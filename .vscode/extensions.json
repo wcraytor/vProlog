@@ -1,0 +1,10 @@
+{
+  // Suggested extensions. The Prolog extension gives syntax highlighting +
+  // snippets; its built-in lint/debug target SWI-Prolog, so for vProlog
+  // (Trealla) use the tasks in tasks.json instead (lint -> Problems panel,
+  // trace -> 4-port tracer in the terminal).
+  "recommendations": [
+    "arthurwang.vsc-prolog",
+    "reditorsupport.r"
+  ]
+}

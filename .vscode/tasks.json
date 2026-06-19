@@ -1,0 +1,53 @@
+{
+  // vProlog editor tasks — drive the standalone `tpl` engine.
+  // Cmd/Ctrl+Shift+B runs the lint task; others via "Tasks: Run Task".
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "vProlog: lint current file",
+      "type": "shell",
+      "command": "${workspaceFolder}/trealla/tpl",
+      "args": ["-g", "consult('${file}'),halt"],
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "silent", "panel": "shared", "clear": true },
+      // Parses Trealla's own diagnostics into the Problems panel:
+      //   Warning: singleton: X, near FILE:LINE
+      //   Error: syntax error, ... , FILE:LINE
+      "problemMatcher": {
+        "owner": "trealla",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^(Warning|Error): (.+), (?:near )?(.+):(\\d+)$",
+          "severity": 1,
+          "message": 2,
+          "file": 3,
+          "line": 4
+        }
+      }
+    },
+    {
+      "label": "vProlog: run current file",
+      "type": "shell",
+      "command": "${workspaceFolder}/trealla/tpl",
+      "args": ["${file}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "vProlog: trace current file (4-port)",
+      "type": "shell",
+      "command": "${workspaceFolder}/trealla/tpl",
+      "args": ["-t", "${file}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "vProlog: REPL (load file, interactive)",
+      "type": "shell",
+      "command": "${workspaceFolder}/trealla/tpl",
+      "args": ["-l", "${file}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  // *.pl defaults to Perl in VS Code; force Prolog highlighting in this repo.
+  "files.associations": { "*.pl": "prolog", "*.pro": "prolog" }
+}
