@@ -1,0 +1,19 @@
+trealla/tpl
+trealla/*.o
+trealla/src/*.o
+trealla/library/*.c
+build/
+*.o
+*.a
+.DS_Store
+
+# compiled shared objects / dynamic libs (rebuilt per-platform)
+*.so
+*.dll
+*.dylib
+# R package build artifacts
+rpkg/src/*.o
+rpkg/src/symbols.rds
+*.Rcheck/
+.Rhistory
+.RData
