@@ -1,0 +1,8 @@
+The package as a whole is licensed under GPL-3.
+
+The bundled Trealla Prolog engine in src/ (all files except vprolog.cpp and
+RcppExports.cpp) and inst/library/*.pl are:
+  Trealla Prolog, Copyright (c) 2020 Andrew George Davison
+  Licensed under the MIT License (a copy is in inst/COPYRIGHTS.trealla).
+MIT-licensed code is GPL-compatible and is redistributed here within the
+GPL-3 package; the original MIT notice is retained.

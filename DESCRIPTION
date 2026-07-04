@@ -1,0 +1,20 @@
+Package: vProlog
+Type: Package
+Title: Embeddable Prolog (Trealla) for R
+Version: 0.1.0
+Authors@R: person("Bert", "Craytor", role = c("aut", "cre"),
+    email = "bert.craytor@tutanota.com")
+Description: Self-contained R binding to the Trealla Prolog engine, embedded
+    in-process via its C API (pl_create/pl_consult/pl_query). The Trealla
+    engine source is bundled and compiled with the package, so no external
+    Prolog installation is required. Exposes consult, eval, provable queries
+    and answer extraction, with CLP(Z), CLP(B), DCG and full UTF-8 support.
+License: GPL-3
+Encoding: UTF-8
+LinkingTo: Rcpp
+Imports: Rcpp
+Suggests: testthat (>= 3.0.0)
+SystemRequirements: C11 toolchain
+RoxygenNote: 7.3.1
+URL: https://github.com/wcraytor/vProlog
+BugReports: https://github.com/wcraytor/vProlog/issues

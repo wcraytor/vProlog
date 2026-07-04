@@ -1,0 +1,9 @@
+^trealla$
+^build$
+^test$
+^research$
+^\.vscode$
+^\.git$
+^\.gitignore$
+^\.DS_Store$
+^README\.md$

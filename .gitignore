@@ -17,3 +17,7 @@ rpkg/src/symbols.rds
 *.Rcheck/
 .Rhistory
 .RData
+*.tar.gz
+src/*.o
+src/**/*.o
+src/*.so
