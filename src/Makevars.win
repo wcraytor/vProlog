@@ -1,6 +1,6 @@
 # Self-contained build of the bundled Trealla engine + the Rcpp binding.
 # Embed mode: no REPL, no FFI/SSL/threads -> only libm is needed.
-PKG_CPPFLAGS = -I. -DEMBED=1 -D_GNU_SOURCE -DNDEBUG \
+PKG_CPPFLAGS = -I. -DEMBED=1 -DUSE_PLAIN_HISTORY -D_GNU_SOURCE -DNDEBUG \
   -DVERSION='"vprolog-0.1.0"' -DDEFAULT_LIBRARY_PATH='"."'
 PKG_LIBS = -lm
 
