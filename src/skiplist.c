@@ -414,7 +414,7 @@ sliter *sl_find_key(skiplist *l, const void *key)
 	}
 
 	if (!p || !(q = p->forward[0]))
-		return false;
+		return NULL;
 
 	sliter *iter;
 
