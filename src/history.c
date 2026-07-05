@@ -8,7 +8,7 @@
 // On Nixes EDITLINE should be available if not defined uses GNU READLINE.
 // On WASM and Windows ISOCLINE?
 
-#if !defined(USE_EDITLINE) && !defined(USE_ISOCLINE) && !defined(USE_READLINE)
+#if !defined(USE_EDITLINE) && !defined(USE_ISOCLINE) && !defined(USE_READLINE) && !defined(USE_PLAIN_HISTORY)
 #define USE_EDITLINE
 #endif
 
@@ -67,7 +67,7 @@ int history_getch(void)
 static char g_filename[1024];
 
 
-#if !USE_ISOCLINE && !defined(__wasi__)
+#if !USE_ISOCLINE && !defined(__wasi__) && !defined(USE_PLAIN_HISTORY)
 char *history_readline_eol(prolog *pl, const char *prompt, char eol)
 {
 	char *cmd = NULL;
@@ -395,7 +395,7 @@ void history_save(void)
 }
 #endif
 
-#ifdef __wasi__
+#if defined(__wasi__) || defined(USE_PLAIN_HISTORY)
 char *history_readline_eol(prolog *pl, const char *prompt, char eol)
 {
 	fprintf(stdout, "%s", prompt);
