@@ -1,7 +1,7 @@
 Package: vProlog
 Type: Package
 Title: Embeddable Prolog (Trealla) for R
-Version: 0.1.1
+Version: 0.1.2
 Authors@R: person("Bert", "Craytor", role = c("aut", "cre"),
     email = "bert.craytor@tutanota.com")
 Description: Self-contained R binding to the Trealla Prolog engine, embedded
@@ -15,6 +15,6 @@ LinkingTo: Rcpp
 Imports: Rcpp
 Suggests: testthat (>= 3.0.0)
 SystemRequirements: C11 toolchain
-RoxygenNote: 7.3.1
+RoxygenNote: 7.3.3
 URL: https://github.com/wcraytor/vProlog
 BugReports: https://github.com/wcraytor/vProlog/issues

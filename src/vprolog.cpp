@@ -17,14 +17,35 @@ using namespace Rcpp;
 static void prolog_finalizer(prolog *pl) { if (pl) pl_destroy(pl); }
 typedef XPtr<prolog, PreserveStorage, prolog_finalizer> PrologPtr;
 
+// Trealla shares one global symbol table across engines and frees it when the
+// last engine is destroyed (pl_destroy -> g_destroy); that freed state does
+// not survive re-initialization, so destroying the "last" engine and touching
+// another one later aborts the process. Hold one never-destroyed anchor
+// engine so the global refcount never reaches zero for the process lifetime.
+static prolog *g_anchor_engine = NULL;
+
 // [[Rcpp::export]]
 SEXP cpp_open() {
+  if (!g_anchor_engine) {
+    g_anchor_engine = pl_create();
+    if (!g_anchor_engine) stop("pl_create() failed (anchor)");
+  }
   prolog *pl = pl_create();
   if (!pl) stop("pl_create() failed");
   g_envp = environ;
   set_quiet(pl);  // suppress banner / interactive chatter
   PrologPtr p(pl);
   return p;
+}
+
+// Explicitly destroy an engine now instead of waiting for gc (idempotent).
+// XPtr::release() clears the pointer AND runs the finalizer (pl_destroy)
+// exactly once; on an already-released pointer it is a no-op. Do not call
+// pl_destroy here as well — that double-destroys.
+// [[Rcpp::export]]
+void cpp_close(SEXP ptr) {
+  PrologPtr p(ptr);
+  p.release();
 }
 
 // [[Rcpp::export]]

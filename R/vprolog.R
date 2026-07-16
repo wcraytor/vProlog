@@ -11,6 +11,21 @@ prolog_open <- function() {
   p
 }
 
+#' Close a Prolog engine
+#'
+#' Destroys the engine immediately instead of waiting for garbage collection.
+#' Safe to call more than once; using the engine afterwards is an error. Useful
+#' in long-running processes (Shiny sessions, batch drivers) that open many
+#' engines.
+#' @param pl A \code{prolog_engine}.
+#' @return \code{NULL}, invisibly.
+#' @export
+prolog_close <- function(pl) {
+  stopifnot(inherits(pl, "prolog_engine"))
+  cpp_close(pl)
+  invisible(NULL)
+}
+
 #' Consult a Prolog source file
 #' @param pl A \code{prolog_engine}.
 #' @param file Path to a \code{.pl} file.

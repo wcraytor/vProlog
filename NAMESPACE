@@ -1,6 +1,7 @@
 useDynLib(vProlog, .registration = TRUE)
 importFrom(Rcpp, sourceCpp)
 export(prolog_open)
+export(prolog_close)
 export(pl_consult)
 export(pl_consult_text)
 export(pl_use)

@@ -5,6 +5,10 @@ cpp_open <- function() {
     .Call(`_vProlog_cpp_open`)
 }
 
+cpp_close <- function(ptr) {
+    invisible(.Call(`_vProlog_cpp_close`, ptr))
+}
+
 cpp_consult <- function(ptr, filename) {
     .Call(`_vProlog_cpp_consult`, ptr, filename)
 }

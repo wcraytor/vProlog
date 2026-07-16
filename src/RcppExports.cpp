@@ -20,6 +20,16 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// cpp_close
+void cpp_close(SEXP ptr);
+RcppExport SEXP _vProlog_cpp_close(SEXP ptrSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type ptr(ptrSEXP);
+    cpp_close(ptr);
+    return R_NilValue;
+END_RCPP
+}
 // cpp_consult
 bool cpp_consult(SEXP ptr, std::string filename);
 RcppExport SEXP _vProlog_cpp_consult(SEXP ptrSEXP, SEXP filenameSEXP) {
@@ -59,6 +69,7 @@ END_RCPP
 
 static const R_CallMethodDef CallEntries[] = {
     {"_vProlog_cpp_open", (DL_FUNC) &_vProlog_cpp_open, 0},
+    {"_vProlog_cpp_close", (DL_FUNC) &_vProlog_cpp_close, 1},
     {"_vProlog_cpp_consult", (DL_FUNC) &_vProlog_cpp_consult, 2},
     {"_vProlog_cpp_eval", (DL_FUNC) &_vProlog_cpp_eval, 2},
     {"_vProlog_cpp_query", (DL_FUNC) &_vProlog_cpp_query, 2},
