@@ -69,7 +69,8 @@ http_open_(Parts, Stream, Options, Visited) :-
 		parts_url(Parts2, URL2),
 		Visited2 = [URL|Visited],
 		check_redirect(URL2, Visited2, Options),
-		redirect_options(Code, Options, Options2),
+		redirect_options(Code, Options, Options1),
+		cross_origin_options(Parts, Parts2, Options1, Options2),
 		http_open_(Parts2, Stream, Options2, Visited2)
 	;	(memberchk(status_code(_), Options) ; between(200, 299, Code))
 	->	body_stream(S, Method, Code, Fields, Stream),
@@ -220,6 +221,27 @@ redirect_options(_, Options0, Options) :-
 		exclude(method_option, Options1, Options)
 	;	Options = Options1
 	).
+
+% vProlog patch: credentials are not sent on to another origin. A redirect
+% that changes the scheme, host or port drops authorization/1 (including
+% userinfo from the URL) and any Authorization, Proxy-Authorization or
+% Cookie request header, as browsers and SWI-Prolog do.
+
+cross_origin_options(url(Scheme, Host, Port, _), url(Scheme, Host, Port, _), Options, Options) :-
+	!.
+cross_origin_options(_, _, Options0, Options) :-
+	exclude(credential_option, Options0, Options).
+
+credential_option(authorization(_)).
+credential_option(request_header(Name=_)) :-
+	text_chars(Name, Cs),
+	maplist(lower_char, Cs, Ls),
+	atom_chars(L, Ls),
+	memberchk(L, [authorization, 'proxy-authorization', cookie]).
+
+lower_char(C, L) :-
+	char_code(C, X),
+	(X >= 0'A, X =< 0'Z -> Y is X + 32, char_code(L, Y) ; L = C).
 
 post_option(post(_)).
 method_option(method(_)).

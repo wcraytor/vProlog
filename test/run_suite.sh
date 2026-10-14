@@ -29,6 +29,9 @@ echo "$pout  [WG17 phrase conformance — informational]"
 # intentional Unicode acceptance, and driver substitution-matching artifacts.
 sh "$ROOT/test/run_iso.sh" 2>/dev/null | tail -1
 
+# vProlog patch: http_open/3 drops credentials on a cross-origin redirect
+sh "$ROOT/test/http/redirect_auth.sh" 2>/dev/null || rc=1
+
 # Embedded C-API test (build if libtrealla.a present, else skip with notice)
 cd "$ROOT" || exit 2
 if [ -f build/libtrealla.a ]; then

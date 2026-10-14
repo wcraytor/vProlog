@@ -16,6 +16,10 @@ Local patches (in `trealla/src`, and therefore in the R package's `src/`):
 - `history.c`: `USE_PLAIN_HISTORY` selects a plain `getline()` reader for
   embed builds (no libedit). Upstream's `history_none.c` is not used because
   it returns EOF for every read from stdin.
+- `library/http/http_open.pl`: a redirect to another origin (scheme, host
+  or port) drops `authorization/1` (including URL userinfo) and any
+  Authorization, Proxy-Authorization or Cookie `request_header/1`;
+  upstream forwards them. Test: `test/http/redirect_auth.sh`.
 
 ## Building `tpl`
 
