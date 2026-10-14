@@ -9,6 +9,101 @@
     pull_request:
 
   jobs:
+    freestanding-hosted:
+      name: Freestanding hosted
+      runs-on: ubuntu-24.04
+      timeout-minutes: 15
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Run hosted adapter smoke test
+          run: make freestanding
+        - name: Run port template smoke test
+          run: make port-template-smoke
+        - name: IPv4/UDP stack, self-consistency
+          run: make net-test
+        - name: IPv4/UDP stack, interoperability with the Linux stack
+          run: |
+            make tests/net/net_interop
+            sudo ./tests/net/interop.sh
+
+    freestanding-qemu:
+      name: Freestanding QEMU RV32
+      runs-on: ubuntu-24.04
+      timeout-minutes: 20
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Install cross tools
+          run: |
+            sudo apt-get update
+            sudo apt-get install gcc-riscv64-unknown-elf picolibc-riscv64-unknown-elf qemu-system-misc
+        - name: Build and boot
+          run: make qemu-riscv32-smoke
+
+    freestanding-rpi4:
+      name: Freestanding Raspberry Pi 4
+      runs-on: ubuntu-24.04
+      # QEMU grew its raspi4b machine in 9.0 and ubuntu-24.04 ships 8.2, so
+      # the boot test runs in a Debian trixie container for its QEMU 10.
+      container: debian:trixie
+      timeout-minutes: 20
+      env:
+        ARM_TOOLCHAIN: arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-elf
+      steps:
+        - name: Install build and boot tools
+          run: |
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential ca-certificates curl git python3 qemu-system-arm \
+              xz-utils
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Install AArch64 bare-metal toolchain
+          run: |
+            curl -fsSL -o toolchain.tar.xz \
+              "https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/$ARM_TOOLCHAIN.tar.xz"
+            tar xf toolchain.tar.xz
+            echo "$PWD/$ARM_TOOLCHAIN/bin" >> "$GITHUB_PATH"
+        - name: Build and boot
+          run: make rpi4-smoke
+
+    freestanding-esp32s3:
+      name: Freestanding ESP32-S3
+      runs-on: ubuntu-24.04
+      timeout-minutes: 30
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Cross-build Arduino Nano ESP32 firmware
+          uses: espressif/esp-idf-ci-action@v1
+          with:
+            esp_idf_version: v6.0.2
+            target: esp32s3
+            path: ports/arduino-nano-esp32
+            command: make -C ../.. arduino-nano-esp32
+        - name: Check firmware layout and size
+          run: |
+            python3 util/esp32s3_build_check.py \
+              ports/arduino-nano-esp32/build/trealla_nano_esp32.map \
+              ports/arduino-nano-esp32/build/trealla_nano_esp32.bin
+        - name: Upload firmware
+          uses: actions/upload-artifact@v4
+          with:
+            name: trealla-arduino-nano-esp32
+            path: |
+              ports/arduino-nano-esp32/build/bootloader/bootloader.bin
+              ports/arduino-nano-esp32/build/partition_table/partition-table.bin
+              ports/arduino-nano-esp32/build/trealla_nano_esp32.bin
+              ports/arduino-nano-esp32/build/trealla_nano_esp32.map
+              ports/arduino-nano-esp32/build/flash_args
+              ports/arduino-nano-esp32/build/flasher_args.json
+            if-no-files-found: error
+
     build:
       name: Native
       runs-on: ${{ matrix.os }}
@@ -17,6 +112,7 @@
         matrix:
           os:
             - ubuntu-latest
+            - ubuntu-24.04-arm
             - macos-latest
       steps:
         - uses: actions/checkout@v4
@@ -26,7 +122,7 @@
           run: |
             sudo apt-get update
             sudo apt-get install libedit-dev xxd libffi-dev libssl-dev
-          if: matrix.os == 'ubuntu-latest'
+          if: startsWith(matrix.os, 'ubuntu-')
         - name: Install deps (macOS)
           run: |
             brew update
@@ -60,7 +156,7 @@
         - name: Install deps
           run: |
             pacman --noconfirm -S make mingw-w64-x86_64-gcc mingw-w64-x86_64-headers-git mingw-w64-x86_64-libffi mingw-w64-x86_64-dlfcn
-            pacman --noconfirm -S mingw-w64-x86_64-openssl mingw-w64-x86_64-libwinpthread vim diffutils git
+            pacman --noconfirm -S mingw-w64-x86_64-openssl mingw-w64-x86_64-libwinpthread mingw-w64-x86_64-wineditline vim diffutils git
         - name: Configure line endings
           run: git config --global core.autocrlf input
         - uses: actions/checkout@v4
@@ -69,12 +165,12 @@
         - name: Fetch tags
           run: git fetch --tags --force origin
         - name: Build
-          run: make WIN=1 release
+          run: make WIN=1 EDITLINE=1 release
         - name: Test
           run: make test
         - name: Make Windows-friendly
           run: |
-            cp ${MINGW_PREFIX}/bin/{libcrypto-3-x64.dll,libssl-3-x64.dll,libffi-8.dll,libdl.dll,libwinpthread-1.dll} .
+            cp ${MINGW_PREFIX}/bin/{libcrypto-3-x64.dll,libssl-3-x64.dll,libffi-8.dll,libdl.dll,libwinpthread-1.dll,edit.dll} .
             echo -e "\n\nOpenSSL (libcrypto-3-x64.dll, libssl-3-x64.dll):\n" >> ATTRIBUTION
             cat ${MINGW_PREFIX}/share/licenses/openssl/LICENSE >> ATTRIBUTION
             echo -e "\n\nlibffi: (libffi-8.dll)\n" >> ATTRIBUTION
@@ -83,8 +179,8 @@
             cat ${MINGW_PREFIX}/share/licenses/dlfcn/LICENSE >> ATTRIBUTION
             echo -e "\n\nlibwinpthread:\n" >> ATTRIBUTION
             cat ${MINGW_PREFIX}/share/licenses/libwinpthread/COPYING >> ATTRIBUTION
-            echo -e "\n\nisocline:\n" >> ATTRIBUTION
-            cat src/isocline/LICENSE >> ATTRIBUTION
+            echo -e "\n\nwineditline:\n" >> ATTRIBUTION
+            cat ${MINGW_PREFIX}/share/licenses/wineditline/LICENSE >> ATTRIBUTION
             if [ ! -f "tpl.exe" ]; then
               mv tpl tpl.exe
             fi
@@ -104,6 +200,447 @@
               libffi-8.dll
               libdl.dll
               libwinpthread-1.dll
+              edit.dll
+
+    windows-arm64:
+      name: Windows ARM64
+      runs-on: windows-11-arm
+      defaults:
+        run:
+          shell: msys2 {0}
+      steps:
+        - uses: msys2/setup-msys2@v2
+          with:
+            msystem: CLANGARM64
+            update: true
+        - name: Install deps
+          run: |
+            pacman --noconfirm -S make file mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-headers-git
+            pacman --noconfirm -S mingw-w64-clang-aarch64-libffi mingw-w64-clang-aarch64-dlfcn mingw-w64-clang-aarch64-openssl
+            pacman --noconfirm -S mingw-w64-clang-aarch64-winpthreads mingw-w64-clang-aarch64-libwinpthread mingw-w64-clang-aarch64-wineditline vim diffutils git
+        - name: Configure line endings
+          run: git config --global core.autocrlf input
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Fetch tags
+          run: git fetch --tags --force origin
+        - name: Build
+          run: make WIN=1 EDITLINE=1 CC=clang HOST_CC=clang AR=llvm-ar release
+        - name: Verify architecture
+          run: |
+            llvm-readobj --file-headers tpl.exe | grep -q 'Machine: IMAGE_FILE_MACHINE_ARM64'
+        - name: Test
+          run: make test
+        - name: Make Windows-friendly
+          run: |
+            cp ${MINGW_PREFIX}/bin/{libcrypto-3-arm64.dll,libssl-3-arm64.dll,libffi-8.dll,libdl.dll,libwinpthread-1.dll,edit.dll} .
+            echo -e "\n\nOpenSSL (libcrypto-3-arm64.dll, libssl-3-arm64.dll):\n" >> ATTRIBUTION
+            cat ${MINGW_PREFIX}/share/licenses/openssl/LICENSE >> ATTRIBUTION
+            echo -e "\n\nlibffi: (libffi-8.dll)\n" >> ATTRIBUTION
+            cat ${MINGW_PREFIX}/share/licenses/libffi/LICENSE >> ATTRIBUTION
+            echo -e "\n\ndlfcn: (libdl.dll)\n" >> ATTRIBUTION
+            cat ${MINGW_PREFIX}/share/licenses/dlfcn/LICENSE >> ATTRIBUTION
+            echo -e "\n\nlibwinpthread:\n" >> ATTRIBUTION
+            cat ${MINGW_PREFIX}/share/licenses/winpthreads/COPYING >> ATTRIBUTION
+            echo -e "\n\nwineditline:\n" >> ATTRIBUTION
+            cat ${MINGW_PREFIX}/share/licenses/wineditline/LICENSE >> ATTRIBUTION
+            mv ATTRIBUTION ATTRIBUTION.txt
+            mv LICENSE LICENSE.txt
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-Windows-ARM64
+            path: |
+              tpl.exe
+              LICENSE.txt
+              ATTRIBUTION.txt
+              README.md
+              libcrypto-3-arm64.dll
+              libssl-3-arm64.dll
+              libffi-8.dll
+              libdl.dll
+              libwinpthread-1.dll
+              edit.dll
+
+    linux32:
+      name: Linux x86 (32-bit)
+      runs-on: ubuntu-24.04
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Install 32-bit dependencies
+          run: |
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            sudo apt-get install file gcc-multilib libedit-dev:i386 libffi-dev:i386 libssl-dev:i386 xxd
+        - name: Fetch tags
+          run: git fetch --tags --force origin
+        - name: Build
+          run: make OPT=-m32 release
+        - name: Verify architecture
+          run: file tpl | grep -q 'ELF 32-bit.*Intel 80386'
+        - name: Test
+          run: make test
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-Linux-X86
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    s390x:
+      name: Linux s390x (big-endian, experimental)
+      runs-on: ubuntu-24.04
+      continue-on-error: true
+      timeout-minutes: 60
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Set up QEMU
+          uses: docker/setup-qemu-action@v4
+          with:
+            platforms: s390x
+        - name: Build and test under s390x
+          run: |
+            docker run --rm --platform linux/s390x \
+              --volume "$GITHUB_WORKSPACE:/workspace" \
+              --workdir /workspace \
+              --env LANG=C.UTF-8 \
+              --env LC_ALL=C.UTF-8 \
+              ubuntu:24.04 \
+              bash -euxo pipefail -c '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y build-essential file git libedit-dev libffi-dev libssl-dev xxd
+                git config --global --add safe.directory /workspace
+                make clean
+                make release
+                file tpl | grep -q "ELF 64-bit MSB.*IBM S/390"
+                make test
+              '
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-Linux-S390X
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    cosmo:
+      name: Cosmopolitan
+      runs-on: ubuntu-latest
+      env:
+        COSMOCC_VERSION: 4.0.2
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Cache cosmocc
+          id: cache-cosmocc
+          uses: actions/cache@v4
+          with:
+            path: ${{ runner.temp }}/cosmocc
+            key: cosmocc-${{ runner.os }}-${{ env.COSMOCC_VERSION }}
+        - name: Install cosmocc
+          if: steps.cache-cosmocc.outputs.cache-hit != 'true'
+          run: |
+            mkdir -p "${RUNNER_TEMP}/cosmocc"
+            curl -fsSL "https://cosmo.zip/pub/cosmocc/cosmocc-${COSMOCC_VERSION}.zip" -o "${RUNNER_TEMP}/cosmocc.zip"
+            unzip -q "${RUNNER_TEMP}/cosmocc.zip" -d "${RUNNER_TEMP}/cosmocc"
+        - name: Add cosmocc to PATH
+          run: echo "${RUNNER_TEMP}/cosmocc/bin" >> "$GITHUB_PATH"
+        - name: Build
+          run: make cosmo
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-cosmopolitan
+            path: |
+              tpl
+              tpl.aarch64.elf
+              tpl.com.dbg
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    freebsd:
+      name: FreeBSD
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Build and test in FreeBSD
+          uses: vmactions/freebsd-vm@v1.5.3
+          with:
+            release: "14"
+            cache-after-prepare: true
+            prepare: pkg install -y bash git gmake libedit libffi
+            run: |
+              make release
+              make test
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-FreeBSD-X64
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    openbsd:
+      name: OpenBSD (experimental)
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      timeout-minutes: 60
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Build and test in OpenBSD
+          uses: vmactions/openbsd-vm@v1.4.6
+          with:
+            release: "7.9"
+            cache-after-prepare: true
+            prepare: |
+              pkg_add bash coreutils gdiff git gmake libffi
+              ln -sf /usr/local/bin/gtimeout /usr/local/bin/timeout
+              ln -sf /usr/local/bin/gdiff /usr/local/bin/diff
+            run: |
+              export PATH="/usr/local/bin:$PATH"
+              git config --global --add safe.directory "$GITHUB_WORKSPACE"
+              gmake release
+              gmake test
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-OpenBSD-X64
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    netbsd-x64:
+      name: NetBSD 11 X64 (experimental)
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      timeout-minutes: 90
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Build and test in NetBSD
+          uses: vmactions/netbsd-vm@v1.4.6
+          with:
+            release: "11.0"
+            arch: x86_64
+            sync: scp
+            usesh: true
+            cache-after-prepare: true
+            prepare: |
+              /usr/sbin/pkg_add -u bash coreutils gmake
+              ln -sf /usr/pkg/bin/gtimeout /usr/pkg/bin/timeout
+            run: |
+              export PATH="/usr/pkg/bin:$PATH"
+              # The README asks for a UTF-8 locale to run the tests, and this
+              # VM starts in C. Without one, test0252 and test0556 differ:
+              # writeq only quotes a non-ASCII atom when the C library calls
+              # its characters alphabetic, which is locale-dependent. The
+              # other BSD runners are already UTF-8, which is why only this
+              # one shows it. The test runners choose the same way, so the
+              # choice lives in one file rather than two that can drift.
+              . tests/locale.sh
+              echo "using LC_ALL=$LC_ALL"
+              version=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
+              gmake "GIT_VERSION=\"$version\"" CC=gcc HOST_CC=gcc NOFFI=1 NOSSL=1 release
+              ./tpl -q -g 'writeln(netbsd_x64_ok),halt'
+              gmake test
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-NetBSD-X64
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    solaris:
+      name: Solaris 11.4 CBE (experimental)
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      timeout-minutes: 60
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Build and test in Solaris
+          uses: vmactions/solaris-vm@v1.3.8
+          with:
+            release: "11.4-gcc-14"
+            cache-after-prepare: true
+            prepare: |
+              rc=0
+              pkg install --accept bash git gnu-coreutils gnu-diffutils gnu-make || rc=$?
+              case "$rc" in 0|3|4) ;; *) exit "$rc" ;; esac
+            run: |
+              export PATH="/usr/gnu/bin:$PATH"
+              git config --global --add safe.directory "$GITHUB_WORKSPACE"
+              gmake CC=gcc HOST_CC=gcc ISOCLINE=1 NOFFI=1 NOSSL=1 release
+              ./tpl -q -g 'writeln(solaris_ok),halt'
+              gmake CC=gcc HOST_CC=gcc ISOCLINE=1 NOFFI=1 NOSSL=1 test
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-Solaris-X64
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    openindiana:
+      name: OpenIndiana Hipster 2026.04 (experimental)
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      timeout-minutes: 60
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Build and test in OpenIndiana
+          uses: vmactions/openindiana-vm@v1.1.5
+          with:
+            release: "202604-build"
+            cache-after-prepare: true
+            prepare: |
+              rc=0
+              pkg install --accept build-essential git gnu-coreutils gnu-diffutils gnu-make || rc=$?
+              case "$rc" in 0|3|4) ;; *) exit "$rc" ;; esac
+            run: |
+              export PATH="/usr/gnu/bin:$PATH"
+              git config --global --add safe.directory "$GITHUB_WORKSPACE"
+              gmake CC=gcc HOST_CC=gcc ISOCLINE=1 NOFFI=1 NOSSL=1 release
+              ./tpl -q -g 'writeln(openindiana_ok),halt'
+              gmake test
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-OpenIndiana-X64
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    tribblix:
+      name: Tribblix 0m41 X64 (experimental)
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      timeout-minutes: 60
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Build and test in Tribblix
+          uses: vmactions/tribblix-vm@v1.0.4
+          with:
+            release: "0m41"
+            arch: x86_64
+            cache-after-prepare: true
+            prepare: |
+              zap refresh
+              zap install-overlay develop
+              zap install TRIBlibedit
+            run: |
+              export PATH="/usr/gnu/bin:$PATH"
+              git config --global --add safe.directory "$GITHUB_WORKSPACE"
+              gmake CC=gcc HOST_CC=gcc TRIBBLIX=1 NOFFI=1 NOSSL=1 release
+              ./tpl -q -g 'writeln(tribblix_x64_ok),halt'
+              gmake test
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-Tribblix-X64
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    riscos:
+      name: RISC OS ARM EABI (experimental)
+      runs-on: ubuntu-24.04
+      continue-on-error: true
+      timeout-minutes: 30
+      env:
+        RISCOS_TOOLCHAIN_URL: https://github.com/netsurf-browser/toolchains/releases/download/gh-master-unstable/arm-riscos-gnueabi.tar.gz
+        RISCOS_TOOLCHAIN_SHA256: c1a5d741494bc9c034c8a5338ad07a9249781152064620c00ca9490e210828fd
+        GCCSDK_INSTALL_CROSSBIN: /opt/netsurf/arm-riscos-gnueabi/cross/bin
+        GCCSDK_INSTALL_ENV: /opt/netsurf/arm-riscos-gnueabi/env
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Install RISC OS cross-toolchain
+          run: |
+            curl --fail --location --retry 3 \
+              --output "${RUNNER_TEMP}/arm-riscos-gnueabi.tar.gz" \
+              "$RISCOS_TOOLCHAIN_URL"
+            echo "$RISCOS_TOOLCHAIN_SHA256  ${RUNNER_TEMP}/arm-riscos-gnueabi.tar.gz" | sha256sum --check
+            sudo tar -xzf "${RUNNER_TEMP}/arm-riscos-gnueabi.tar.gz" -C /
+        - name: Cross-build for RISC OS
+          run: |
+            export PATH="$GCCSDK_INSTALL_CROSSBIN:$PATH"
+            make CC=arm-riscos-gnueabi-gcc HOST_CC=cc \
+              ISOCLINE=1 NOFFI=1 NOSSL=1 NOTHREADS=1 NOPIC=1 NOLIB=1 release
+            cp tpl 'tpl,e1f'
+            file 'tpl,e1f'
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-RISCOS-ARM-EABI
+            path: |
+              tpl,e1f
+              LICENSE
+              ATTRIBUTION
+              README.md
+
+    haiku:
+      name: Haiku (experimental)
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Build and smoke-test in Haiku
+          uses: vmactions/haiku-vm@v1.1.3
+          with:
+            release: "r1beta5"
+            usesh: true
+            run: |
+              make ISOCLINE=1 NOFFI=1 NOSSL=1 release
+              ./tpl -q -g 'writeln(haiku_ok),halt'
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: tpl-Haiku-X64
+            path: |
+              tpl
+              LICENSE
+              ATTRIBUTION
+              README.md
 
     # Roughly matches https://github.com/WebAssembly/wasi-sdk#install
     wasm:
@@ -159,7 +696,7 @@
 
     release:
       if: startsWith(github.ref, 'refs/tags/')
-      needs: [build, windows, wasm]
+      needs: [build, windows, windows-arm64, linux32, cosmo, freebsd, wasm]
       name: Release binaries
       runs-on: ubuntu-latest
       steps:

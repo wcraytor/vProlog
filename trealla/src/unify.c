@@ -2,48 +2,54 @@
 
 #include "query.h"
 
+// Small terms cannot be cyclic: a cycle has to come back to a pair already visited, and that
+// takes more steps than this. Below the threshold the memo is skipped entirely, which takes a
+// hash insert off every predicate call that has an argument. The count is of pairs visited, so
+// at most this many go unrecorded however the term is shaped, and a cycle still repeats a pair
+// once past it.
+
+#define UNIFY_MEMO_AFTER 32
+
+// How deep unify_internal() may recurse. Each level costs 120 bytes of C stack, measured, so
+// 8192 is under a megabyte against the 8M both the main thread and, since we now ask for it,
+// every other thread gets. Exceeding it is an error: it used to return true, which silently
+// unified terms that differ below the limit. A WASM build runs on a far smaller stack.
+
+#if defined(__wasi__) || defined(__EMSCRIPTEN__)
+#define MAX_UNIFY_DEPTH 1024
+#else
+#define MAX_UNIFY_DEPTH 8192
+#endif
+
 static int compare_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth);
+static bool compound_pair_seen(query *q, cell *c1, pl_ctx ctx1, cell *c2, pl_ctx ctx2);
 
 static int compare_lists(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
 {
-	cell *orig_p1 = p1, *orig_p2 = p2;
-	pl_ctx orig_p1_ctx = p1_ctx, orig_p2_ctx = p2_ctx;
-	bool any1 = false, any2 = false;
-
 	while (is_iso_list(p1) && is_iso_list(p2)) {
+		if ((p1 == p2) && (p1_ctx == p2_ctx))
+			return 0;
+
+		if ((++q->unify_seen_pairs > UNIFY_MEMO_AFTER)
+		&& compound_pair_seen(q, p1, p1_ctx, p2, p2_ctx))
+			return 0;
+
 		cell *c1 = p1 + 1, *c2 = p2 + 1;
 		pl_ctx c1_ctx = p1_ctx, c2_ctx = p2_ctx;
-		slot *e1 = NULL, *e2 = NULL;
-		uint32_t save_vgen, save_vgen2;
-		int both = 0;
+		c1 = deref(q, c1, c1_ctx);
+		c1_ctx = q->latest_ctx;
+		c2 = deref(q, c2, c2_ctx);
+		c2_ctx = q->latest_ctx;
 
-		DEREF_VAR(any1, both, save_vgen, e1, e1->vgen, c1, c1_ctx, q->vgen);
-		DEREF_VAR(any1, both, save_vgen2, e2, e2->vgen2, c2, c2_ctx, q->vgen);
-
-		if (both != 2) {
-			int val = compare_internal(q, c1, c1_ctx, c2, c2_ctx, depth);
-			if (val) return val;
-		}
-
-		if (e1) e1->vgen = save_vgen;
-		if (e2) e2->vgen2 = save_vgen2;
+		int val = compare_internal(q, c1, c1_ctx, c2, c2_ctx, depth+1);
+		if (val) return val;
 
 		p1 = p1 + 1; p1 += p1->num_cells;
 		p2 = p2 + 1; p2 += p2->num_cells;
-		e1 = e2 = NULL;
-		int both1 = 0, both2 = 0;
-
-		DEREF_VAR(any2, both1, save_vgen, e1, e1->vgen, p1, p1_ctx, q->vgen);
-		DEREF_VAR(any2, both2, save_vgen2, e2, e2->vgen2, p2, p2_ctx, q->vgen);
-
-		if (both1)
-			q->is_cyclic1++;
-
-		if (both2)
-			q->is_cyclic2++;
-
-		if (q->is_cyclic1 && q->is_cyclic2)
-			break;
+		p1 = deref(q, p1, p1_ctx);
+		p1_ctx = q->latest_ctx;
+		p2 = deref(q, p2, p2_ctx);
+		p2_ctx = q->latest_ctx;
 	}
 
 	return compare_internal(q, p1, p1_ctx, p2, p2_ctx, depth+1);
@@ -54,28 +60,27 @@ static int compare_structs(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p
 	int val = CMP_STRING_TO_STRING(q, p1, p2);
 	if (val) return val;
 
-	bool any = false;
-	int arity = p1->arity;
+	if ((p1 == p2) && (p1_ctx == p2_ctx))
+		return 0;
+
+	if ((++q->unify_seen_pairs > UNIFY_MEMO_AFTER)
+		&& compound_pair_seen(q, p1, p1_ctx, p2, p2_ctx))
+		return 0;
+
+	uint32_t arity = get_arity(p1);
 	p1 = p1 + 1;
 	p2 = p2 + 1;
 
 	while (arity--) {
 		cell *c1 = p1, *c2 = p2;
 		pl_ctx c1_ctx = p1_ctx, c2_ctx = p2_ctx;
-		slot *e1 = NULL, *e2 = NULL;
-		uint32_t save_vgen, save_vgen2;
-		int both = 0;
+		c1 = deref(q, c1, c1_ctx);
+		c1_ctx = q->latest_ctx;
+		c2 = deref(q, c2, c2_ctx);
+		c2_ctx = q->latest_ctx;
 
-		DEREF_VAR(any, both, save_vgen, e1, e1->vgen, c1, c1_ctx, q->vgen);
-		DEREF_VAR(any, both, save_vgen2, e2, e2->vgen2, c2, c2_ctx, q->vgen);
-
-		if (both != 2) {
-			int val = compare_internal(q, c1, c1_ctx, c2, c2_ctx, depth+1);
-			if (val) return val;
-		}
-
-		if (e1) e1->vgen = save_vgen;
-		if (e2) e2->vgen2 = save_vgen2;
+		int val = compare_internal(q, c1, c1_ctx, c2, c2_ctx, depth+1);
+		if (val) return val;
 
 		p1 += p1->num_cells;
 		p2 += p2->num_cells;
@@ -86,11 +91,6 @@ static int compare_structs(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p
 
 static int compare_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
 {
-	if (depth > 30) {
-		//printf("*** OOPS %s %d\n", __FILE__, __LINE__);
-		return 0;
-	}
-
 	if (is_var(p1)) {
 		if (is_var(p2)) {
 			if (p1_ctx < p2_ctx)
@@ -179,7 +179,12 @@ static int compare_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx 
 	if (is_codes(p2) && is_string(p1) && !is_codes(p1))
 		return -1;
 
-	if (is_string(p1) && is_string(p2))
+	// A byte string and a text string can hold identical bytes and still
+	// be different lists, so the backing store may only be compared when
+	// both are walked the same way. Otherwise fall through and go
+	// element by element.
+
+	if (is_string(p1) && is_string(p2) && (is_bytes(p1) == is_bytes(p2)))
 		return CMP_STRING_TO_STRING(q, p1, p2);
 
 	if (is_iso_atom(p1)) {
@@ -189,32 +194,32 @@ static int compare_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx 
 		return -1;
 	}
 
-	if (p1->arity < p2->arity)
+	if (get_arity(p1) < get_arity(p2))
 		return -1;
 
-	if (p1->arity > p2->arity)
+	if (get_arity(p1) > get_arity(p2))
 		return 1;
 
-	if ((is_string(p1) && is_iso_list(p2))
-		|| (is_string(p2) && is_iso_list(p1))) {
-		LIST_HANDLER(p1);
-		LIST_HANDLER(p2);
+	if ((is_string(p1) && is_list(p2))
+		|| (is_string(p2) && is_list(p1))) {
+		PROLOG_LIST_HANDLER(p1);
+		PROLOG_LIST_HANDLER(p2);
 
 		while (is_list(p1) && is_list(p2)) {
-			cell *c1 = LIST_HEAD(p1);
+			cell *c1 = PROLOG_LIST_HEAD(p1);
 			c1 = deref(q, c1, p1_ctx);
 			pl_ctx c1_ctx = q->latest_ctx;
-			cell *c2 = LIST_HEAD(p2);
+			cell *c2 = PROLOG_LIST_HEAD(p2);
 			c2 = deref(q, c2, p2_ctx);
 			pl_ctx c2_ctx = q->latest_ctx;
 
 			int val = compare_internal(q, c1, c1_ctx, c2, c2_ctx, depth+1);
 			if (val) return val;
 
-			p1 = LIST_TAIL(p1);
+			p1 = PROLOG_LIST_TAIL(p1);
 			p1 = deref(q, p1, p1_ctx);
 			p1_ctx = q->latest_ctx;
-			p2 = LIST_TAIL(p2);
+			p2 = PROLOG_LIST_TAIL(p2);
 			p2 = deref(q, p2, p2_ctx);
 			p2_ctx = q->latest_ctx;
 		}
@@ -236,19 +241,57 @@ static int compare_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx 
 
 int compare(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx)
 {
-	q->is_cyclic1 = q->is_cyclic2 = false;
 	if (++q->vgen == 0) q->vgen = 1;
+	q->unify_seen_used = 0;
+	q->unify_seen_pairs = 0;
 	return compare_internal(q, p1, p1_ctx, p2, p2_ctx, 0);
 }
 
-static void set_var(query *q, const cell *c, pl_ctx c_ctx, cell *v, pl_ctx v_ctx)
+// Something older now refers into this frame's slots: keep them from recovery and from reuse by a tail call.
+
+void pin_frame(query *q, pl_ctx ctx)
+{
+	frame *f = GET_FRAME(ctx);
+	f->no_recov = true;
+	f->heap_pinned = true;
+	q->no_recov = true;
+}
+
+// A copy kept beyond the call, as an attribute value or a blackboard entry, refers into frames by index: keep
+// every one from `from` up alive, since nothing else records the reference.
+
+void pin_refs(query *q, const cell *c, pl_idx num_cells, pl_ctx from)
+{
+	for (pl_idx i = 0; i < num_cells; i++, c++) {
+		if (is_ref(c) && (c->val_ctx >= from))
+			pin_frame(q, c->val_ctx);
+	}
+}
+
+// Only a variable in a frame older than the newest choicepoint needs its binding undone: backtracking discards any
+// frame made since. Once attributed variables are about, hooks walk every binding of a unification, so trail as before.
+
+static inline bool needs_trail(query *q, pl_ctx c_ctx)
+{
+	if (c_ctx == q->st.fp)
+		return false;
+
+	if (q->attrs_used)
+		return true;
+
+	return q->st.cp && (c_ctx < GET_CURR_CHOICE()->st.fp);
+}
+
+static bool set_var(query *q, const cell *c, pl_ctx c_ctx, cell *v, pl_ctx v_ctx)
 {
 	const frame *f = GET_FRAME(c_ctx);
 	slot *e = get_slot(q, f, c->var_num);
 	cell *c_attrs = e->c.val_attrs;
 
-	if (is_managed(v) || (c_ctx != q->st.fp))
-		add_trail(q, c_ctx, c->var_num, c_attrs);
+	if (is_managed(v) || needs_trail(q, c_ctx)) {
+		if (!add_trail(q, c_ctx, c->var_num, c_attrs))
+			return false;
+	}
 
 	if (c_attrs)
 		q->run_hook = true;
@@ -256,27 +299,53 @@ static void set_var(query *q, const cell *c, pl_ctx c_ctx, cell *v, pl_ctx v_ctx
 	if (is_var(v)) {
 		make_ref(&e->c, v->var_num, v_ctx);
 
+		// A new frame's variable bound to one of the current frame's: a tail call would reuse the current frame.
+
 		if ((c_ctx == q->st.fp)
-			&& (c_ctx != v_ctx)
+			&& (c_ctx != v_ctx) && (v_ctx >= q->st.cur_ctx)
 			&& !is_temporary(c) && !is_void(c)
 			) {
-			q->no_recov = true;
+			q->no_tco = true;
 			q->total_no_recovs++;
 		}
+
+		if (v_ctx > c_ctx)
+			pin_frame(q, v_ctx);
 	} else if (is_compound(v)) {
 		make_indirect(&e->c, v, v_ctx);
+		const bool pin_query = (v_ctx >= q->st.cur_ctx) && (c_ctx != v_ctx);
+		const bool pin_cur = c_ctx < q->st.cur_ctx;
+		const bool pin_v = v_ctx > c_ctx;
 
-		if ((v_ctx >= q->st.cur_ctx)
-			&& (c_ctx != v_ctx)
-			&& !is_ground(v)
-			){
+		if (!pin_query && !pin_cur && !pin_v)
+			return true;
+
+		// A ground term off the heap refers into no frame and no trim can take it. Only looked for once a pin would follow.
+
+		if (is_ground(v) && !is_on_heap(q, v))
+			return true;
+
+		if (pin_query) {
+			q->no_tco = true;
+			q->total_no_recovs++;
+		}
+
+		if (pin_cur) {
+			frame *fc = GET_CURR_FRAME();
+			fc->no_recov = true;
+			fc->heap_pinned = true;
 			q->no_recov = true;
 			q->total_no_recovs++;
 		}
+
+		if (pin_v)
+			pin_frame(q, v_ctx);
 	} else {
 		e->c = *v;
 		share_cell(v);
 	}
+
+	return true;
 }
 
 void reset_var(query *q, const cell *c, pl_ctx c_ctx, cell *v, pl_ctx v_ctx)
@@ -288,27 +357,16 @@ void reset_var(query *q, const cell *c, pl_ctx c_ctx, cell *v, pl_ctx v_ctx)
 	e->c = *v;
 }
 
-void undo_var(query *q, const cell *c, pl_ctx c_ctx)
-{
-	const frame *f = GET_FRAME(c_ctx);
-	slot *e = get_slot(q, f, c->var_num);
-	unshare_cell(&e->c);
-	e->c.tag = TAG_EMPTY;
-	e->c.val_attrs = NULL;
-	// TO-DO: undo on trail
-	q->st.tp--;
-}
-
 static bool unify_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth);
 
 static bool unify_string_to_list(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
 {
-	LIST_HANDLER(p1);
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p1);
+	PROLOG_LIST_HANDLER(p2);
 
-	while (is_list(p1) && is_iso_list(p2)) {
-		cell *c1 = LIST_HEAD(p1);
-		cell *c2 = LIST_HEAD(p2);
+	while (is_list(p1) && is_list(p2)) {
+		cell *c1 = PROLOG_LIST_HEAD(p1);
+		cell *c2 = PROLOG_LIST_HEAD(p2);
 
 		pl_ctx c1_ctx = p1_ctx;
 		c2 = deref(q, c2, p2_ctx);
@@ -317,8 +375,8 @@ static bool unify_string_to_list(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl
 		if (!unify_internal(q, c1, c1_ctx, c2, c2_ctx, 0))
 			return false;
 
-		c1 = LIST_TAIL(p1);
-		c2 = LIST_TAIL(p2);
+		c1 = PROLOG_LIST_TAIL(p1);
+		c2 = PROLOG_LIST_TAIL(p2);
 
 		p1 = c1;
 		p2 = deref(q, c2, p2_ctx);
@@ -400,79 +458,157 @@ static bool unify_cstrings(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p
 	return false;
 }
 
-static bool unify_lists(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
+// Probe for (c1,ctx1)/(c2,ctx2). Returns the slot to use and sets
+// *found. Entries from an earlier compare/unify operation have a stale
+// generation and read as empty, which is safe with linear probing: an
+// entry inserted this generation can never sit behind a stale slot in
+// its own probe chain, because insertion would have stopped there.
+//
+// Terminates because the caller keeps at least half the table free.
+
+static unsigned unify_seen_slot(const unify_seen_pair *tab, unsigned size,
+	cell *c1, pl_ctx ctx1, cell *c2, pl_ctx ctx2, uint32_t gen, bool *found)
 {
-	cell *orig_p1 = p1, *orig_p2 = p2;
-	pl_ctx orig_p1_ctx = p1_ctx, orig_p2_ctx = p2_ctx;
-	bool any1 = false, any2 = false;
+	uintptr_t h = ((uintptr_t)c1 >> 3) ^ ((uintptr_t)c2 >> 2)
+		^ ((uintptr_t)ctx1 << 9) ^ (uintptr_t)ctx2;
+	unsigned i = (unsigned)(h & (size - 1));
 
-	while (is_iso_list(p1) && is_iso_list(p2)) {
-		cell *c1 = p1 + 1, *c2 = p2 + 1;
-		pl_ctx c1_ctx = p1_ctx, c2_ctx = p2_ctx;
-		slot *e1 = NULL, *e2 = NULL;
-		uint32_t save_vgen, save_vgen2;
-		int both = 0;
-
-		DEREF_VAR(any1, both, save_vgen, e1, e1->vgen, c1, c1_ctx, q->vgen);
-		DEREF_VAR(any1, both, save_vgen2, e2, e2->vgen2, c2, c2_ctx, q->vgen);
-
-		if (both != 2) {
-			if (!unify_internal(q, c1, c1_ctx, c2, c2_ctx, depth))
-				return false;
+	while (tab[i].gen == gen) {
+		if ((tab[i].c1 == c1) && (tab[i].c2 == c2)
+			&& (tab[i].ctx1 == ctx1) && (tab[i].ctx2 == ctx2)) {
+			*found = true;
+			return i;
 		}
 
-		if (e1) e1->vgen = save_vgen;
-		if (e2) e2->vgen2 = save_vgen2;
+		i = (i + 1) & (size - 1);
+	}
+
+	*found = false;
+	return i;
+}
+
+// Allocate, or double and rehash the live entries. False on OOM, where
+// the caller skips the memo: slower, never wrong.
+
+static bool unify_seen_grow(query *q)
+{
+	unsigned newsize = q->unify_seen_size ? q->unify_seen_size * 2 : UNIFY_SEEN_SIZE;
+	unify_seen_pair *tab = TPL_calloc(newsize, sizeof(unify_seen_pair));
+
+	if (!tab)
+		return false;
+
+	for (unsigned i = 0; i < q->unify_seen_size; i++) {
+		unify_seen_pair *p = &q->unify_seen[i];
+
+		if (p->gen != q->vgen)
+			continue;
+
+		bool found = false;
+		unsigned j = unify_seen_slot(tab, newsize, p->c1, p->ctx1, p->c2, p->ctx2, q->vgen, &found);
+		tab[j] = *p;
+	}
+
+	TPL_free(q->unify_seen);
+	q->unify_seen = tab;
+	q->unify_seen_size = newsize;
+	return true;
+}
+
+// True if this compound pair was already visited by the current
+// compare/unify operation; otherwise record it.
+
+static bool compound_pair_seen(query *q, cell *c1, pl_ctx ctx1, cell *c2, pl_ctx ctx2)
+{
+	if (((q->unify_seen_used + 1) * 2) > q->unify_seen_size) {
+		if (!unify_seen_grow(q))
+			return false;
+	}
+
+	bool found = false;
+	unsigned i = unify_seen_slot(q->unify_seen, q->unify_seen_size, c1, ctx1, c2, ctx2, q->vgen, &found);
+
+	if (found)
+		return true;
+
+	unify_seen_pair *p = &q->unify_seen[i];
+	p->c1 = c1;
+	p->c2 = c2;
+	p->ctx1 = ctx1;
+	p->ctx2 = ctx2;
+	p->gen = q->vgen;
+	q->unify_seen_used++;
+	return false;
+}
+
+static bool unify_lists(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
+{
+	if ((p1 == p2) && (p1_ctx == p2_ctx))
+		return true;
+
+	if ((++q->unify_seen_pairs > UNIFY_MEMO_AFTER)
+		&& compound_pair_seen(q, p1, p1_ctx, p2, p2_ctx))
+		return true;
+
+	// Brent's cycle detection on the walk: two cyclic lists repeat a pair of cells, so compare each pair against a
+	// checkpoint moved at every power of two. A repeat means the rest is a lap already unified.
+
+	const cell *save1 = NULL, *save2 = NULL;
+	pl_ctx save1_ctx = 0, save2_ctx = 0;
+	unsigned lap = 0, power = 1;
+
+	while (is_iso_list(p1) && is_iso_list(p2)) {
+		cell *c1 = deref(q, p1 + 1, p1_ctx);
+		pl_ctx c1_ctx = q->latest_ctx;
+		cell *c2 = deref(q, p2 + 1, p2_ctx);
+		pl_ctx c2_ctx = q->latest_ctx;
+
+		if (!unify_internal(q, c1, c1_ctx, c2, c2_ctx, depth+1))
+			return false;
+
 		p1 = p1 + 1; p1 += p1->num_cells;
 		p2 = p2 + 1; p2 += p2->num_cells;
-		e1 = e2 = NULL;
-		int both1 = 0, both2 = 0;
+		p1 = deref(q, p1, p1_ctx);
+		p1_ctx = q->latest_ctx;
+		p2 = deref(q, p2, p2_ctx);
+		p2_ctx = q->latest_ctx;
 
-		DEREF_VAR(any2, both1, save_vgen, e1, e1->vgen, p1, p1_ctx, q->vgen);
-		DEREF_VAR(any2, both2, save_vgen2, e2, e2->vgen2, p2, p2_ctx, q->vgen);
+		if ((p1 == save1) && (p2 == save2) && (p1_ctx == save1_ctx) && (p2_ctx == save2_ctx))
+			return true;
 
-		if (both1)
-			q->is_cyclic1++;
-
-		if (both2)
-			q->is_cyclic2++;
-
-		if (q->is_cyclic1 && q->is_cyclic2)
-			break;
+		if (++lap == power) {
+			save1 = p1; save1_ctx = p1_ctx;
+			save2 = p2; save2_ctx = p2_ctx;
+			power *= 2;
+			lap = 0;
+		}
 	}
 
 	return unify_internal(q, p1, p1_ctx, p2, p2_ctx, depth+1);
 }
 
-static bool unify_structs(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
+// The arguments of two compounds already known to share a functor and an arity.
+
+static bool unify_args(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, uint32_t arity, unsigned depth)
 {
-	if (p1->arity != p2->arity)
-		return false;
+	if ((p1 == p2) && (p1_ctx == p2_ctx))
+		return true;
 
-	if (p1->val_off != p2->val_off)
-		return false;
+	if ((++q->unify_seen_pairs > UNIFY_MEMO_AFTER)
+		&& compound_pair_seen(q, p1, p1_ctx, p2, p2_ctx))
+		return true;
 
-	int arity = p1->arity;
 	p1++; p2++;
 
 	while (arity--) {
-		pl_ctx c1_ctx = p1_ctx, c2_ctx = p2_ctx;
-		cell *c1 = p1, *c2 = p2;
-		slot *e1 = NULL, *e2 = NULL;
-		uint32_t save_vgen, save_vgen2;
-		bool any = false;
-		int both = 0;
+		cell *c1 = deref(q, p1, p1_ctx);
+		pl_ctx c1_ctx = q->latest_ctx;
+		cell *c2 = deref(q, p2, p2_ctx);
+		pl_ctx c2_ctx = q->latest_ctx;
 
-		DEREF_VAR(any, both, save_vgen, e1, e1->vgen, c1, c1_ctx, q->vgen);
-		DEREF_VAR(any, both, save_vgen2, e2, e2->vgen2, c2, c2_ctx, q->vgen);
+		if (!unify_internal(q, c1, c1_ctx, c2, c2_ctx, depth+1))
+			return false;
 
-		if (both != 2) {
-			if (!unify_internal(q, c1, c1_ctx, c2, c2_ctx, depth+1))
-				return false;
-		}
-
-		if (e1) e1->vgen = save_vgen;
-		if (e2) e2->vgen2 = save_vgen2;
 		p1 += p1->num_cells;
 		p2 += p2->num_cells;
 	}
@@ -480,28 +616,30 @@ static bool unify_structs(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2
 	return true;
 }
 
+static bool unify_structs(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
+{
+	const uint32_t arity = get_arity(p1);
+
+	if ((arity != get_arity(p2)) || (p1->val_off != p2->val_off))
+		return false;
+
+	return unify_args(q, p1, p1_ctx, p2, p2_ctx, arity, depth);
+}
+
 static bool unify_var(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
 {
-	bool was_cyclic = false;
-	bool check = !is_local(p1);
+	bool occurs = q->flags.occurs_check != OCCURS_CHECK_FALSE;
+	bool check = !is_local(p1) && (occurs || (q->sto_watch && !q->sto_seen));
+	bool was_cyclic = check && is_cyclic_term(q, p2, p2_ctx);
 
-	if (q->flags.occurs_check == OCCURS_CHECK_TRUE) {
-		if (check && is_cyclic_term(q, p2, p2_ctx))
-			was_cyclic = true;
-	} else if (q->flags.occurs_check == OCCURS_CHECK_ERROR) {
-		if (check && is_cyclic_term(q, p2, p2_ctx))
-			was_cyclic = true;
-	}
+	if (!set_var(q, p1, p1_ctx, p2, p2_ctx))
+		return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
 
-	set_var(q, p1, p1_ctx, p2, p2_ctx);
+	if (check && !was_cyclic && is_cyclic_term(q, p2, p2_ctx)) {
+		if (q->sto_watch)
+			q->sto_seen = true;
 
-	if (q->flags.occurs_check == OCCURS_CHECK_TRUE) {
-		if (!was_cyclic && check && is_cyclic_term(q, p2, p2_ctx)) {
-			q->cycle_error = 1;
-			return false;
-		}
-	} else if (q->flags.occurs_check == OCCURS_CHECK_ERROR) {
-		if (!was_cyclic && check && is_cyclic_term(q, p2, p2_ctx)) {
+		if (occurs) {
 			q->cycle_error = 1;
 			return false;
 		}
@@ -515,7 +653,7 @@ static bool unify_interned(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p
 	if (is_iso_list(p1) && is_iso_list(p2))
 		return unify_lists(q, p1, p1_ctx, p2, p2_ctx, depth);
 
-	if (p1->arity || p2->arity)
+	if (get_arity(p1) || get_arity(p2))
 		return unify_structs(q, p1, p1_ctx, p2, p2_ctx, depth+1);
 
 	if (is_interned(p2))
@@ -532,6 +670,22 @@ struct dispatch {
 	bool (*fn)(query*, cell*, pl_ctx, cell*, pl_ctx, unsigned);
 };
 
+static bool unify_blobs(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
+{
+	(void)q; (void)p1_ctx; (void)p2_ctx; (void)depth;
+	return is_blob(p2) && (p1->val_blob == p2->val_blob);
+}
+
+// deref() resolves indirects, so unify_internal() should never see one.
+// Present so the table covers every tag rather than reading past its
+// end - see the note on g_disp below.
+
+static bool unify_indirects(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
+{
+	(void)q; (void)p1; (void)p1_ctx; (void)p2; (void)p2_ctx; (void)depth;
+	return false;
+}
+
 static const struct dispatch g_disp[] =
 {
 	{TAG_EMPTY, NULL},
@@ -541,20 +695,85 @@ static const struct dispatch g_disp[] =
 	{TAG_INT, unify_integers},
 	{TAG_FLOAT, unify_floats},
 	{TAG_RATIONAL, unify_rationals},
+	{TAG_INDIRECT, unify_indirects},
+	{TAG_BLOB, unify_blobs},
 	{0}
 };
 
 static bool unify_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx, unsigned depth)
 {
+	// Most of what head matching unifies is leaves: two atoms, or two small integers. Both walked
+	// every tag test below and then dispatched, to end up comparing one field. Answer them here.
+
+	if (is_interned(p1) && is_interned(p2) && !get_arity(p1) && !get_arity(p2))
+		return p1->val_off == p2->val_off;
+
+	if (is_smallint(p1) && is_smallint(p2))
+		return get_smallint(p1) == get_smallint(p2);
+
+	// Two interned cells settle it between them: neither can be a variable or a string, so the
+	// tests below cannot change the answer, and the functor decides it before any dispatch.
+	// Same shape, same work as unify_interned() reaching unify_lists()/unify_structs(), minus
+	// asking again what we already know. The depth guard is the one thing that has to stay.
+
+	if (is_interned(p1) && is_interned(p2)) {
+		const uint32_t arity = get_arity(p1);
+
+		if ((arity != get_arity(p2)) || (p1->val_off != p2->val_off))
+			return false;
+
+		if (depth > MAX_UNIFY_DEPTH) {
+			q->cycle_error++;
+			q->unify_too_deep = true;
+			return false;
+		}
+
+		if (p1->val_off == g_dot_s && (arity == 2))
+			return unify_lists(q, p1, p1_ctx, p2, p2_ctx, depth);
+
+		return unify_args(q, p1, p1_ctx, p2, p2_ctx, arity, depth+1);
+	}
+
 	if (is_var(p1) && is_var(p2)) {
+		// Var-var with exactly one side attributed: bind the plain var
+		// to the attributed one so the attributes remain visible on the
+		// surviving root (SICStus attvar semantics - no hook fires for
+		// attvar/plain-var unification). If the attributed var lives in
+		// a younger frame, set_var() pins that frame.
+		const slot *e1 = get_slot(q, GET_FRAME(p1_ctx), p1->var_num);
+		const slot *e2 = get_slot(q, GET_FRAME(p2_ctx), p2->var_num);
+		bool a1 = !is_ref(&e1->c) && e1->c.val_attrs != NULL;
+		bool a2 = !is_ref(&e2->c) && e2->c.val_attrs != NULL;
+
+		if (a1 && !a2) {
+			if (!set_var(q, p2, p2_ctx, p1, p1_ctx))
+				return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
+
+			return true;
+		}
+
+		if (a2 && !a1) {
+			if (!set_var(q, p1, p1_ctx, p2, p2_ctx))
+				return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
+
+			return true;
+		}
+
+		bool ok;
+
 		if (p2_ctx > p1_ctx)
-			set_var(q, p2, p2_ctx, p1, p1_ctx);
+			ok = set_var(q, p2, p2_ctx, p1, p1_ctx);
 		else if (p2_ctx < p1_ctx)
-			set_var(q, p1, p1_ctx, p2, p2_ctx);
+			ok = set_var(q, p1, p1_ctx, p2, p2_ctx);
 		else if (p2->var_num > p1->var_num)
-			set_var(q, p2, p2_ctx, p1, p1_ctx);
+			ok = set_var(q, p2, p2_ctx, p1, p1_ctx);
 		else if (p2->var_num < p1->var_num)
-			set_var(q, p1, p1_ctx, p2, p2_ctx);
+			ok = set_var(q, p1, p1_ctx, p2, p2_ctx);
+		else
+			ok = true;
+
+		if (!ok)
+			return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
 
 		return true;
 	}
@@ -575,8 +794,12 @@ static bool unify_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p
 		return false;
 
 	if (is_string(p1)) {
-		if (is_string(p2))
-			return unify_cstrings(q, p1, p1_ctx, p2, p2_ctx, depth);
+		if (is_string(p2)) {
+			if (is_bytes(p1) == is_bytes(p2))
+				return unify_cstrings(q, p1, p1_ctx, p2, p2_ctx, depth);
+
+			return unify_string_to_list(q, p1, p1_ctx, p2, p2_ctx, depth);
+		}
 
 		if (is_iso_list(p2))
 			return unify_string_to_list(q, p1, p1_ctx, p2, p2_ctx, depth);
@@ -591,36 +814,40 @@ static bool unify_internal(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p
 		return false;
 	}
 
-	if ((q->is_cyclic1 || q->is_cyclic2)) {
-		if (depth > 30) {
-			//printf("*** OOPS %s %d\n", __FILE__, __LINE__);
-			q->cycle_error++;
-			return true;
-		}
-	} else if (depth > 30) {
-		//printf("*** OOPS %s %d\n", __FILE__, __LINE__);
-		q->cycle_error++;
-		return true;
+	if (depth > MAX_UNIFY_DEPTH) {
+		q->cycle_error++;			// what unify() already tests; the flag says which kind
+		q->unify_too_deep = true;
+		return false;
 	}
 
 	return g_disp[p1->tag].fn(q, p1, p1_ctx, p2, p2_ctx, depth);
 }
 
-bool unify(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx)
+static inline void unify_start(query *q)
 {
-	q->is_cyclic1 = q->is_cyclic2 = false;
-	q->has_vars = q->no_recov = false;
+	q->has_vars = q->no_recov = q->no_tco = false;
 	q->run_hook = false;
 	q->before_hook_tp = q->st.tp;
 	if (++q->vgen == 0) q->vgen = 1;
-	bool ok;
 
-	if (!is_var(p1) && is_var(p2))
-		ok = unify_internal(q, p2, p2_ctx, p1, p1_ctx, 0);
-	else
-		ok = unify_internal(q, p1, p1_ctx, p2, p2_ctx, 0);
+	// The memo is keyed by vgen, so every entry is invalidated by the
+	// bump above and the table is reused as-is; only the occupancy
+	// count has to reset, and doing it here keeps that branch out of
+	// compound_pair_seen()'s per-pair path.
 
+	q->unify_seen_used = 0;
+	q->unify_seen_pairs = 0;
+}
+
+static inline bool unify_finish(query *q, bool ok, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx)
+{
 	if (q->cycle_error) {
+		if (q->unify_too_deep) {
+			q->unify_too_deep = false;
+			q->run_hook = false;
+			return throw_error(q, p1, p1_ctx, "resource_error", "stack");
+		}
+
 		if (q->flags.occurs_check == OCCURS_CHECK_ERROR) {
 			q->run_hook = false;
 			return throw_error(q, p2, p2_ctx, "representation_error", "term");
@@ -633,4 +860,85 @@ bool unify(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx)
 	}
 
 	return true;
+}
+
+bool unify(query *q, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx)
+{
+	unify_start(q);
+	bool ok;
+
+	if (!is_var(p1) && is_var(p2))
+		ok = unify_internal(q, p2, p2_ctx, p1, p1_ctx, 0);
+	else
+		ok = unify_internal(q, p1, p1_ctx, p2, p2_ctx, 0);
+
+	return unify_finish(q, ok, p1, p1_ctx, p2, p2_ctx);
+}
+
+// A goal against a clause head: a void head argument is a singleton at depth 1, so nothing reads it and it is left unbound.
+
+bool unify_head(query *q, cell *goal, pl_ctx goal_ctx, cell *head, pl_ctx head_ctx)
+{
+	const uint32_t arity = get_arity(goal);
+
+	if (!arity || !is_interned(goal) || ((goal->val_off == g_dot_s) && (arity == 2))
+		|| (get_arity(head) != arity) || (head->val_off != goal->val_off))
+		return unify(q, goal, goal_ctx, head, head_ctx);
+
+	unify_start(q);
+	cell *p1 = goal + 1, *p2 = head + 1;
+	const bool plain = (q->flags.occurs_check == OCCURS_CHECK_FALSE) && !q->sto_watch;
+
+	for (uint32_t i = 0; i < arity; i++, p1 += p1->num_cells, p2 += p2->num_cells) {
+		if (is_void(p2))
+			continue;
+
+		// A head variable still unbound in the new frame cannot occur in the goal, so it just takes the argument.
+
+		if (plain && is_var(p2) && !is_ref(p2)) {
+			const slot *e = get_slot(q, GET_FRAME(head_ctx), p2->var_num);
+
+			if (is_empty(&e->c) && !e->c.val_attrs) {
+				cell *v = deref(q, p1, goal_ctx);
+
+				if (!set_var(q, p2, head_ctx, v, q->latest_ctx))
+					return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
+
+				continue;
+			}
+		}
+
+		cell *c1 = deref(q, p1, goal_ctx);
+		pl_ctx c1_ctx = q->latest_ctx;
+
+		// A '_' just inside a head argument occurs nowhere else: binding it does nothing but pin frames, so match around it.
+
+		if (is_interned(p2) && is_interned(c1) && get_arity(p2)
+			&& (get_arity(c1) == get_arity(p2)) && (c1->val_off == p2->val_off)) {
+			cell *a1 = c1 + 1, *a2 = p2 + 1;
+
+			for (uint32_t j = get_arity(p2); j--; a1 += a1->num_cells, a2 += a2->num_cells) {
+				if (is_var(a2) && is_anon(a2))
+					continue;
+
+				cell *d1 = deref(q, a1, c1_ctx);
+				pl_ctx d1_ctx = q->latest_ctx;
+				cell *d2 = deref(q, a2, head_ctx);
+				pl_ctx d2_ctx = q->latest_ctx;
+
+				if (!unify_internal(q, d1, d1_ctx, d2, d2_ctx, 3))
+					return unify_finish(q, false, goal, goal_ctx, head, head_ctx);
+			}
+
+			continue;
+		}
+
+		cell *c2 = deref(q, p2, head_ctx);
+		pl_ctx c2_ctx = q->latest_ctx;
+
+		if (!unify_internal(q, c1, c1_ctx, c2, c2_ctx, 2))
+			return unify_finish(q, false, goal, goal_ctx, head, head_ctx);
+	}
+
+	return unify_finish(q, true, goal, goal_ctx, head, head_ctx);
 }

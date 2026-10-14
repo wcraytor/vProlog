@@ -42,11 +42,11 @@ static bool do_put_atts(query *q, cell *attr, pl_ctx attr_ctx, bool is_minus)
 	if (!c->val_attrs && is_minus)
 		return true;
 
-	if (((attr->val_off == g_minus_s) || (attr->val_off == g_plus_s)) && (attr->arity == 1))
+	if (((attr->val_off == g_minus_s) || (attr->val_off == g_plus_s)) && (get_arity(attr) == 1))
 		attr++;
 
-	add_trail(q, p1_ctx, p1->var_num, c->val_attrs);
-	unsigned a_arity = attr->arity;
+	CHECKED(add_trail(q, p1_ctx, p1->var_num, c->val_attrs));
+	unsigned a_arity = get_arity(attr);
 	bool found;
 	const char *m_name = find_attribute(q, attr, a_arity, &found);
 	if (!found) return false;
@@ -58,10 +58,10 @@ static bool do_put_atts(query *q, cell *attr, pl_ctx attr_ctx, bool is_minus)
 		cell *tmp = alloc_tmp(q, 1+1);
 		CHECKED(tmp);
 		make_atom(tmp, g_dot_s);
-		tmp->arity = 2;
+		set_arity(tmp, 2);
 		tmp->num_cells += 1;
 		make_atom(tmp+1, new_atom(q->pl, m_name));
-		tmp[1].arity = 1;
+		set_arity(&tmp[1], 1);
 		cell *tmp2 = clone_term_to_tmp(q, attr, attr_ctx);
 		CHECKED(tmp2);
 		cell *tmp3 = get_tmp_heap(q, 1);
@@ -75,10 +75,10 @@ static bool do_put_atts(query *q, cell *attr, pl_ctx attr_ctx, bool is_minus)
 	if (c->val_attrs) {
 		cell *l = c->val_attrs;
 		pl_ctx l_ctx = c_ctx;
-		LIST_HANDLER(l);
+		PROLOG_LIST_HANDLER(l);
 
 		while (is_iso_list(l)) {
-			cell *h = LIST_HEAD(l);
+			cell *h = PROLOG_LIST_HEAD(l);
 			h = deref(q, h, l_ctx);
 			pl_ctx h_ctx = q->latest_ctx;
 			cell *h1 = deref(q, h+1, h_ctx);
@@ -86,14 +86,14 @@ static bool do_put_atts(query *q, cell *attr, pl_ctx attr_ctx, bool is_minus)
 
 			if (CMP_STRING_TO_CSTR(q, h, m_name)
 				|| CMP_STRING_TO_STRING(q, h1, attr)
-				|| (h1->arity != a_arity)) {
+				|| (get_arity(h1) != a_arity)) {
 				append_list(q, h);
 			} else if (is_minus) {
 				if (!unify(q, attr, attr_ctx, h1, h1_ctx))
 					return false;
 			}
 
-			l = LIST_TAIL(l);
+			l = PROLOG_LIST_TAIL(l);
 			l = deref(q, l, l_ctx);
 			l_ctx = q->latest_ctx;
 		}
@@ -117,6 +117,8 @@ static bool do_put_atts(query *q, cell *attr, pl_ctx attr_ctx, bool is_minus)
 	trim_heap(q);
 	CHECKED(undo_on_backtrack(q, l, UNDO_CELLS));
 	e->c.val_attrs = l;
+	pin_refs(q, l, l->num_cells, p1_ctx+1);
+	q->attrs_used = true;
 	return true;
 }
 
@@ -124,20 +126,20 @@ static bool bif_put_atts_2(query *q)
 {
 	GET_FIRST_ARG(p1,var);
 	GET_NEXT_ARG(p2,callable);
-	bool is_minus = (p2->val_off == g_minus_s) && (p2->arity == 1);
+	bool is_minus = (p2->val_off == g_minus_s) && (get_arity(p2) == 1);
 
 	if (is_iso_list(p2)) {
-		LIST_HANDLER(p2);
+		PROLOG_LIST_HANDLER(p2);
 
 		while (is_iso_list(p2)) {
-			cell *attr = LIST_HEAD(p2);
+			cell *attr = PROLOG_LIST_HEAD(p2);
 			attr = deref(q, attr, p2_ctx);
 			pl_ctx attr_ctx = q->latest_ctx;
 
 			if (!do_put_atts(q, attr, attr_ctx, is_minus))
 				return false;
 
-			p2 = LIST_TAIL(p2);
+			p2 = PROLOG_LIST_TAIL(p2);
 			p2 = deref(q, p2, p2_ctx);
 			p2_ctx = q->latest_ctx;
 		}
@@ -159,7 +161,7 @@ static bool bif_get_atts_2(query *q)
 	slot *e = get_slot(q, f, p1->var_num);
 	cell *c = deref(q, &e->c, e->c.val_ctx);
 	pl_ctx c_ctx = q->latest_ctx;
-	bool is_minus = !is_var(p2) && (p2->val_off == g_minus_s) && (p2->arity == 1);
+	bool is_minus = !is_var(p2) && (p2->val_off == g_minus_s) && (get_arity(p2) == 1);
 
 	if (!c->val_attrs)
 		return is_minus ? true : false;
@@ -168,17 +170,17 @@ static bool bif_get_atts_2(query *q)
 		cell *l = c->val_attrs;
 		pl_ctx l_ctx = c_ctx;
 		init_tmp_heap(q);
-		LIST_HANDLER(l);
+		PROLOG_LIST_HANDLER(l);
 
 		while (is_iso_list(l)) {
-			cell *h = LIST_HEAD(l);
+			cell *h = PROLOG_LIST_HEAD(l);
 			h = deref(q, h, l_ctx);
 			cell *h1 = deref(q, h+1, q->latest_ctx);
 
 			if (!is_nil(h1))
 				append_list(q, h1);
 
-			l = LIST_TAIL(l);
+			l = PROLOG_LIST_TAIL(l);
 			l = deref(q, l, l_ctx);
 			l_ctx = q->latest_ctx;
 		}
@@ -194,19 +196,19 @@ static bool bif_get_atts_2(query *q)
 
 	cell *attr = p2;
 
-	if (((p2->val_off == g_minus_s) || (p2->val_off == g_plus_s)) && (p2->arity == 1))
+	if (((p2->val_off == g_minus_s) || (p2->val_off == g_plus_s)) && (get_arity(p2) == 1))
 		attr++;
 
-	unsigned a_arity = attr->arity;
+	unsigned a_arity = get_arity(attr);
 	bool found;
 	const char *m_name = find_attribute(q, attr, a_arity, &found);
 	if (!found) return false;
 	cell *l = c->val_attrs;
 	pl_ctx l_ctx = c_ctx;
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_iso_list(l)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = deref(q, h, l_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 		cell *h1 = deref(q, h+1, h_ctx);
@@ -214,14 +216,14 @@ static bool bif_get_atts_2(query *q)
 
 		if (!CMP_STRING_TO_CSTR(q, h, m_name)
 			&& !CMP_STRING_TO_STRING(q, h1, attr)
-			&& (h1->arity == a_arity)) {
+			&& (get_arity(h1) == a_arity)) {
 			if (is_minus)
 				return false;
 
 			return unify(q, attr, p2_ctx, h1, h1_ctx);
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = deref(q, l, l_ctx);
 		l_ctx = q->latest_ctx;
 	}
@@ -274,7 +276,11 @@ static bool bif_sys_list_attributed_2(query *q)
 	pl_idx mark = get_smalluint(p1);
 
 	for (unsigned j = mark; j < q->st.tp; j++) {
-		const trail *tr = q->trails + j;
+		const trail *tr = get_trail(q, j);
+
+		if (is_frame_layout(tr))
+			continue;
+
 		const frame *f = GET_FRAME(tr->val_ctx);
 		slot *e = get_slot(q, f, tr->var_num);
 		cell *c = deref(q, &e->c, e->c.val_ctx);
@@ -331,10 +337,10 @@ static bool bif_sys_attributed_var_1(query *q)
 	cell *l = c->val_attrs;
 	pl_ctx l_ctx = c_ctx;
 	bool any = false;
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_iso_list(l)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = deref(q, h, l_ctx);
 		cell *h1 = deref(q, h+1, l_ctx);
 
@@ -343,7 +349,7 @@ static bool bif_sys_attributed_var_1(query *q)
 			break;
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = deref(q, l, l_ctx);
 		l_ctx = q->latest_ctx;
 	}
@@ -362,7 +368,13 @@ typedef struct {
 	slot e[];
 } bind_state;
 
-static void set_occurs(unsigned var_num, pl_ctx val_ctx, cell *c, pl_ctx c_ctx)
+// Mark a cyclically-bound variable's occurrences inside its own value,
+// so term_variables/2 in verify_attributes/3 skips the variable being
+// bound. The mark holds only for the hook: left on the heap cells it
+// hides that variable from every later term_variables/2, and a dif/2
+// that cannot see it posts no constraint at all (issue #1127).
+
+static void mark_occurs(unsigned var_num, pl_ctx val_ctx, cell *c, pl_ctx c_ctx, bool set)
 {
 	for (int num_cells = c->num_cells; num_cells--; c++) {
 		if (!is_var(c))
@@ -379,7 +391,10 @@ static void set_occurs(unsigned var_num, pl_ctx val_ctx, cell *c, pl_ctx c_ctx)
 		if (val_ctx != ctx)
 			continue;
 
-		c->flags |= FLAG_VAR_CYCLIC;
+		if (set)
+			c->flags |= FLAG_VAR_CYCLIC;
+		else
+			c->flags &= ~FLAG_VAR_CYCLIC;
 	}
 }
 
@@ -398,13 +413,17 @@ static bool bif_sys_undo_trail_2(query *q)
 	CHECKED(init_tmp_heap(q), TPL_free(save));
 
 	for (pl_idx i = q->undo_lo_tp, j = 0; i < q->undo_hi_tp; i++, j++) {
-		const trail *tr = q->trails + i;
+		const trail *tr = get_trail(q, i);
+
+		if (is_frame_layout(tr))
+			continue;
+
 		const frame *f = GET_FRAME(tr->val_ctx);
 		slot *e = get_slot(q, f, tr->var_num);
 		save->e[j].c = e->c;
 		cell *c = deref(q, &e->c, e->c.val_ctx);
 		pl_ctx c_ctx = q->latest_ctx;
-		set_occurs(tr->var_num, tr->val_ctx, c, c_ctx);
+		mark_occurs(tr->var_num, tr->val_ctx, c, c_ctx, true);
 		cell lhs, rhs;
 		make_ref(&lhs, tr->var_num, tr->val_ctx);
 
@@ -438,10 +457,20 @@ static bool bif_sys_redo_trail_1(query * q)
 	const bind_state *save = (bind_state*)p1->val_blob;
 
 	for (pl_idx i = save->lo_tp, j = 0; i < save->hi_tp; i++, j++) {
-		const trail *tr = q->trails + i;
+		const trail *tr = get_trail(q, i);
+
+		if (is_frame_layout(tr))
+			continue;
+
 		const frame *f = GET_FRAME(tr->val_ctx);
 		slot *e = get_slot(q, f, tr->var_num);
 		e->c = save->e[j].c;
+
+		// Close the bracket '$undo_trail'/2 opened: the binding is back,
+		// so the occurs marks it set have done their job (issue #1127).
+
+		cell *c = deref(q, &e->c, e->c.val_ctx);
+		mark_occurs(tr->var_num, tr->val_ctx, c, q->latest_ctx, false);
 	}
 
 	return true;
@@ -452,6 +481,7 @@ static bool bif_sys_mark_start_1(query * q)
 	GET_FIRST_ARG(p1,var);
 	cell mark;
 	make_uint(&mark, q->st.tp);
+	q->residue_used = true;
 	unify(q, p1, p1_ctx, &mark, q->st.cur_ctx);
 	return true;
 }

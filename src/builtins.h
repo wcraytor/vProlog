@@ -88,21 +88,36 @@ bool bif_iso_float_1(query *q);
 bool bif_iso_integer_1(query *q);
 
 bool do_yield(query *q, int msecs);
+bool do_yield_on_stream(query *q, stream *str, bool is_write);
+bool do_yield_now(query *q);
 bool do_yield_then(query *q, bool status);
 void do_yield_at(query *q, unsigned int time_in_ms);
 
+// Makes sure a queue depth exists, growing the array if it does not.
+bool ensure_queuen(query *q, unsigned qnum);
+
 inline static void init_queuen(query *q)
 {
-	TPL_free(q->queue[q->st.qnum]);
-	q->queue[q->st.qnum] = NULL;
-	q->qp[q->st.qnum] = 0;
-	q->qcnt[q->st.qnum] = 0;
+	qbuf *b = &q->queues[q->st.qnum];
+	TPL_free(b->queue);
+	b->queue = NULL;
+	b->qp = 0;
+	b->qcnt = 0;
 }
 
-inline static void grab_queuen(query *q)
+// Returns false when the nesting limit is reached or the array cannot grow;
+// the caller raises resource_error(max_queues) either way. It used to step
+// q->st.qnum first and let the caller notice afterwards, which wrote one
+// past the end of every one of those arrays before the check was reached.
+
+inline static bool grab_queuen(query *q)
 {
+	if (((q->st.qnum + 1) >= MAX_QUEUES) || !ensure_queuen(q, q->st.qnum + 1))
+		return false;
+
 	q->st.qnum++;
 	init_queuen(q);
+	return true;
 }
 
 inline static void drop_queuen(query *q)
@@ -113,54 +128,96 @@ inline static void drop_queuen(query *q)
 
 inline static pl_idx queuen_used(const query *q)
 {
-	return q->qp[q->st.qnum];
+	return q->queues[q->st.qnum].qp;
 }
 
 inline static cell *get_queuen(query *q)
 {
-	return q->queue[q->st.qnum];
+	return q->queues[q->st.qnum].queue;
+}
+
+// findall/3 and findnsols/4 rebuild their result list from the queue
+// with end_list(), which dup_cells() - i.e. takes its OWN reference to
+// every managed blob. The queue's references (alloc_queuen ->
+// dup_cells) are then redundant and must be released, or the blob
+// outlives the query. Order matters: unshare only AFTER end_list() has
+// taken its refs, or the last one drops to zero and the list gets
+// built over freed strbufs.
+//
+// NB. not every queue works this way: bif_sys_list_1() converts with an
+// explicitly unsafe copy that TRANSFERS ownership to the new list, so
+// that path must keep freeing the buffer raw via drop_queuen().
+
+inline static void free_solns(cell *solns, pl_idx num_cells)
+{
+	for (cell *c = solns; num_cells--; c++)
+		unshare_cell(c);
+
+	TPL_free(solns);
 }
 
 inline static cell *take_queuen(query *q)
 {
-	cell *save = q->queue[q->st.qnum];
-	q->queue[q->st.qnum] = NULL;
-	q->qp[q->st.qnum] = 0;
+	qbuf *b = &q->queues[q->st.qnum];
+	cell *save = b->queue;
+	b->queue = NULL;
+	b->qp = 0;
 	return save;
 }
 
-#define GET_CHOICE(i) (q->choices+(i))
-#define GET_CURR_CHOICE() GET_CHOICE(q->st.cp-1)
+static inline choice *get_choice(const query *q, pl_idx idx)
+{
+	choice_page *a = q->choice_current;
+
+	while (a && (idx < a->base))
+		a = a->prev;
+
+	while (a && (idx >= (a->base + a->page_size)))
+		a = a->next;
+
+	assert(a);
+	return a->entries + (idx - a->base);
+}
+#define GET_CHOICE(i) get_choice(q, (i))
+#define GET_CURR_CHOICE() (q->choice_next - 1)
 #define GET_PREV_CHOICE() GET_CHOICE(q->st.cp-2)
 
-#define GET_FRAME(i) (q->frames+(i))
+static inline void pop_choice(query *q)
+{
+	assert(q->st.cp);
+	q->st.cp--;
+
+	// choice_current owns the top live choice.  At a page boundary the
+	// decremented cp is the next free slot, so its predecessor is already
+	// on the previous page.
+	q->choice_next--;
+
+	if (q->choice_next == q->choice_current->entries && q->st.cp)
+	{
+		q->choice_current = q->choice_current->prev;
+		q->choice_next = q->choice_current->entries + q->choice_current->page_size;
+	}
+}
+
+static inline frame *get_frame(const query *q, pl_idx idx)
+{
+	return q->frame_pages[idx >> FRAME_PAGE_SHIFT] + (idx & (FRAME_PAGE_SIZE - 1));
+}
+#define GET_FRAME(i) get_frame(q, (i))
 #define GET_CURR_FRAME() GET_FRAME(q->st.cur_ctx)
 #define GET_NEW_FRAME() GET_FRAME(q->st.fp)
 
 inline static slot *get_slot(const query *q, const frame *f, unsigned var_num)
 {
 	return var_num < f->initial_slots
-		? q->slots + f->base + var_num
-		: q->slots + f->op + (var_num - f->initial_slots);
+		? f->slots + var_num
+		: f->ovf + (var_num - f->initial_slots);
 }
 
-inline static cell *deref(query *q, cell *c, pl_ctx c_ctx)
+__attribute__((always_inline))
+inline static cell *deref_from_slot(query *q, cell *c, pl_ctx c_ctx, slot *e)
 {
-	if (!is_var(c)) {
-		if (is_indirect(c)) {
-			q->latest_ctx = c->val_ctx;
-			return c->val_ptr;
-		}
-
-		q->latest_ctx = c_ctx;
-		return c;
-	}
-
-	if (is_ref(c))
-		c_ctx = c->val_ctx;
-
-	const frame *f = GET_FRAME(c_ctx);
-	slot *e = get_slot(q, f, c->var_num);
+	const frame *f;
 
 	while (is_var(&e->c)) {
 		c_ctx = e->c.val_ctx;
@@ -191,8 +248,39 @@ inline static cell *deref(query *q, cell *c, pl_ctx c_ctx)
 	return &e->c;
 }
 
+__attribute__((always_inline))
+inline static cell *deref(query *q, cell *c, pl_ctx c_ctx)
+{
+	if (!is_var(c)) {
+		if (is_indirect(c)) {
+			q->latest_ctx = c->val_ctx;
+			return c->val_ptr;
+		}
+
+		q->latest_ctx = c_ctx;
+		return c;
+	}
+
+	if (is_ref(c))
+		c_ctx = c->val_ctx;
+
+	const frame *f = GET_FRAME(c_ctx);
+	slot *e = get_slot(q, f, c->var_num);
+	return deref_from_slot(q, c, c_ctx, e);
+}
+
 #define FIRST_ARG(c) ((c)+1)
 #define NEXT_ARG(c) ((c)+(c)->num_cells)
+
+inline static cell *get_nth_arg(cell *c, unsigned n)
+{
+	c = FIRST_ARG(c);
+
+	while (n--)
+		c = NEXT_ARG(c);
+
+	return c;
+}
 
 #define GET_RAW_ARG(n,p) \
 	cell *p = get_raw_arg(q,n); \
@@ -301,9 +389,98 @@ inline static cell *get_raw_arg(query *q, int n)
 	CHECK_SENTINEL(expr, 0, __VA_ARGS__; \
 	return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory"))
 
+// Visit stamps for the walk in progress, in a table beside the slots so a slot is just its cell. An entry counts only
+// while q->vgen is its generation, so a bump empties the table as it used to retire every slot's stamp.
+
+void add_vgen(query *q, const slot *e, uint32_t val);
+
+inline static unsigned vgen_hash(const slot *e, unsigned mask)
+{
+	return (unsigned)((((uintptr_t)e >> 3) * 0x9E3779B97F4A7C15ULL) >> 40) & mask;
+}
+
+inline static uint32_t get_vgen(const query *q, const slot *e)
+{
+	if ((q->vgens_gen != q->vgen) || !q->vgens_used)
+		return 0;
+
+	const unsigned mask = q->vgens_size - 1;
+
+	for (unsigned i = vgen_hash(e, mask); ; i = (i + 1) & mask) {
+		const vgen_entry *v = &q->vgens[i];
+
+		if (v->gen != q->vgen)
+			return 0;
+
+		if (v->e == e)
+			return v->val;
+	}
+}
+
+inline static void set_vgen(query *q, const slot *e, uint32_t val)
+{
+	if (q->vgens_gen != q->vgen) {
+		q->vgens_gen = q->vgen;
+		q->vgens_used = 0;
+	}
+
+	if (q->vgens_used) {
+		const unsigned mask = q->vgens_size - 1;
+
+		for (unsigned i = vgen_hash(e, mask); ; i = (i + 1) & mask) {
+			vgen_entry *v = &q->vgens[i];
+
+			if (v->gen != q->vgen)
+				break;
+
+			if (v->e == e) {
+				v->val = val;
+				return;
+			}
+		}
+	}
+
+	if (val)
+		add_vgen(q, e, val);
+}
+
+// Stamp e with val and return what it was: one probe for the read and write a walk does at every variable.
+
+inline static uint32_t swap_vgen(query *q, const slot *e, uint32_t val)
+{
+	if (q->vgens_gen != q->vgen) {
+		q->vgens_gen = q->vgen;
+		q->vgens_used = 0;
+	}
+
+	if (((q->vgens_used + 1) * 2) <= q->vgens_size) {
+		const unsigned mask = q->vgens_size - 1;
+
+		for (unsigned i = vgen_hash(e, mask); ; i = (i + 1) & mask) {
+			vgen_entry *v = &q->vgens[i];
+
+			if (v->gen != q->vgen) {
+				*v = (vgen_entry){ e, q->vgen, val };
+				q->vgens_used++;
+				return 0;
+			}
+
+			if (v->e == e) {
+				const uint32_t old = v->val;
+				v->val = val;
+				return old;
+			}
+		}
+	}
+
+	const uint32_t old = get_vgen(q, e);
+	set_vgen(q, e, val);
+	return old;
+}
+
 // This one leaves original state if a cycle detected...
 
-#define DEREF_CHECKED(any, both, svg, e, evgen, c, c_ctx, qvgen)	\
+#define DEREF_CHECKED(any, both, svg, e, c, c_ctx, qvgen)			\
 	if (is_var(c)) {												\
 		pl_ctx tmp_c_ctx = c_ctx;									\
 		any = true;													\
@@ -313,20 +490,19 @@ inline static cell *get_raw_arg(query *q, int n)
 																	\
 		const frame *f = GET_FRAME(tmp_c_ctx);						\
 		e = get_slot(q, f, c->var_num);								\
-		svg = evgen;												\
+		svg = swap_vgen(q, e, qvgen);								\
 																	\
-		if (evgen == qvgen) {										\
+		if (svg == qvgen) {											\
 			both++;													\
 		} else {													\
 			c = deref(q, c, tmp_c_ctx);								\
 			c_ctx = q->latest_ctx;									\
-			evgen = qvgen;											\
 		}															\
 	}
 
 // This one always derefs...
 
-#define DEREF_VAR(any, both, svg, e, evgen, c, c_ctx, qvgen)		\
+#define DEREF_VAR(any, both, svg, e, c, c_ctx, qvgen)				\
 	if (is_var(c)) {												\
 		pl_ctx tmp_c_ctx = c_ctx;									\
 		any = true;													\
@@ -336,15 +512,12 @@ inline static cell *get_raw_arg(query *q, int n)
 																	\
 		const frame *f = GET_FRAME(tmp_c_ctx);						\
 		e = get_slot(q, f, c->var_num);								\
-		svg = evgen;												\
+		svg = swap_vgen(q, e, qvgen);								\
 																	\
-		if (evgen == qvgen) {										\
+		if (svg == qvgen)											\
 			both++;													\
-		} else {													\
-			evgen = qvgen;											\
-		}															\
 																	\
-		c = deref(q, c, tmp_c_ctx);									\
+		c = deref_from_slot(q, c, tmp_c_ctx, e);						\
 		c_ctx = q->latest_ctx;										\
 	}
 
@@ -355,7 +528,7 @@ inline static cell *get_raw_arg(query *q, int n)
 																	\
 		const frame *f = GET_FRAME(c_ctx);							\
 		slot *e = get_slot(q, f, c->var_num);						\
-		e->vgen = 0;												\
+		set_vgen(q, e, 0);											\
 		p = deref(q, c, c_ctx);										\
 		p_ctx = q->latest_ctx;										\
 	}
@@ -370,8 +543,6 @@ inline static cell *get_raw_arg(query *q, int n)
 	} \
 }
 
-
-bool bif_iso_halt_0(query *q);
 bool bif_iso_close_1(query *q);
 bool bif_iso_true_0(query *q);
 bool bif_iso_fail_0(query *q);
@@ -387,6 +558,9 @@ bool bif_sys_succeed_on_retry_1(query *q);
 bool bif_sys_succeed_on_retry_2(query *q);
 bool bif_sys_fail_on_retry_1(query *q);
 bool bif_sys_drop_barrier_1(query *q);
+bool bif_sys_block_catcher_1(query *q);
+bool bif_sys_catch_3(query *q);
+bool bif_sys_catch_exit_1(query *q);
 bool bif_sys_reset_handler_1(query *q);
 bool bif_sys_call_cleanup_3(query *q);
 bool bif_sys_queue_1(query *q);
@@ -394,6 +568,7 @@ bool bif_sys_get_level_1(query *q);
 bool bif_sys_set_if_var_2(query *q);
 bool bif_sys_jump_1(query *q);
 bool bif_sys_jump_if_nil_2(query *q);
+bool bif_sys_member_3(query *q);
 bool bif_sys_cut_1(query *q);
 bool bif_parse_csv_file_2(query *q);
 bool bif_parse_csv_line_3(query *q);
@@ -406,5 +581,3 @@ bool bif_sre_subst_4(query *q);
 bool bif_call_0(query *q, cell *p1, pl_ctx p1_ctx);
 bool bif_statistics_0(query *q);
 bool bif_sys_module_1(query *q);
-bool bif_sys_undo_1(query *q);
-bool bif_sys_create_var_1(query *q);

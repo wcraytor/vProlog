@@ -3,8 +3,7 @@
 #include <stdio.h>
 #include "trealla.h"
 extern char **environ;
-char **g_envp = NULL;
-void sigfn(int s) { (void)s; }
+extern char **g_envp;  /* defined by the engine (src/bif_os.c) */
 
 int main(void){
   g_envp = environ;

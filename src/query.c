@@ -1,3 +1,6 @@
+#if defined(_WIN32)
+#include <process.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,7 +13,16 @@
 #include "prolog.h"
 #include "query.h"
 
-#ifdef _WIN32
+#if TPL_FREESTANDING
+#include "platform/platform.h"
+static void msleep(int ms)
+{
+	uint64_t until = tpl_platform_monotonic_usec() + (uint64_t)ms * 1000u;
+
+	while (tpl_platform_monotonic_usec() < until)
+		;
+}
+#elif defined(_WIN32)
 #include <windows.h>
 #define msleep Sleep
 #else
@@ -27,7 +39,141 @@ static void msleep(int ms)
 
 #define DEBUG_MATCH if (0)
 
+#ifdef INDEX_PROFILE
+
+// Deliberately process-global and opt-in: this is diagnostic accounting for
+// one workload, not query state. It reports which dynamic predicate lookups
+// lose selectivity after an indexing change.
+
+#define INDEX_PROFILE_ROWS 1024
+
+typedef struct {
+	const predicate *pr;
+	char name[64];
+	unsigned arity;
+	uint64_t calls, linear, idx1, idx2, idx3, candidates;
+} index_profile_row;
+
+static index_profile_row g_index_profile[INDEX_PROFILE_ROWS];
+static bool g_index_profile_registered;
+
+static index_profile_row *index_profile_get(const predicate *pr)
+{
+	unsigned i = ((size_t)pr >> 4) % INDEX_PROFILE_ROWS;
+
+	for (unsigned probes = 0; probes < INDEX_PROFILE_ROWS; probes++) {
+		index_profile_row *r = &g_index_profile[i];
+
+		if (!r->pr) {
+			r->pr = pr;
+			r->arity = get_arity(&pr->key);
+			snprintf(r->name, sizeof(r->name), "%s", C_STR(pr->m, &pr->key));
+			return r;
+		}
+
+		if (r->pr == pr)
+			return r;
+
+		i = (i + 1) % INDEX_PROFILE_ROWS;
+	}
+
+	return NULL;
+}
+
+static void index_profile_report(void)
+{
+	for (unsigned rank = 0; rank < 20; rank++) {
+		index_profile_row *best = NULL;
+
+		for (unsigned i = 0; i < INDEX_PROFILE_ROWS; i++) {
+			index_profile_row *r = &g_index_profile[i];
+			if (r->pr && (!best || (r->candidates > best->candidates)))
+				best = r;
+		}
+
+		if (!best || !best->candidates)
+			break;
+
+		fprintf(stderr, "INDEX_PROFILE %s/%u calls=%llu linear=%llu idx1=%llu idx2=%llu idx3=%llu candidates=%llu avg=%.1f\n",
+			best->name, best->arity,
+			(unsigned long long)best->calls, (unsigned long long)best->linear,
+			(unsigned long long)best->idx1,
+			(unsigned long long)best->idx2, (unsigned long long)best->idx3,
+			(unsigned long long)best->candidates,
+			best->calls ? (double)best->candidates / best->calls : 0.0);
+
+		best->candidates = 0;
+	}
+}
+
+#define INDEX_PROFILE_START(pr) index_profile_row *ip = index_profile_get(pr); if (ip) ip->calls++
+#define INDEX_PROFILE_MODE(ip, n) if (ip) (ip)->n++
+#define INDEX_PROFILE_CANDIDATES(ip, n) if (ip) ((ip)->candidates += (n))
+
+#else
+
+#define INDEX_PROFILE_START(pr)
+#define INDEX_PROFILE_MODE(ip, n)
+#define INDEX_PROFILE_CANDIDATES(ip, n)
+
+#endif
+
 static const unsigned INITIAL_NBR_QUEUE_CELLS = 100;
+
+// The query's scratch parser, built on first use.
+//
+// Only number_codes/2 and number_chars/2 ever ask for one, but a parser is
+// 39KB - a 16000-byte name pool and six MAX_VARS arrays - and one was built
+// for every query ever created, which made it much the largest thing a query
+// allocated. Most queries never parse anything at all: a task, a findall, a
+// goal expansion, a format/3 sub-query.
+//
+// Built against the module the query was created in rather than the one in
+// force when it is first needed, because parser_create() fixes p->m and
+// p->flags and parser_reset() never revisits them. So a scratch parse means
+// the same thing wherever execution has got to, exactly as before.
+
+parser *query_parser(query *q)
+{
+	if (q->p)
+		return q->p;
+
+	q->p = parser_create(q->parser_m);
+
+	if (q->p)
+		q->p->q = q;
+
+	return q->p;
+}
+
+// Depths are entered one at a time and nearly always just the one, so this
+// grows to fit rather than doubling. A new depth starts with no buffer and
+// the initial size as its hint; alloc_queuen() does the rest.
+
+bool ensure_queuen(query *q, unsigned qnum)
+{
+	if (qnum < q->queues_alloc)
+		return true;
+
+	if (qnum >= MAX_QUEUES)
+		return false;
+
+	unsigned wanted = qnum + 1;
+	qbuf *queues = TPL_realloc(q->queues, wanted * sizeof(qbuf));
+
+	if (!queues)
+		return false;
+
+	for (unsigned i = q->queues_alloc; i < wanted; i++) {
+		queues[i].queue = NULL;
+		queues[i].qp = queues[i].qcnt = 0;
+		queues[i].q_size = INITIAL_NBR_QUEUE_CELLS;
+	}
+
+	q->queues = queues;
+	q->queues_alloc = wanted;
+	return true;
+}
 static const unsigned INITIAL_NBR_HEAP_CELLS = 100;
 static const unsigned INITIAL_NBR_SLOTS = 1000;
 static const unsigned INITIAL_NBR_TRAILS = 1000;
@@ -39,10 +185,22 @@ int g_tpl_interrupt = 0;
 
 typedef enum { CALL, EXIT, REDO, NEXT, FAIL } box_t;
 
-#define YIELD_INTERVAL 100000	// Goal interval between yield checks
+#define YIELD_INTERVAL 100000	// Goal interval between yield and pressure checks
 #define REDUCE_PRESSURE 1
-#define PRESSURE_FACTOR 4
 #define TRACE_MEM 0
+#define OOM_RESERVE_SIZE (1024U * 1024U)
+
+static void rearm_oom_reserve(query *q)
+{
+	if (!q->oom_reserve)
+		q->oom_reserve = TPL_malloc(OOM_RESERVE_SIZE);
+}
+
+void release_oom_reserve(query *q)
+{
+	TPL_free(q->oom_reserve);
+	q->oom_reserve = NULL;
+}
 
 void dump_term(query *q, const char *s, const cell *c)
 {
@@ -58,7 +216,7 @@ void dump_term(query *q, const char *s, const cell *c)
 		else if (is_var(c))
 			printf("_%u ", c->var_num);
 		else if (is_compound(c))
-			printf("%s/%u ", C_STR(q, c), c->arity);
+			printf("%s/%u ", C_STR(q, c), get_arity(c));
 
 		printf("\n");
 	}
@@ -88,6 +246,12 @@ static void trace_call(query *q, cell *c, pl_ctx c_ctx, box_t box)
 	if (c->val_off == g_sys_block_catcher_s)
 		return;
 
+	if (c->val_off == g_sys_catch_s)
+		return;
+
+	if (c->val_off == g_sys_catch_exit_s)
+		return;
+
 	if (c->val_off == g_conjunction_s)
 		return;
 
@@ -98,6 +262,22 @@ static void trace_call(query *q, cell *c, pl_ctx c_ctx, box_t box)
 	if (box == CALL)
 		box = q->retry?REDO:CALL;
 
+	// '$member'(X, L, V) is member(X, L) to whoever is tracing: print its cells without the hidden V
+
+	cell *as_member = NULL;
+
+	if ((c->val_off == g_sys_member_s) && (get_arity(c) == 3)) {
+		pl_idx n = c->num_cells - 1;
+
+		if ((as_member = TPL_malloc(sizeof(cell)*n)) != NULL) {
+			memcpy(as_member, c, sizeof(cell)*n);
+			as_member->val_off = g_member_s;
+			set_arity(as_member, 2);
+			as_member->num_cells = n;
+			c = as_member;
+		}
+	}
+
 	const char *src = C_STR(q, c);
 	frame *f = GET_CURR_FRAME();
 	q->step++;
@@ -107,7 +287,7 @@ static void trace_call(query *q, cell *c, pl_ctx c_ctx, box_t box)
 		q->my_chan,
 		q->st.m->name,
 		q->step,
-		q->st.cur_ctx, q->st.fp, q->st.cp, q->st.sp,
+		q->st.cur_ctx, q->st.fp, q->st.cp, slot_index(q, q->st.sp),
 		q->st.tp,
 		q->st.hp, q->st.hp_num,
 		f->no_recov
@@ -124,6 +304,7 @@ static void trace_call(query *q, cell *c, pl_ctx c_ctx, box_t box)
 	q->quoted = true;
 	q->double_quotes = true;
 	char *dst = print_term_to_strbuf(q, c, c_ctx, -1);
+	TPL_free(as_member);
 	SB_strcat(pr, dst);
 	TPL_free(dst);
 	q->quoted = false;
@@ -133,13 +314,41 @@ static void trace_call(query *q, cell *c, pl_ctx c_ctx, box_t box)
 	size_t srclen = srclen = SB_strlen(pr);
 	int n = q->pl->current_error;
 	stream *str = &q->pl->streams[n];
-	net_write(src, srclen, str);
+	tpl_write(src, srclen, str);
 	SB_free(pr);
 	if (++q->vgen == 0) q->vgen = 1;
 
 	if (q->creep) {
 		msleep(250);
 	}
+}
+
+static void free_slot_pages(slot_page *a)
+{
+	while (a) {
+		slot_page *save = a;
+		a = a->next;
+		TPL_free(save->slots);
+		TPL_free(save);
+	}
+}
+
+// What the query has in use, against a thread's stack_limit(Bytes). It is
+// worked out only when an area takes a new page, which is rare, and the
+// engine throws on its next goal, where a throw is safe.
+
+void check_stack_limit(query *q)
+{
+	if (!q->stack_limit)
+		return;
+
+	size_t slots = q->st.sp_page ? q->st.sp_page->base + (size_t)(q->st.sp - q->st.sp_page->slots) : 0;
+	size_t cells = q->heap_pages ? q->heap_pages->base + q->st.hp : 0;
+	size_t used = (size_t)q->st.fp * sizeof(frame) + (size_t)q->st.cp * sizeof(choice)
+		+ (size_t)q->st.tp * sizeof(trail) + slots * sizeof(slot) + cells * sizeof(cell);
+
+	if (used > q->stack_limit)
+		q->stack_over = q->goal_trap = true;
 }
 
 void check_pressure(query *q)
@@ -150,136 +359,363 @@ void check_pressure(query *q)
 		q->tmp_heap = NULL;
 		q->tmph_size = 1000;
 	}
+#endif
+}
 
-#if TRACE_MEM
-	printf("*** q->st.tp=%u, q->trails_size=%u\n", (unsigned)q->st.tp, (unsigned)q->trails_size);
-#endif
-	if (q->st.tp < (q->trails_size / 2)) {
-		unsigned new_size = q->st.tp < INITIAL_NBR_TRAILS ? INITIAL_NBR_TRAILS : q->st.tp + 1;
-		q->trails_size = alloc_grow(q, (void**)&q->trails, sizeof(trail), new_size, new_size*3/2);
-	}
-#if TRACE_MEM
-	printf("*** q->st.cp=%u, q->choices_size=%u\n", (unsigned)q->st.cp, (unsigned)q->choices_size);
-#endif
-	if (q->st.cp < (q->choices_size / 2)) {
-		unsigned new_size = q->st.cp < INITIAL_NBR_CHOICES ? INITIAL_NBR_CHOICES : q->st.cp + 1;
-		q->choices_size = alloc_grow(q, (void**)&q->choices, sizeof(choice), new_size, new_size*3/2);
-	}
-#if TRACE_MEM
-	printf("*** q->st.fp=%u, q->frames_size=%u\n", (unsigned)q->st.fp, (unsigned)q->frames_size);
-#endif
-	if (q->st.fp < (q->frames_size / 2)) {
-		unsigned new_size = q->st.fp < INITIAL_NBR_FRAMES ? INITIAL_NBR_FRAMES : q->st.fp + 1;
-		q->frames_size = alloc_grow(q, (void**)&q->frames, sizeof(frame), new_size, new_size*3/2);
-	}
-#if TRACE_MEM
-	printf("*** q->st.sp=%u, q->slots_size=%u\n", (unsigned)q->st.sp, (unsigned)q->slots_size);
-#endif
-	if (q->st.sp < (q->slots_size / 2)) {
-		unsigned new_size = q->st.sp < INITIAL_NBR_SLOTS ? INITIAL_NBR_SLOTS : q->st.sp + 1;
-		q->slots_size = alloc_grow(q, (void**)&q->slots, sizeof(slot), new_size, new_size*3/2);
-	}
-#endif
+// A choicepoint's undo list, allocated the first time one is needed and kept with the choicepoint slot for reuse.
+
+static list *choice_undo(choice *ch)
+{
+	if (!ch->undo && (ch->undo = TPL_calloc(1, sizeof(list))))
+		list_init(ch->undo);
+
+	return ch->undo;
 }
 
 static bool check_choice(query *q)
 {
-	if (q->st.cp < q->choices_size)
+	choice_page *a = q->choice_current;
+
+	if (a && (q->choice_next < (a->entries + a->page_size)))
 		return true;
 
-	pl_idx new_choicessize = alloc_grow(q, (void**)&q->choices, sizeof(choice), q->st.cp+1, q->choices_size*3/2);
+	if (a && a->next) {
+		q->choice_current = a = a->next;
+		q->choice_next = a->entries;
+		return true;
+	}
 
-	if (!new_choicessize) {
+	a = TPL_calloc(1, sizeof(choice_page));
+	if (!a) {
 		q->oom = q->error = true;
 		return false;
 	}
 
-	q->choices_size = new_choicessize;
+	a->page_size = q->choice_current ? q->choice_current->page_size * 2 : INITIAL_NBR_CHOICES;
+	a->entries = TPL_calloc(a->page_size, sizeof(choice));
+
+	if (!a->entries) {
+		TPL_free(a);
+		q->oom = q->error = true;
+		return false;
+	}
+
+	a->base = q->st.cp;
+	a->prev = q->choice_current;
+
+	if (a->prev)
+		a->prev->next = a;
+	else
+		q->choice_pages = a;
+
+	q->choice_current = a;
+	q->choice_next = a->entries;
+	check_stack_limit(q);
 	return true;
 }
 
 bool check_frame(query *q, unsigned max_vars)
 {
 	CHECKED(check_slot(q, max_vars));
+	pl_idx page_idx = q->st.fp >> FRAME_PAGE_SHIFT;
 
-	if (q->st.fp < q->frames_size) {
-		frame *f = GET_NEW_FRAME();
-		f->max_vars = max_vars;
-		f->base = q->st.sp;
-		return true;
+	if (page_idx >= q->frame_pages_size) {
+		pl_idx pages = alloc_grow(q, (void**)&q->frame_pages, sizeof(frame *),
+			page_idx + 1, (page_idx + 1) * 2);
+
+		if (!pages) {
+			q->oom = q->error = true;
+			return false;
+		}
+
+		memset(q->frame_pages + q->frame_pages_size, 0,
+			(pages - q->frame_pages_size) * sizeof(frame *));
+		q->frame_pages_size = pages;
 	}
 
-	pl_idx new_framessize = alloc_grow(q, (void**)&q->frames, sizeof(frame), q->st.fp+1, q->frames_size*3/2);
+	if (!q->frame_pages[page_idx]) {
+		frame *frames = TPL_calloc(FRAME_PAGE_SIZE, sizeof(frame));
+		if (!frames) {
+			q->oom = q->error = true;
+			return false;
+		}
 
-	if (!new_framessize) {
-		q->oom = q->error = true;
-		return false;
+		for (unsigned i = 0; i < FRAME_PAGE_SIZE; i++)
+			frames[i].slots = frames[i].ovf = q->slot_pages->slots;
+
+		q->frame_pages[page_idx] = frames;
+		check_stack_limit(q);
 	}
 
-	q->frames_size = new_framessize;
 	frame *f = GET_NEW_FRAME();
-	f->max_vars = max_vars;
-	f->base = q->st.sp;
+	f->slots = q->st.sp;
 	return true;
 }
 
+// A too-small next page stays in the list past the new one, as a stale frame above fp can still point into it.
+
+static bool next_slot_page(query *q, unsigned cnt)
+{
+	slot_page *a = q->st.sp_page, *b = a->next;
+
+	if (!b || ((size_t)(b->end - b->slots) <= cnt)) {
+		slot *slots = NULL;
+		size_t n = alloc_grow(q, (void**)&slots, sizeof(slot), (size_t)cnt + 1, (size_t)(a->end - a->slots) * 2);
+		b = n ? TPL_calloc(1, sizeof(slot_page)) : NULL;
+
+		if (!b) {
+			TPL_free(slots);
+			q->oom = q->error = true;
+			return false;
+		}
+
+		b->slots = slots;
+		b->end = slots + n;
+		b->prev = a;
+		b->next = a->next;
+
+		if (b->next)
+			b->next->prev = b;
+
+		a->next = b;
+	}
+
+	a->used = q->st.sp - a->slots;
+	b->base = a->base + a->used;
+	q->st.sp_page = b;
+	q->st.sp = b->slots;
+	check_stack_limit(q);
+	return true;
+}
+
+// The visit-stamp table beside the slots (see get_vgen() in builtins.h), doubled, keeping this generation's entries.
+
+static bool vgens_grow(query *q)
+{
+	const unsigned size = q->vgens_size ? q->vgens_size * 2 : 256;
+	vgen_entry *tab = TPL_calloc(size, sizeof(vgen_entry));
+
+	if (!tab)
+		return false;
+
+	for (unsigned i = 0; i < q->vgens_size; i++) {
+		const vgen_entry *v = &q->vgens[i];
+
+		if (v->gen != q->vgen)
+			continue;
+
+		unsigned j = vgen_hash(v->e, size - 1);
+
+		while (tab[j].gen == q->vgen)
+			j = (j + 1) & (size - 1);
+
+		tab[j] = *v;
+	}
+
+	TPL_free(q->vgens);
+	q->vgens = tab;
+	q->vgens_size = size;
+	return true;
+}
+
+// The out-of-line half of set_vgen(): e has no entry this generation yet, and val is not 0.
+
+void add_vgen(query *q, const slot *e, uint32_t val)
+{
+	if (((q->vgens_used + 1) * 2) > q->vgens_size) {
+		if (!vgens_grow(q)) {
+			q->oom = q->error = true;
+			return;
+		}
+	}
+
+	unsigned i = vgen_hash(e, q->vgens_size - 1);
+
+	while (q->vgens[i].gen == q->vgen)
+		i = (i + 1) & (q->vgens_size - 1);
+
+	q->vgens[i] = (vgen_entry){ e, q->vgen, val };
+	q->vgens_used++;
+}
+
+// Make room for a run of cnt slots at sp, which moves to the start of the next page if its own is short.
+
 bool check_slot(query *q, unsigned cnt)
 {
-	cnt += 2;	// Allow some extra
-
-	pl_idx num = q->st.sp + cnt;
-
-	if (num < q->slots_size)
-		return true;
-
-	pl_idx new_slotssize = alloc_grow(q, (void**)&q->slots, sizeof(slot), num+1, num*3/2);
-
-	if (!new_slotssize) {
+	if (cnt > UINT32_MAX - 2) {
 		q->oom = q->error = true;
 		return false;
 	}
 
-	q->slots_size = new_slotssize;
-	return true;
+	cnt += 2;	// Allow some extra
+
+	if ((size_t)(q->st.sp_page->end - q->st.sp) > cnt)
+		return true;
+
+	return next_slot_page(q, cnt);
+}
+
+static inline void check_slots_highwater(query *q)
+{
+	pl_idx n = q->st.sp_page->base + (pl_idx)(q->st.sp - q->st.sp_page->slots);
+
+	if (n > q->hw_slots)
+		q->hw_slots = n;
+}
+
+// A slot's index as if the live slots were one array, skipped page tails left out, which is what names a variable when printing.
+
+pl_idx slot_index(const query *q, const slot *e)
+{
+	pl_idx n = 0;
+
+	for (const slot_page *a = q->slot_pages; a; a = a->next) {
+		if ((e >= a->slots) && (e <= a->end))
+			return n + (pl_idx)(e - a->slots);
+
+		n += a->used;
+	}
+
+	return n;
 }
 
 bool check_trail(query *q)
 {
-	if (q->st.tp < q->trails_size)
+	trail_page *a = q->trail_current;
+
+	if (a && (q->trail_next < (a->entries + a->page_size)))
 		return true;
 
-	pl_idx new_trailssize = alloc_grow(q, (void**)&q->trails, sizeof(trail), q->st.tp+1, q->trails_size*3/2);
+	if (a && a->next) {
+		q->trail_current = a = a->next;
+		q->trail_next = a->entries;
+		return true;
+	}
 
-	if (!new_trailssize) {
+	a = TPL_calloc(1, sizeof(trail_page));
+	if (!a) {
 		q->oom = q->error = true;
 		return false;
 	}
 
-	q->trails_size = new_trailssize;
+	a->page_size = q->trail_current ? q->trail_current->page_size * 2 : INITIAL_NBR_TRAILS;
+	a->entries = TPL_calloc(a->page_size, sizeof(trail));
+
+	if (!a->entries) {
+		TPL_free(a);
+		q->oom = q->error = true;
+		return false;
+	}
+
+	a->base = q->st.tp;
+	a->prev = q->trail_current;
+
+	if (a->prev)
+		a->prev->next = a;
+	else
+		q->trail_pages = a;
+
+	q->trail_current = a;
+	q->trail_next = a->entries;
+	check_stack_limit(q);
 	return true;
 }
 
-bool undo_on_backtrack(query *q, void *v, enum undo_item type)
+trail *get_trail(query *q, pl_idx idx)
+{
+	trail_page *a = q->trail_current;
+
+	while (a && (idx < a->base))
+		a = a->prev;
+
+	while (a && (idx >= (a->base + a->page_size)))
+		a = a->next;
+
+	assert(a);
+	return a->entries + (idx - a->base);
+}
+
+// An item goes on the current choicepoint, or on the query when there is
+// none, and a cut promotes it outwards rather than dropping it.
+
+static undo_item *push_undo_item(query *q)
 {
 	undo_item *u = TPL_calloc(1, sizeof(undo_item));
-	if (!u) return false;
+	if (!u) return NULL;
 	u->m = q->st.m;
-	u->c = v;
-
-	if (type == UNDO_BBOARD)
-		u->is_bboard = true;
-	else
-		u->is_cells = true;
 
 	list *undo;
 
 	if (q->st.cp) {
 		choice *ch = GET_CURR_CHOICE();
-		undo = &ch->undo;
+		undo = choice_undo(ch);
+
+		if (!undo) {
+			TPL_free(u);
+			return NULL;
+		}
 	} else
 		undo = &q->undo;
 
 	list_push_back(undo, u);
+	return u;
+}
+
+bool undo_on_backtrack(query *q, void *v, enum undo_item type)
+{
+	undo_item *u = push_undo_item(q);
+	if (!u) return false;
+	u->c = v;
+
+	if (type == UNDO_RULE)
+		u ->is_rule = true;
+	else
+		u->is_cells = true;
+
+	return true;
+}
+
+// A b_setval/2 entry to take back off thread t's variables, if still on top.
+
+bool undo_gvar_on_backtrack(query *q, void *t, const char *key, uint64_t id)
+{
+	char *k = TPL_strdup(key);
+	if (!k) return false;
+	undo_item *u = push_undo_item(q);
+	if (!u) { TPL_free(k); return false; }
+	u->tptr = t;
+	u->key = k;
+	u->gvar_id = id;
+	u->is_gvar = true;
+	return true;
+}
+
+// A bb_b_put/2 entry to take back off m's blackboard. The key is the
+// undo's own copy: a bb_put/2 meanwhile frees the one the entry holds.
+
+bool undo_bb_on_backtrack(query *q, module *m, const char *key)
+{
+	char *k = TPL_strdup(key);
+	if (!k) return false;
+	undo_item *u = push_undo_item(q);
+	if (!u) { TPL_free(k); return false; }
+	u->m = m;
+	u->key = k;
+	u->is_bboard = true;
+	return true;
+}
+
+// close/1 does not unmap: a slice carries no refcount, so the mapping has to
+// outlive the stream for a term that holds one to stay good. Backtracking over
+// the open/4 undoes every binding made since, so nothing can reach it then.
+
+bool undo_mmap_on_backtrack(query *q, void *addr, size_t len)
+{
+	undo_item *u = push_undo_item(q);
+	if (!u) return false;
+	u->addr = addr;
+	u->mmap_len = len;
+	u->is_mmap = true;
 	return true;
 }
 
@@ -311,6 +747,97 @@ void make_call_redo(query *q, cell *tmp)
 	tmp->mid = q->st.m->id;				// ... current-module
 }
 
+// A control-construct goal is run as its body: the control structure as
+// the clone made to check it has it, every variable in it dereferenced at
+// the time of the call (ISO 7.6.2), so a cut nested behind one still cuts,
+// but each leaf goal by reference from the original, so the terms its
+// arguments are bound to stay the caller's, for nb_setarg/3. The walk
+// follows the clone, which is finite even where the goal is cyclic.
+
+// A control construct by its functor, not by the builtin flag, which a
+// goal built as data, say by unifying a clause head (A;B), does not carry.
+
+bool is_control_pair(const cell *c)
+{
+	return is_interned(c) && (get_arity(c) == 2)
+		&& ((c->val_off == g_conjunction_s) || (c->val_off == g_disjunction_s)
+			|| (c->val_off == g_if_then_s) || (c->val_off == g_soft_cut_s));
+}
+
+// A term built as data, by unifying a clause head (A;B) say, carries no
+// builtin: run as it is, a ,/2 there was a call, and the cut inside it
+// cut only that call. Give it the builtin, as call_check() does on top.
+
+static void resolve_control(query *q, cell *c)
+{
+	if (is_builtin(c) && c->bif_ptr)
+		return;
+
+	bool found = false;
+	builtins *bif = get_builtin_term(q->st.m, c, &found, NULL);
+
+	if (found && bif) {
+		c->bif_ptr = bif;
+		c->flags |= FLAG_INTERNED_BUILTIN;
+	}
+}
+
+// The right-hand chain, as in a long conjunction, is walked in a loop and
+// only a left operand recursed into, so the C stack grows with the left
+// nesting, not with the length of the goal.
+
+static pl_idx body_cells(query *q, cell *cl, cell *o, pl_ctx o_ctx, cell *dst)
+{
+	pl_idx n = 0;
+	unsigned spine = 0;
+
+	for (;;) {
+		o = deref(q, o, o_ctx);
+		o_ctx = q->latest_ctx;
+
+		if (!is_control_pair(cl) || !is_control_pair(o) || (o->val_off != cl->val_off))
+			break;
+
+		if (dst) {
+			copy_cells(dst + n, cl, 1);
+			resolve_control(q, dst + n);
+		}
+
+		cell *cl1 = cl + 1, *o1 = o + 1;
+		n++;
+		n += body_cells(q, cl1, o1, o_ctx, dst ? dst + n : NULL);
+		cl = cl1 + cl1->num_cells;
+		o = o1 + o1->num_cells;
+		spine++;
+	}
+
+	if (dst) {
+		dup_cells_by_ref(dst + n, o, o_ctx, o->num_cells);
+
+		if (is_interned(dst + n) && !get_arity(dst + n) && (dst[n].val_off == g_cut_s))
+			resolve_control(q, dst + n);
+	}
+
+	n += o->num_cells;
+
+	// Each header on the chain spans from itself to the end.
+
+	for (pl_idx pos = 0; dst && spine--; pos += 1 + dst[pos+1].num_cells)
+		dst[pos].num_cells = n - pos;
+
+	return n;
+}
+
+cell *prepare_call_body(query *q, bool noskip, cell *clone, cell *p1, pl_ctx p1_ctx, unsigned extras)
+{
+	pl_idx n = body_cells(q, clone, p1, p1_ctx, NULL);
+	cell *tmp = alloc_heap(q, n + extras);
+	if (!tmp) return NULL;
+	q->noskip = noskip;
+	body_cells(q, clone, p1, p1_ctx, tmp);
+	return tmp;
+}
+
 cell *prepare_call(query *q, bool noskip, cell *p1, pl_ctx p1_ctx, unsigned extras)
 {
 	unsigned num_cells = p1->num_cells + extras;
@@ -336,15 +863,15 @@ static size_t scan_is_chars_list_internal(query *q, cell *l, pl_ctx l_ctx, bool 
 	cell *save_l = l;
 	pl_ctx save_l_ctx = l_ctx;
 	bool any1 = false, any2 = false;
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_list(l) && (q->st.m->flags.double_quote_chars || allow_codes)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		pl_ctx h_ctx = l_ctx;
 		slot *e = NULL;
 		uint32_t save_vgen = 0;
 		int both = 0;
-		DEREF_VAR(any1, both, save_vgen, e, e->vgen, h, h_ctx, q->vgen);
+		DEREF_VAR(any1, both, save_vgen, e, h, h_ctx, q->vgen);
 		q->suspect = h;
 
 		if (is_var(h)) {
@@ -374,12 +901,12 @@ static size_t scan_is_chars_list_internal(query *q, cell *l, pl_ctx l_ctx, bool 
 			is_chars_list += len;
 		}
 
-		if (e) e->vgen = save_vgen;
-		l = LIST_TAIL(l);
+		if (e) set_vgen(q, e, save_vgen);
+		l = PROLOG_LIST_TAIL(l);
 		cell *lsave = l;
 
 		both = 0;
-		DEREF_VAR(any2, both, save_vgen, e, e->vgen, l, l_ctx, q->vgen);
+		DEREF_VAR(any2, both, save_vgen, e, l, l_ctx, q->vgen);
 
 		if (both) {
 			*is_partial = true;
@@ -391,11 +918,11 @@ static size_t scan_is_chars_list_internal(query *q, cell *l, pl_ctx l_ctx, bool 
 	if (any2 && !*is_partial) {
 		cell *l2 = save_l;
 		pl_ctx l2_ctx = save_l_ctx;
-		LIST_HANDLER(l2);
+		PROLOG_LIST_HANDLER(l2);
 
 		while (is_list(l2) && (q->st.m->flags.double_quote_chars || allow_codes)) {
-			LIST_HEAD(l2);
-			l2 = LIST_TAIL(l2);
+			PROLOG_LIST_HEAD(l2);
+			l2 = PROLOG_LIST_TAIL(l2);
 			RESTORE_VAR(l2, l2_ctx, l2, l2_ctx, q->vgen);
 		}
 	}
@@ -455,34 +982,40 @@ int create_vars(query *q, unsigned cnt)
 	if (!cnt)
 		return f->actual_slots;
 
-	if ((f->actual_slots + cnt) > MAX_LOCAL_VARS) {
-		q->oom = q->error = true;
+	// Fail soft: callers use CHECKED() to throw resource_error(memory).
+	// Setting oom/error here would make start() abort the query even when
+	// catch/3 handles the throw (issue #1094).
+	if ((f->actual_slots > MAX_LOCAL_VARS) || (cnt > (MAX_LOCAL_VARS - f->actual_slots)))
 		return -1;
-	}
 
-	if (!check_slot(q, cnt)) {
-		q->error = true;
+	if (!check_slot(q, cnt))
 		return -1;
-	}
 
 	unsigned var_num = f->actual_slots;
+	const bool no_ovf = f->ovf == q->slot_pages->slots;
 
-	if (!f->op && ((f->base + f->initial_slots) == q->st.sp)) {
+	// A choicepoint made since this frame restores only its own frame's layout, yet rewinds sp under a run moved up here.
+
+	if (q->st.cp && (GET_CURR_CHOICE()->st.fp > q->st.cur_ctx)
+		&& !add_trail(q, q->st.cur_ctx, TRAIL_FRAME_LAYOUT | f->actual_slots, no_ovf ? NULL : (cell*)f->ovf))
+		return -1;
+
+	if (no_ovf && ((f->slots + f->initial_slots) == q->st.sp)) {
 		f->initial_slots += cnt;
-	} else if (!f->op) {
-		f->op = q->st.sp;
-	} else if ((f->op + (f->actual_slots - f->initial_slots)) == q->st.sp) {
+	} else if (no_ovf) {
+		f->ovf = q->st.sp;
+	} else if ((f->ovf + (f->actual_slots - f->initial_slots)) == q->st.sp) {
 	} else {
-		pl_idx save_overflow = f->op;
-		f->op = q->st.sp;
+		const slot *save_overflow = f->ovf;
 		pl_idx cnt2 = f->actual_slots - f->initial_slots;
 
-		if (!check_slot(q, cnt2)) {
-			q->error = true;
-			return -1;
-		}
+		// The overflow moves up to sp whole, so the room has to hold it and the new slots together.
 
-		memmove(q->slots+f->op, q->slots+save_overflow, sizeof(slot)*cnt2);
+		if (!check_slot(q, cnt2 + cnt))
+			return -1;
+
+		f->ovf = q->st.sp;
+		memmove(f->ovf, save_overflow, sizeof(slot)*cnt2);
 		q->st.sp += cnt2;
 	}
 
@@ -490,84 +1023,359 @@ int create_vars(query *q, unsigned cnt)
 	memset(e, 0, sizeof(slot)*cnt);
 	q->st.sp += cnt;
 	f->actual_slots += cnt;
+	check_slots_highwater(q);
 	return var_num;
 }
 
 static void enter_predicate(query *q, predicate *pr)
 {
 	frame *f = GET_FRAME(q->st.cur_ctx);
-	f->dbgen = q->pl->dbgen;
 	q->st.pr = pr;
 
-	if (pr->is_dynamic)
-		pr->refcnt++;
+	// Incremental tabling (item 3). Once per CALL, not once per clause
+	// tried, and the bit is false for everything unless declared, so
+	// the null case is a test on a struct already in cache.
+
+	if (pr->is_incremental)
+		tbl_note_predicate_dep(q, pr);
+
+	if (!pr->is_dynamic) {
+		f->dbgen = q->pl->dbgen;
+		return;
+	}
+
+	// Under the lock a leave counts under, so a drain's count of the readers present is exact.
+
+	const bool mt = q->pl->is_multithreaded;
+
+	if (mt)
+		prolog_lock_mod(pr->m->pl, pr->m);
+
+	f->dbgen = q->pl->dbgen;
+	q->st.pr_dbgen = f->dbgen;
+	pr->refcnt++;
+
+	if (mt)
+		prolog_unlock_mod(pr->m->pl, pr->m);
 }
 
-void leave_predicate(query *q, predicate *pr, bool is_final)
+void leave_predicate_and_drop(query *q, predicate *pr, bool is_final)
+{
+	leave_predicate(q, pr, q->st.pr_dbgen, is_final);
+	drop_choice(q);
+}
+
+// Retracted clauses leave the chain while readers are still about, as far as the logical update view
+// allows. A reader that entered before a clause was retracted may still see it (can_view()), so the
+// clause can come out only once every such reader has gone. A drain bumps the generation to G and
+// counts the readers present, all of which entered before G; when the last of them leaves, no reader
+// can see a clause retracted at or before G, and those come out of the chain. Nothing is freed here:
+// that still waits for the count to reach zero, because a query goes on running a clause body, and
+// holding terms out of a clause, after it has left the predicate (tests/misc/db_purge_window.pl).
+
+static void drain_complete(predicate *pr)
+{
+	rule *r;
+
+	while ((r = list_front(&pr->dirty)) != NULL) {
+		if (r->dbgen_retracted > pr->drain_gen)
+			break;
+
+		list_pop_front(&pr->dirty);
+		predicate_delink(pr, r);
+		list_push_back(&pr->delinked, r);
+	}
+
+	pr->drain_gen = 0;
+	pr->drain_old = 0;
+}
+
+#define TOUCH_SHARED UINT64_MAX
+
+// A binding into a clause's cells (a caller's variable bound to one of its compound arguments) is only
+// made by matching its head, so the first match marks it: which query, and when by its push clock. Made
+// while other queries are alive, nobody can say whose bindings those are, and the mark says so for good.
+
+static void touch_rule(query *q, rule *r)
+{
+	const uint64_t me = q->qid + 1;
+
+	if (r->touch_qid == me)
+		return;
+
+	if ((r->touch_qid != TOUCH_SHARED) && (q->pl->q_cnt == 1)) {
+		r->touch_qid = me;
+		r->touch_at = q->push_clock;
+	} else
+		r->touch_qid = TOUCH_SHARED;
+}
+
+// Where a reclaimed clause waits to be freed. If this query made the only live bindings into it, they
+// all came after its first match, so it goes with the newest choicepoint pushed by then: backtracking
+// there undoes every one of them. With no live binding into it, the current choicepoint will do. Any
+// other case waits for the query to end.
+
+static list *reclaim_list(query *q, const rule *r)
+{
+	const uint64_t me = q->qid + 1, t = r->touch_qid;
+	list *l = NULL;
+
+	if (t == me) {
+		pl_idx lo = 0, hi = q->st.cp;
+
+		while (lo < hi) {
+			pl_idx mid = lo + (hi - lo) / 2;
+
+			if (GET_CHOICE(mid)->pushgen <= r->touch_at)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+
+		if (lo)
+			l = choice_undo(GET_CHOICE(lo - 1));
+	} else if (!t || ((t != TOUCH_SHARED) && (q->pl->q_cnt == 1))) {
+		if (q->st.cp)
+			l = choice_undo(GET_CURR_CHOICE());
+	}
+
+	return l ? l : &q->undo;
+}
+
+// An undo list, not q->dirty: rules there are freed with clear_clause() only, while q->dirty pays
+// index_remove_clause() at teardown - an sl_rem() per rule against an index that can hold hundreds of
+// thousands of entries with many sharing a key, which once cost giso's full tester 80 seconds.
+// reclaim_rule() has already taken the rule out of the index, so there is nothing left to remove.
+
+static void reclaim_rule(query *q, predicate *pr, rule *r)
+{
+	if (pr->cnt)
+		index_remove_clause(pr, r);
+
+	r->cl.is_deleted = true;
+	q->dirty_cnt++;
+	undo_item *u = TPL_calloc(1, sizeof(undo_item));
+
+	if (!u) {
+		list_push_back(&q->dirty, r);
+		return;
+	}
+
+	u->m = q->st.m;
+	u->r = r;
+	u->is_rule = true;
+	list_push_back(reclaim_list(q, r), u);
+}
+
+void leave_predicate(query *q, predicate *pr, uint64_t dbgen, bool is_final)
 {
 	if (!pr)
 		return;
 
-	sl_done(q->st.iter);
 	q->st.iter = NULL;
+	q->st.kchain = false;
 
 	if (!pr->is_dynamic || !pr->refcnt)
 		return;
 
-	if (--pr->refcnt != 0)
-		return;
+	// Must span the decrement, not just the purge: shrinking it lets a
+	// thread run a clause that has been reclaimed. See
+	// tests/misc/db_purge_window.pl.
 
-	if (!list_count(&pr->dirty))
-		return;
+	const bool mt = pr->m->pl->is_multithreaded;
 
-	if (pr->is_abolished)
+	if (mt)
+		prolog_lock_mod(pr->m->pl, pr->m);
+
+	if (pr->drain_gen && (dbgen < pr->drain_gen) && (pr->drain_old > 0))
+		pr->drain_old--;
+
+	if (--pr->refcnt != 0) {
+		if (pr->drain_gen && !pr->drain_old)
+			drain_complete(pr);
+
+		if (!pr->drain_gen && list_count(&pr->dirty) && !pr->is_abolished) {
+			pr->drain_gen = ++pr->m->pl->dbgen;
+			pr->drain_old = pr->refcnt;
+		}
+
+		if (mt) prolog_unlock_mod(pr->m->pl, pr->m);
 		return;
+	}
+
+	pr->drain_gen = 0;
+	pr->drain_old = 0;
+
+	if ((!list_count(&pr->dirty) && !list_count(&pr->delinked)) || pr->is_abolished) {
+		if (mt) prolog_unlock_mod(pr->m->pl, pr->m);
+		return;
+	}
 
 	// Predicate is no longer being used
 
 	//printf("*** leave %u, %s/%u, in_retractall=%d, is_final=%d, retry=%d\n",
-	//	(unsigned)list_count(&pr->dirty), C_STR(q, &pr->key), pr->key.arity, q->in_retractall, is_final, q->retry);
+	//	(unsigned)list_count(&pr->dirty), C_STR(q, &pr->key), get_arity(&pr->key), q->in_retractall, is_final, q->retry);
 
-	module_lock(pr->m);
 	rule *r;
-	const frame *f = GET_CURR_FRAME();
+
+	while ((r = list_pop_front(&pr->delinked)) != NULL)
+		reclaim_rule(q, pr, r);
 
 	while ((r = list_pop_front(&pr->dirty)) != NULL) {
 		predicate_delink(pr, r);
-
-		if (pr->idx1 && pr->cnt) {
-			cell *c = get_head(r->cl.cells);
-			sl_rem(pr->idx1, c, r);
-
-			if (pr->idx2) {
-				cell *arg1 = FIRST_ARG(c);
-				cell *arg2 = NEXT_ARG(arg1);
-				sl_rem(pr->idx2, arg2, r);
-			}
-		}
-
-		if (q->in_retract && !r->cl.num_vars && q->pl->opt) {
-			clear_clause(&r->cl);
-			TPL_free(r);
-		} else {
-			r->cl.is_deleted = true;
-			list_push_back(&q->dirty, r);
-		}
+		reclaim_rule(q, pr, r);
 	}
 
 	if (pr->idx1 && !pr->cnt) {
-		sl_destroy(pr->idx2);
-		sl_destroy(pr->idx1);
-		pr->idx1 = pr->idx2 = NULL;
+		index_free(pr);
+		pr->needs_index = false;
+		pr->no_idx3 = false;
+		pr->idx3_want = 0;
+		pr->is_var_in_head = false;
+		pr->is_var_in_first_arg = false;
+		pr->is_open_first_arg = false;
+		pr->is_var_in_idx2_arg = false;
+		pr->idx2_arg = 0;
+	} else if (pr->is_var_in_head || pr->is_var_in_first_arg || pr->is_var_in_idx2_arg) {
+		// Clauses just left the chain. If the last var-headed one was
+		// among them the flags are now stale, and being stale here is
+		// one-way: they are only ever set by assert_commit(). Safe to
+		// walk - refcnt is 0, so no query is iterating this predicate.
+
+		recheck_var_in_indexed_args(pr);
 	}
 
-	module_unlock(pr->m);
+	if (mt)
+		prolog_unlock_mod(pr->m->pl, pr->m);
+}
+
+// Free what is on q->dirty and can be proved unreachable now, rather than waiting for the query
+// to end. Without this a deterministic loop that retracts accumulates every clause it retracts:
+// nothing drains q->dirty until teardown, and only an actual retry drains the undo list.
+//
+// A clause reaches here already delinked and with no reader inside its predicate, so iteration
+// cannot reach it. is_purgeable rules out a binding pointing into its cells. What is left is code
+// running out of them, which is this scan. Another thread's query is not scanned, so this only
+// runs single-threaded; the concurrent case still waits, as before.
+
+#define PURGE_DIRTY_AT 512
+#define PURGE_MAX_STACK 64
+
+static bool clause_holds_instr(const query *q, const clause *cl, const rule *r)
+{
+	const cell *lo = cl->cells, *hi = cl->cells + cl->cidx;
+
+	if ((q->st.instr >= lo) && (q->st.instr < hi))
+		return true;
+
+	for (pl_idx i = 0; i < q->st.fp; i++) {
+		const frame *f = GET_FRAME(i);
+
+		if (f->instr && (f->instr >= lo) && (f->instr < hi))
+			return true;
+	}
+
+	for (pl_idx i = 0; i < q->st.cp; i++) {
+		const choice *ch = GET_CHOICE(i);
+
+		if (ch->st.instr && (ch->st.instr >= lo) && (ch->st.instr < hi))
+			return true;
+
+		if (ch->st.dbe == r)
+			return true;
+	}
+
+	return false;
+}
+
+// A retracted rule on an undo list is freed when backtracking undoes past it, which a
+// deterministic loop never does. The undo item's whole action is that free, so releasing it
+// early is the same work done sooner - the same two roots have to be ruled out as for
+// q->dirty, and index entries are already gone either way, because reclaim_rule() runs
+// before leave_predicate() destroys the index.
+
+static void purge_undo_rules(query *q, list *l)
+{
+	undo_item *u = list_front(l);
+
+	while (u) {
+		undo_item *next = list_next(u);
+
+		if (u->is_rule && u->r->cl.is_purgeable && !clause_holds_instr(q, &u->r->cl, u->r)) {
+			list_remove(l, u);
+			clear_clause(&u->r->cl);
+			TPL_free(u->r);
+			TPL_free(u);
+			q->dirty_cnt--;
+		}
+
+		u = next;
+	}
+}
+
+static void purge_reclaimed(query *q)
+{
+	// A deep stack makes the scan above dear, and a program with one is not the retract loop
+	// this is for. Leave those to teardown rather than pay per clause.
+
+	// Whatever this pass cannot free stays on the list, so the next attempt waits for another
+	// PURGE_DIRTY_AT arrivals. Without that, a list of clauses that are all held would have
+	// every following goal walking it again.
+
+	q->purge_at = q->dirty_cnt + PURGE_DIRTY_AT;
+
+	if ((q->st.fp > PURGE_MAX_STACK) || (q->st.cp > PURGE_MAX_STACK))
+		return;
+
+	const bool mt = q->pl->is_multithreaded;
+
+	purge_undo_rules(q, &q->undo);
+
+	for (pl_idx i = 0; i < q->st.cp; i++)
+		if (GET_CHOICE(i)->undo)
+			purge_undo_rules(q, GET_CHOICE(i)->undo);
+
+	rule *r = list_front(&q->dirty);
+
+	while (r) {
+		rule *next = list_next(r);
+
+		if (r->cl.is_purgeable && !clause_holds_instr(q, &r->cl, r)) {
+			// reclaim_rule() only drops index entries while the predicate still has clauses,
+			// so an index can still name this rule. query_purge_dirty_list() does the same
+			// before freeing; skipping it leaves the skiplist pointing into freed cells.
+
+			if (mt) prolog_lock_mod(q->pl, r->owner->m);
+			index_remove_clause(r->owner, r);
+			if (mt) prolog_unlock_mod(q->pl, r->owner->m);
+
+			list_remove(&q->dirty, r);
+			clear_clause(&r->cl);
+			TPL_free(r);
+			q->dirty_cnt--;
+		}
+
+		r = next;
+	}
+
+	q->purge_at = q->dirty_cnt + PURGE_DIRTY_AT;
 }
 
 static void query_purge_dirty_list(query *q)
 {
 	unsigned cnt = 0;
 	rule *r;
+	const bool mt = q->pl->is_multithreaded;
+
+	// q->dirty can mix rules from different predicates/modules, unlike
+	// leave_predicate()'s single pr->m - lock per rule's own owner
+	// rather than once for the whole pass.
+
+	for (r = list_front(&q->dirty); r; r = list_next(r)) {
+		if (mt) prolog_lock_mod(q->pl, r->owner->m);
+		index_remove_clause(r->owner, r);
+		if (mt) prolog_unlock_mod(q->pl, r->owner->m);
+	}
 
 	while ((r = list_pop_front(&q->dirty)) != NULL) {
 		clear_clause(&r->cl);
@@ -579,7 +1387,7 @@ static void query_purge_dirty_list(query *q)
 		printf("*** query_purge_dirty_list %u\n", cnt);
 }
 
-static void trim_trail(query *q)
+static void trim_trail(query *q, bool reused, bool moved)
 {
 	if (q->undo_hi_tp)
 		return;
@@ -593,13 +1401,56 @@ static void trim_trail(query *q)
 		tp = 0;
 
 	while (q->st.tp > tp) {
-		const trail *tr = q->trails + q->st.tp - 1;
+		const trail *tr = get_trail(q, q->st.tp - 1);
 
-		if (tr->val_ctx != q->st.cur_ctx)
+		if ((tr->val_ctx != q->st.cur_ctx) || is_frame_layout(tr))
 			break;
 
-		q->st.tp--;
+		if (!reused) {
+			const frame *f = GET_FRAME(tr->val_ctx);
+
+			if (f->no_recov) {
+				const slot *e = get_slot(q, f, tr->var_num);
+
+				if (is_managed(&e->c))
+					break;
+			}
+		} else if (moved && q->st.cp) {
+			const frame *f = GET_FRAME(tr->val_ctx);
+
+			// These now release the values reuse_frame() moved in, should we backtrack past the frame.
+
+			if ((tr->var_num < f->actual_slots) && is_managed(&get_slot(q, f, tr->var_num)->c))
+				break;
+		}
+
+		pop_trail(q);
 	}
+}
+
+// Nothing from a run on an earlier page onwards is live once sp falls back to it.
+
+static void rewind_slots(query *q, slot *run)
+{
+	slot_page *a = q->st.sp_page;
+
+	while ((run < a->slots) || (run > a->end))
+		a = a->prev;
+
+	q->st.sp_page = a;
+	q->st.sp = run;
+}
+
+// Back to frame f's heap mark: one in an older page frees the newer, where allocation would otherwise carry on unmarked.
+
+static void wind_heap(query *q, const frame *f)
+{
+	const bool other_page = q->st.hp_num != f->hp_num;
+	q->st.hp = f->hp;
+	q->st.hp_num = f->hp_num;
+
+	if (other_page)
+		trim_heap(q);
 }
 
 static void trim_frame(query *q, const frame *f)
@@ -611,21 +1462,35 @@ static void trim_frame(query *q, const frame *f)
 		memset(e, 0, sizeof(slot));
 	}
 
-	q->st.sp -= f->actual_slots;
+	if ((size_t)(q->st.sp - q->st.sp_page->slots) >= f->actual_slots)
+		q->st.sp -= f->actual_slots;
+	else
+		rewind_slots(q, f->slots);
+
 	q->st.fp = q->st.cur_ctx;
 }
 
-void add_trail(query *q, pl_ctx c_ctx, unsigned c_var_nbr, cell *attrs)
+bool add_trail(query *q, pl_ctx c_ctx, unsigned c_var_nbr, cell *attrs)
 {
-	if (!check_trail(q)) {
-		q->error = false;
-		return;
-	}
+	if (!check_trail(q))
+		return false;
 
-	trail *tr = q->trails + q->st.tp++;
+	trail *tr = q->trail_next++;
+	q->st.tp++;
+
+	if (q->st.tp > q->hw_trails)
+		q->hw_trails = q->st.tp;
+
 	tr->val_ctx = c_ctx;
 	tr->var_num = c_var_nbr;
 	tr->attrs = attrs;
+
+	// '$list_attributed'/2 reads entries back from a mark by frame index, so once one is set, keep the frame.
+
+	if (q->residue_used && !(c_var_nbr & TRAIL_FRAME_LAYOUT))
+		pin_frame(q, c_ctx);
+
+	return true;
 }
 
 void undo_me(query *q)
@@ -634,9 +1499,39 @@ void undo_me(query *q)
 	const choice *ch = GET_CURR_CHOICE();
 
 	while (q->st.tp > ch->st.tp) {
-		const trail *tr = q->trails + --q->st.tp;
+		const trail *tr = pop_trail(q);
+
+		if (is_frame_layout(tr)) {
+			// A frame backtracking discards needs no layout, and may be a later call's with the index: keep that one's.
+
+			if (tr->val_ctx >= ch->st.fp)
+				continue;
+
+			frame *fl = GET_FRAME(tr->val_ctx);
+			fl->actual_slots = tr->var_num & ~TRAIL_FRAME_LAYOUT;
+			fl->ovf = tr->attrs ? (slot*)tr->attrs : q->slot_pages->slots;
+
+			// Without an overflow run a frame's slots are all initial ones.
+
+			if (!tr->attrs)
+				fl->initial_slots = fl->actual_slots;
+
+			continue;
+		}
+
 		const frame *f = GET_FRAME(tr->val_ctx);
-		slot *e = get_slot(q, f, tr->var_num);
+		slot *e;
+
+		// An entry can name a slot its frame no longer has, when a smaller frame took the index: that slot was
+		// released already and backtracking discards the frame, so skip it rather than reach into the overflow area.
+
+		if (tr->var_num < f->initial_slots)
+			e = f->slots + tr->var_num;
+		else if (tr->var_num < f->actual_slots)
+			e = f->ovf + (tr->var_num - f->initial_slots);
+		else
+			continue;
+
 		cell *c = &e->c;
 		unshare_cell(c);
 		memset(e, 0, sizeof(slot));
@@ -648,6 +1543,7 @@ static void try_me(query *q, unsigned num_vars)
 {
 	frame *f = GET_NEW_FRAME();
 	f->initial_slots = f->actual_slots = num_vars;
+	f->heap_pinned = false;
 	q->total_matches++;
 
 	for (unsigned i = 0; i < num_vars; i++) {
@@ -656,11 +1552,35 @@ static void try_me(query *q, unsigned num_vars)
 	}
 }
 
+// Skip the branch join points compile_term() emits on the way to the
+// clause end: a bare `true` landing, or a forward `$jump` to one. Both
+// are no-ops for machine state (bif_sys_jump_1 only moves q->st.instr),
+// so a goal followed by nothing but these is followed by nothing.
+// is_end() on the result means the clause is over.
+
+static const cell *skip_landings(const cell *c)
+{
+	while (!is_end(c)) {
+		if (!is_interned(c))
+			break;
+
+		if ((c->val_off == g_true_s) && !get_arity(c))
+			c += c->num_cells;						// landing
+		else if ((c->val_off == g_sys_jump_s) && (get_arity(c) == 1)
+			&& is_smallint(c+1) && (get_smallint(c+1) > 0))
+			c += get_smallint(c+1);					// jump to a landing
+		else
+			break;
+	}
+
+	return c;
+}
+
 static void push_frame(query *q)
 {
 	const frame *f_cur = GET_CURR_FRAME();
 	frame *f_new = GET_NEW_FRAME();
-	const cell *next_cell = q->st.instr + q->st.instr->num_cells;
+	const cell *next_cell = skip_landings(q->st.instr + q->st.instr->num_cells);
 
 	// Avoid long chains of useless returns...
 
@@ -672,7 +1592,8 @@ static void push_frame(query *q)
 		f_new->instr = q->st.instr;
 	}
 
-	f_new->op = 0;
+	f_new->ovf = q->slot_pages->slots;
+	f_new->tp = GET_CURR_CHOICE()->st.tp;
 	f_new->no_recov = q->no_recov;
 	f_new->chgen = ++q->chgen;
 	f_new->hp = q->st.hp;
@@ -680,12 +1601,33 @@ static void push_frame(query *q)
 	q->st.sp += f_new->actual_slots;
 	q->st.cur_ctx = q->st.fp;
 	q->st.fp++;
+
+	if (q->st.fp > q->hw_frames)
+		q->hw_frames = q->st.fp;
+
+	check_slots_highwater(q);
 }
 
-// Note: TCO's clause might not be the caller clause... hence passing
-// num_vars. Currently restricted to the same predicate though (still?).
+// A reused frame whose run is on a page before sp's restarts it at that page's start: nothing live lies past the old run.
 
-static void reuse_frame(query *q, unsigned num_vars)
+static void restart_run(query *q, frame *f)
+{
+	slot_page *a = q->st.sp_page->prev;
+
+	while ((f->slots < a->slots) || (f->slots > a->end)) {
+		a->used = 0;
+		a = a->prev;
+	}
+
+	a->used = f->slots - a->slots;
+	q->st.sp_page->base = a->base + a->used;
+	f->slots = q->st.sp_page->slots;
+}
+
+// Note: TCO's clause might not be the caller clause, nor even the caller's
+// predicate... hence passing num_vars.
+
+static bool reuse_frame(query *q, unsigned num_vars)
 {
 	cell *c_next = q->st.instr + q->st.instr->num_cells;
 
@@ -694,80 +1636,230 @@ static void reuse_frame(query *q, unsigned num_vars)
 	if (c_next->val_off == g_sys_drop_barrier_s)
 		drop_choice(q);
 
-	// Copy slots from the new frame to the current frame...
+	// Release all the current frame's slots before copying: the new frame's can overlap them...
 
 	const frame *f_new = GET_NEW_FRAME();
 	frame *f_cur = GET_CURR_FRAME();
-	f_cur->initial_slots = f_cur->actual_slots = num_vars;
-	f_cur->no_recov = false;
 
-	for (pl_idx i = 0; i < num_vars; i++) {
-		const slot *from = get_slot(q, f_new, i);
-		slot *to = get_slot(q, f_cur, i);
-		unshare_cell(&to->c);
-		*to = *from;
+	for (unsigned i = 0; i < f_cur->actual_slots; i++) {
+		slot *e = get_slot(q, f_cur, i);
+
+		if (is_managed(&e->c)) {
+			unshare_cell_(&e->c);
+			memset(e, 0, sizeof(slot));
+		}
 	}
 
-	q->st.sp = f_cur->base + f_cur->actual_slots;
+	f_cur->initial_slots = f_cur->actual_slots = num_vars;
+	f_cur->no_recov = false;
+	f_cur->heap_pinned = f_new->heap_pinned;
+
+	if ((f_cur->slots < q->st.sp_page->slots) || (f_cur->slots > f_new->slots))
+		restart_run(q, f_cur);
+
+	slot *to = f_cur->slots;
+	slot *from = f_new->slots;
+
+	// A move, not a copy: an old trail entry naming the index the new frame had must find no counted value left past
+	// this frame to release again. Released slots are left empty for the same reason, as trim_frame() leaves them.
+
+	const slot *to_end = to + num_vars;
+
+	for (unsigned i = 0; i < num_vars; i++) {
+		to[i] = from[i];
+
+		if (((from + i) >= to_end) && is_managed(&from[i].c))
+			memset(from + i, 0, sizeof(slot));
+	}
+
+	// Head unification trailed the reference-counted values it bound in the new frame, and this frame's own entries
+	// named the values just released: point the one here and drop the other, so backtracking releases each once.
+	// Attribute hooks hold on to trail positions, so leave the trail alone while attributes are about.
+
+	bool moved = false;
+
+	if (!q->attrs_used && (q->st.cp > 1)) {
+		for (pl_idx i = GET_CURR_CHOICE()->st.tp; !moved && (i < q->st.tp); i++) {
+			const trail *tr = get_trail(q, i);
+			moved = !is_frame_layout(tr) && (tr->val_ctx == q->st.fp);
+		}
+	}
+
+	// Only from where this frame's call began: before that, no entry can name the values being moved or released.
+
+	if (moved) {
+		pl_idx w = GET_CHOICE(q->st.cp - 2)->st.tp;
+
+		if (w < f_cur->tp)
+			w = f_cur->tp;
+
+		for (pl_idx r = w, end = q->st.tp; r < end; r++) {
+			trail *tr = get_trail(q, r);
+
+			if (!is_frame_layout(tr)) {
+				if (tr->val_ctx == q->st.cur_ctx)
+					continue;
+
+				if (tr->val_ctx == q->st.fp)
+					tr->val_ctx = q->st.cur_ctx;
+			}
+
+			if (w != r)
+				*get_trail(q, w) = *tr;
+
+			w++;
+		}
+
+		while (q->st.tp > w)
+			pop_trail(q);
+	}
+
+	f_cur->tp = q->st.tp;
+	q->st.sp = f_cur->slots + f_cur->actual_slots;
+	check_slots_highwater(q);
 	q->st.dbe->tcos++;
 	q->total_tcos++;
 	q->st.hp = f_cur->hp;
 	q->st.hp_num = f_cur->hp_num;
 	trim_heap(q);
+	return moved;
 }
 
-static bool commit_any_choices(const query *q, const frame *f)
+// Does a slot of the new frame refer to a term that reusing this frame would trim from the heap? A term
+// built here can carry an older context (=../2 does that), which set_var() cannot tell from the context.
+
+static bool refs_trimmed_heap(const query *q, const frame *f, unsigned num_vars)
 {
-	if (q->st.cp == 1)							// Skip in-progress choice
+	const page *a = q->heap_pages;
+
+	if (!a || ((a->num <= f->hp_num) && (a->idx <= f->hp)))
 		return false;
 
-	const choice *ch = GET_PREV_CHOICE();	// Skip in-progress choice
-	return ch->gen > f->chgen;
+	const frame *f_new = GET_NEW_FRAME();
+
+	for (unsigned i = 0; i < num_vars; i++) {
+		const cell *c = &get_slot(q, f_new, i)->c;
+
+		if (is_indirect(c) && is_heap_since(q, f, c->val_ptr))
+			return true;
+	}
+
+	return false;
 }
 
-static void commit_frame(query *q)
+// Did head unification trail a slot of the new frame? Only reference-counted values are, and reuse_frame()
+// moves them without their trail entries, so backtracking to an older choicepoint would release them twice.
+
+static bool head_trailed_new_frame(query *q)
+{
+	const choice *ch = GET_CURR_CHOICE();
+
+	for (pl_idx i = ch->st.tp; i < q->st.tp; i++) {
+		const trail *tr = get_trail(q, i);
+
+		if (!is_frame_layout(tr) && (tr->val_ctx == q->st.fp))
+			return true;
+	}
+
+	return false;
+}
+
+static bool commit_any_choices(const query *q, unsigned skip)
+{
+	if (q->st.cp <= skip)
+		return false;
+
+	const choice *ch = GET_CHOICE(q->st.cp - 1 - skip);
+
+	// The clause's own alternatives carry its frame's generation: reusing the frame would put them in reach of the callee's cut.
+
+	return (ch->st.fp >= q->st.fp) || (ch->gen >= GET_CURR_FRAME()->chgen);
+}
+
+static bool is_last_call(const query *q, bool *has_barrier)
+{
+	const cell *c = q->st.instr + q->st.instr->num_cells;
+	bool barrier = false;
+
+	// call/N plants nothing after the goal but a $drop_barrier, which is
+	// bookkeeping that reuse_frame() performs directly.
+
+	if (is_interned(c) && (c->val_off == g_sys_drop_barrier_s)) {
+		c += c->num_cells;
+		barrier = true;
+	}
+
+	if (has_barrier)
+		*has_barrier = barrier;
+
+	// Past that, only the branch join points that compile_term() emits
+	// on the way to the clause end may be skipped: they do nothing.
+
+	c = skip_landings(c);
+
+	if (!is_end(c))
+		return false;
+
+	return barrier || !c->ret_instr;
+}
+
+static void commit_frame(query *q, bool head_has_vars)
 {
 	q->st.dbe->matched++;
 	q->total_matched++;
 
 	clause *cl = &q->st.dbe->cl;
 	frame *f = GET_CURR_FRAME();
-	f->m = q->st.m;
+	f->mid = q->st.m->id;
 
-	rule *save_dbe = q->st.dbe;
-	bool is_det = !q->has_vars && cl->is_unique;
-	bool last_match = is_det || cl->is_first_cut || !has_next_key(q);
+	bool is_det = !head_has_vars && cl->is_unique
+		&& !q->st.pr->is_var_in_head && !q->st.pr->is_var_in_first_arg
+		&& !q->st.pr->is_var_in_idx2_arg;
+	bool last_match = is_det || cl->is_first_cut || !has_next_key(q)
+		|| (is_next_cut(q->st.instr) && cl->is_fact);
 	bool tco = false;
 
 #if 0
 	if (last_match) {
 		fprintf(stderr, "*** q->no_recov=%d, last_match=%d %s/%u, q->st.cur_ctx=%u,q->st.fp=%u\n",
 			q->no_recov, last_match,
-			C_STR(q, q->st.key), q->st.key->arity,
+			C_STR(q, q->st.key), get_arity(q->st.key),
 			q->st.cur_ctx, q->st.fp
 			);
 	}
 #endif
 
-	if (!q->no_recov
-		&& last_match
+	// A frame whose heap another frame now points into cannot be
+	// reused: reuse_frame() winds hp back to this frame's own base and
+	// trims, which would take those cells with it. q->no_recov cannot
+	// carry that on its own - the next unify() clears it, and head
+	// unification of this very call is one - so set_var() pins the
+	// frame and the pin is what is read here. f->no_recov is not, it
+	// being set by every if-then-else, \+, ignore/1 and \= as well
+	// (docs/tco-then-branch-report.md, 3), which would cost those
+	// their TCO.
+
+	if (last_match
+		&& is_tail_call(q->st.instr)
+		&& !q->no_recov && !q->no_tco
+		&& !f->heap_pinned
 		&& (q->st.fp == (q->st.cur_ctx + 1))
 		) {
-		bool tail_recursive = is_recursive_call(q->st.instr);
-		bool slots_ok = f->initial_slots <= cl->num_vars;
-		bool choices = commit_any_choices(q, f);
-		tco = slots_ok && tail_recursive && !choices;
+		bool barrier = false;
+
+		tco = is_last_call(q, &barrier)
+			&& !commit_any_choices(q, barrier ? 2 : 1)
+			&& !refs_trimmed_heap(q, f, cl->num_vars)
+			&& !((q->st.cp > (barrier ? 2u : 1u)) && q->attrs_used && head_trailed_new_frame(q));
 
 #if 0
 		cell *head = get_head(cl->cells);
 
 		fprintf(stderr,
 			"*** %s/%u tco=%d,q->no_recov=%d,last_match=%d,is_det=%d,"
-			"tail_recursive=%d,slots_ok=%d,choices=%d,"
 			"cl->num_vars=%u,f->initial_slots=%u/%u\n",
-			C_STR(q, head), head->arity,
+			C_STR(q, head), get_arity(head),
 			tco, q->no_recov, last_match, is_det,
-			tail_recursive, slots_ok, choices,
 			cl->num_vars, f->initial_slots, f->actual_slots);
 #endif
 	}
@@ -775,17 +1867,29 @@ static void commit_frame(query *q)
 	if (!q->st.dbe->owner->is_builtin)
 		q->st.m = q->st.dbe->owner->m;
 
-	if (tco && q->pl->opt) {
-		Trace(q, get_head(save_dbe->cl.cells), q->st.cur_ctx, EXIT);
-		reuse_frame(q, cl->num_vars);
-	} else {
+	const bool reused = tco && q->pl->opt;
+
+	// No EXIT port for a reused frame: the calls sharing it get one, from resume_frame(), when they are done.
+
+	bool moved = false;
+
+	if (reused)
+		moved = reuse_frame(q, cl->num_vars);
+	else
 		push_frame(q);
-	}
+
+	// Read what we still need out of cl BEFORE giving up the reference.
+	// leave_predicate() may take the refcount to zero and reclaim, and a
+	// concurrent purge can free this very clause the moment it does -
+	// leaving the continuation to be read out of freed memory.
+
+	cell *next_instr = cl->alt ? cl->alt : get_body(cl->cells);
+	if (!next_instr) next_instr = cl->cells + (cl->cidx-1);
 
 	if (last_match) {
-		leave_predicate(q, q->st.pr, false);
-		drop_choice(q);
-		trim_trail(q);
+		leave_predicate_and_drop(q, q->st.pr, false);
+		trim_trail(q, reused, moved);
+
 
 	} else {
 		choice *ch = GET_CURR_CHOICE();
@@ -793,29 +1897,71 @@ static void commit_frame(query *q)
 		ch->gen = q->chgen;
 	}
 
-	q->st.instr = cl->alt ? cl->alt : get_body(cl->cells);
-	if (!q->st.instr) q->st.instr = cl->cells + (cl->cidx-1);
+	q->st.instr = next_instr;
 	q->st.iter = NULL;
+}
+
+static void undo_list_drain(list *l)
+{
+	undo_item *u;
+
+	while ((u = list_pop_back(l)) != NULL) {
+		if (u->is_gvar) {
+			gvar_undo(u->tptr, u->key, u->gvar_id);
+			TPL_free(u->key);
+		} else if (u->is_bboard) {
+			prolog_lock(u->m->pl);
+			sl_del(u->m->keyval, u->key);
+			prolog_unlock(u->m->pl);
+			TPL_free(u->key);
+		} else if (u->is_mmap)
+			stream_unmap(u->addr, u->mmap_len);
+		else if (u->is_rule) {
+			clear_clause(&u->r->cl);
+			TPL_free(u->r);
+		} else {
+			unshare_cells(u->c, u->c->num_cells);
+			TPL_free(u->c);
+		}
+
+		TPL_free(u);
+	}
+}
+
+// Release the prefetch a choicepoint owns.
+//
+// run_state is snapshotted whole into every choice raised after
+// find_key(), so the handle is aliased by all of them and only the
+// choice it was built for may free it. iter_owner names that slot, and a
+// choice's slot is simply its own index - which is why this takes the
+// choice rather than a caller-computed cp. The three call sites had
+// spelled that index two different ways (q->st.cp in retry_choice, where
+// the decrement comes after; q->st.cp - 1 in drop_choice, where it comes
+// before), which looked like a discrepancy and was not.
+
+static void release_prefetch(query *q, choice *ch, pl_idx cp)
+{
+	if (!ch->st.iter || (ch->st.iter_owner != cp))
+		return;
+
+	// q->st may still alias it - defuse before the free.
+
+	if (q->st.iter == ch->st.iter)
+		q->st.iter = NULL;
+
+	sl_done(ch->st.iter);
+	ch->st.iter = NULL;
 }
 
 int retry_choice(query *q)
 {
 	while (q->st.cp) {
 		undo_me(q);
+		pl_idx cp = q->st.cp - 1;
 		choice *ch = GET_CURR_CHOICE();
-		q->st.cp--;
-		undo_item *u;
-
-		while ((u = list_pop_back(&ch->undo)) != NULL) {
-			if (u->is_bboard)
-				sl_del(u->m->keyval, u->key);
-			else {
-				unshare_cells(u->c, u->c->num_cells);
-				TPL_free(u->c);
-			}
-
-			TPL_free(u);
-		}
+		pop_choice(q);
+		if (ch->undo)
+			undo_list_drain(ch->undo);
 
 		q->st = ch->st;
 
@@ -824,19 +1970,30 @@ int retry_choice(query *q)
 		f->chgen = ch->chgen;
 		f->initial_slots = ch->initial_slots;
 		f->actual_slots = ch->actual_slots;
-		f->op = ch->op;
-		f->base = ch->base;
+		f->ovf = ch->ovf;
+		f->slots = ch->slots;
 
 		if (ch->reset)
 			continue;
 
+		// Every choice carries the st.pr current when it was pushed, but only a clause matcher's entered it.
+
 		if (ch->catchme_exception || ch->fail_on_retry) {
-			leave_predicate(q, ch->st.pr, true);
+			// Choice abandoned without drop_choice(); free its prefetch.
+			release_prefetch(q, ch, cp);
+
+			if (ch->owns_pr)
+				leave_predicate(q, ch->st.pr, ch->st.pr_dbgen, true);
+
 			continue;
 		}
 
 		if (!ch->register_cleanup && q->noretry) {
-			leave_predicate(q, ch->st.pr, true);
+			release_prefetch(q, ch, cp);
+
+			if (ch->owns_pr)
+				leave_predicate(q, ch->st.pr, ch->st.pr_dbgen, true);
+
 			continue;
 		}
 
@@ -862,47 +2019,52 @@ void drop_choice(query *q)
 	if (!q->st.cp)
 		return;
 
-	choice *ch = GET_CURR_CHOICE();
-	list *undo;
+	pl_idx cp = q->st.cp - 1;
+	choice *ch = GET_CHOICE(cp);
 
-	if (q->st.cp > 1) {
-		choice *ch_prev = GET_PREV_CHOICE();
-		undo = &ch_prev->undo;
-	} else
-		undo = &q->undo;
+	release_prefetch(q, ch, cp);
 
-	undo_item *u;
+	if (ch->undo && list_count(ch->undo)) {
+		list *undo = q->st.cp > 1 ? choice_undo(GET_PREV_CHOICE()) : &q->undo;
+		undo_item *u;
 
-	while ((u = list_pop_front(&ch->undo)) != NULL)
-		list_push_back(undo, u);
+		if (!undo)
+			undo = &q->undo;
 
-	--q->st.cp;
+		while ((u = list_pop_front(ch->undo)) != NULL)
+			list_push_back(undo, u);
+	}
+
+	pop_choice(q);
 }
 
 bool push_choice(query *q)
 {
 	CHECKED(check_choice(q));
 	const frame *f = GET_CURR_FRAME();
-	choice *ch = GET_CHOICE(q->st.cp);
+	choice *ch = q->choice_next++;
 	ch->skip = 0;
 	ch->st = q->st;
+	ch->pushgen = ++q->push_clock;
 	q->st.cp++;
 
-	// Keep a record of the frame state, we need to restore
-	// it on retry. On cut we commit to it.
+	if (q->st.cp > q->hw_choices)
+		q->hw_choices = q->st.cp;
 
-	list_init(&ch->undo);
+	if (ch->undo)
+		list_init(ch->undo);
+
 	ch->dbgen = f->dbgen;
 	ch->chgen = ch->gen = f->chgen;
 	ch->initial_slots = f->initial_slots;
 	ch->actual_slots = f->actual_slots;
-	ch->op = f->op;
-	ch->base = f->base;
+	ch->ovf = f->ovf;
+	ch->slots = f->slots;
 
 	ch->catchme_retry =
 		ch->catchme_exception = ch->barrier = ch->register_cleanup =
 		ch->block_catcher = ch->fail_on_retry =
-		ch->succeed_on_retry = ch->reset = false;
+		ch->succeed_on_retry = ch->reset = ch->owns_pr = false;
 
 	return true;
 }
@@ -931,8 +2093,6 @@ bool push_barrier(query *q)
 
 bool push_succeed_on_retry_with_barrier(query *q, pl_idx skip)
 {
-	frame *f = GET_CURR_FRAME();
-	f->no_recov = true;				// FIXME: memory waste
 	CHECKED(push_barrier(q));
 	choice *ch = GET_CURR_CHOICE();
 	ch->succeed_on_retry = true;
@@ -966,6 +2126,8 @@ bool push_catcher(query *q, enum q_retry retry)
 	else if (retry == QUERY_EXCEPTION)
 		ch->catchme_exception = true;
 
+	rearm_oom_reserve(q);
+
 	return true;
 }
 
@@ -973,8 +2135,16 @@ bool push_catcher(query *q, enum q_retry retry)
 
 bool drop_barrier(query *q, pl_idx cp)
 {
-	if ((q->st.cp-1) != cp)
+	if ((q->st.cp-1) != cp) {
+		// The call's choices still need the barrier, but a cut after the call must reach the caller's.
+
+		if (cp < q->st.cp) {
+			frame *f = GET_CURR_FRAME();
+			f->chgen = GET_CHOICE(cp)->chgen;
+		}
+
 		return false;
+	}
 
 	const choice *ch = GET_CURR_CHOICE();
 	frame *f = GET_CURR_FRAME();
@@ -1002,7 +2172,9 @@ void cut(query *q)
 
 		// Done...
 
-		leave_predicate(q, ch->st.pr, false);
+		if (ch->owns_pr)
+			leave_predicate(q, ch->st.pr, ch->st.pr_dbgen, false);
+
 		drop_choice(q);
 
 		if (ch->register_cleanup && !ch->fail_on_retry) {
@@ -1041,21 +2213,39 @@ static bool resume_frame(query *q)
 #endif
 	Trace(q, get_head(f->instr), f->prev, EXIT);
 
+	// Call is followed by !: drop callee-internal choices the cut will
+	// kill so trim_frame can run. Stop at barriers (cut handles those,
+	// including setup_call_cleanup) and at the parent clause choice
+	// (gen < f->chgen) - that stays until the real cut.
+
+	if (f->instr && is_next_cut(f->instr)) {
+		while (q->st.cp) {
+			choice *ch = GET_CURR_CHOICE();
+
+			if (ch->barrier || (ch->gen < f->chgen))
+				break;
+
+			if (ch->owns_pr)
+				leave_predicate(q, ch->st.pr, ch->st.pr_dbgen, false);
+
+			drop_choice(q);
+		}
+	}
+
 	if (q->pl->opt
 		&& !f->no_recov
 		&& (q->st.fp == (q->st.cur_ctx + 1))
 		&& !resume_any_choices(q, f)
 		) {
 		q->total_recovs++;
-		q->st.hp = f->hp;
-		q->st.hp_num = f->hp_num;
+		wind_heap(q, f);
 		trim_frame(q, f);
 	}
 
 	q->st.instr = f->instr;
 	q->st.cur_ctx = f->prev;
 	f = GET_CURR_FRAME();
-	q->st.m = f->m;
+	q->st.m = module_by_id(q->pl, f->mid);
 	return true;
 }
 
@@ -1071,13 +2261,19 @@ static void proceed(query *q)
 	if (!is_end(q->st.instr))
 		return;
 
-	if (q->st.instr->ret_instr) {
-		frame *f = GET_CURR_FRAME();
-		f->chgen = q->st.instr->chgen;
-		q->st.m = q->pl->modmap[q->st.instr->mid];
+	if (!q->st.instr->ret_instr) {
+		q->st.instr = NULL;
+		return;
 	}
 
-	q->st.instr = q->st.instr->ret_instr;
+	// A goal requeued last in a heap-built call (a signal retry) returns to that call's own end: follow the chain.
+
+	do {
+		frame *f = GET_CURR_FRAME();
+		f->chgen = q->st.instr->chgen;
+		q->st.m = module_by_id(q->pl, q->st.instr->mid);
+		q->st.instr = q->st.instr->ret_instr;
+	} while (is_end(q->st.instr) && q->st.instr->ret_instr);
 }
 
 static bool can_view(query *q, uint64_t dbgen, const rule *r)
@@ -1094,60 +2290,99 @@ static bool can_view(query *q, uint64_t dbgen, const rule *r)
 	return true;
 }
 
-static void setup_key(query *q)
-{
-	cell *save_arg1 = FIRST_ARG(q->st.key), *save_arg2 = NULL;
-	cell *arg1 = deref(q, save_arg1, q->st.key_ctx);
+// What has_next_key() needs to know of the goal, given its first three arguments dereferenced (NULL past the arity).
 
+static void setup_key(query *q, const cell *arg1, const cell *arg2, const cell *arg3)
+{
 	q->st.karg1_is_ground = !is_var(arg1);
 	q->st.karg1_is_atomic = is_atomic(arg1);
+	q->st.karg2_is_ground = arg2 && !is_var(arg2);
+	q->st.karg2_is_atomic = arg2 && is_atomic(arg2);
+	q->st.karg3_is_ground = arg3 && !is_var(arg3);
+	q->st.karg3_is_atomic = arg3 && is_atomic(arg3);
 
-	if (q->st.key->arity > 1) {
-		cell *arg2 = deref(q, save_arg2 = NEXT_ARG(save_arg1), q->st.key_ctx);
-		q->st.karg2_is_ground = arg2 && !is_var(arg2);
-		q->st.karg2_is_atomic = arg2 && is_atomic(arg2);
+	// When every bound argument is atomic and among the first three, the per-argument tests in
+	// has_next_key() already decide a match and its whole-head compare adds nothing.
+
+	const unsigned arity = get_arity(q->st.key);
+	bool checked = (q->st.karg1_is_atomic || !q->st.karg1_is_ground)
+		&& ((arity < 2) || q->st.karg2_is_atomic || !q->st.karg2_is_ground)
+		&& ((arity < 3) || q->st.karg3_is_atomic || !q->st.karg3_is_ground);
+
+	if (checked && (arity > 3)) {
+		cell *arg = get_nth_arg(q->st.key, 3);
+
+		for (unsigned i = 3; checked && (i < arity); i++, arg += arg->num_cells)
+			checked = is_var(deref(q, arg, q->st.key_ctx));
 	}
 
-	if (q->st.key->arity > 2) {
-		cell *arg3 = deref(q, NEXT_ARG(save_arg2), q->st.key_ctx);
-		q->st.karg3_is_ground = arg3 && !is_var(arg3);
-		q->st.karg3_is_atomic = arg3 && is_atomic(arg3);
-	}
+	q->st.key_args_checked = checked;
+}
+
+// The clause after r on the chain dbe walks: a key chain after an indexed lookup, else pr->head's.
+
+static inline rule *chain_next(const query *q, const rule *r)
+{
+	return q->st.kchain ? r->knext[q->st.kchain2] : r->next;
+}
+
+// The same from the goal itself, when find_key() left a chain walk: for callers without match_head()'s dereferences.
+
+static void setup_chain_key(query *q)
+{
+	if (q->st.iter || q->st.iter_single || !q->st.dbe || !chain_next(q, q->st.dbe) || !get_arity(q->st.key))
+		return;
+
+	const unsigned arity = get_arity(q->st.key);
+	cell *d[3] = {0}, *ga = FIRST_ARG(q->st.key);
+
+	for (unsigned i = 0; (i < 3) && (i < arity); i++, ga += ga->num_cells)
+		d[i] = deref(q, ga, q->st.key_ctx);
+
+	setup_key(q, d[0], d[1], d[2]);
 }
 
 static void next_key(query *q)
 {
+	if (q->st.iter_single) {
+		q->st.iter_single = false;
+		q->st.dbe = NULL;
+		return;
+	}
+
 	if (!q->st.iter) {
-		q->st.dbe = q->st.dbe->next;
+		q->st.dbe = chain_next(q, q->st.dbe);
 		return;
 	}
 
 	if (!sl_next(q->st.iter, (void*)&q->st.dbe)) {
 		q->st.dbe = NULL;
-		sl_done(q->st.iter);
 		q->st.iter = NULL;
 	}
 }
 
 bool has_next_key(query *q)
 {
+	if (q->st.iter_single)
+		return false;
+
 	if (q->st.iter)
 		return sl_has_next(q->st.iter, NULL);
 
-	if (!q->st.dbe->next)
+	if (!chain_next(q, q->st.dbe))
 		return false;
 
-	if (!q->st.key->arity)
+	if (!get_arity(q->st.key))
 		return true;
 
 	if (q->st.dbe->cl.is_unique) {
-		if ((q->st.key->arity == 1) && q->st.karg1_is_atomic)
+		if ((get_arity(q->st.key) == 1) && q->st.karg1_is_atomic)
 			return false;
 
-		if ((q->st.key->arity == 2) && q->st.karg1_is_atomic && q->st.karg2_is_atomic)
+		if ((get_arity(q->st.key) == 2) && q->st.karg1_is_atomic && q->st.karg2_is_atomic)
 			return false;
 
-		if ((q->st.key->arity == 3) && q->st.karg1_is_atomic && q->st.karg2_is_atomic && q->st.karg3_is_atomic)
+		if ((get_arity(q->st.key) == 3) && q->st.karg1_is_atomic && q->st.karg2_is_atomic && q->st.karg3_is_atomic)
 			return false;
 	}
 
@@ -1165,10 +2400,10 @@ bool has_next_key(query *q)
 
 	//DUMP_TERM("key ", q->st.key, q->st.key_ctx, 1);
 
-	for (rule *next = q->st.dbe->next; next; next = next->next) {
+	for (rule *next = chain_next(q, q->st.dbe); next; next = chain_next(q, next)) {
 		cell *dkey = next->cl.cells;
 
-		if ((dkey->val_off == g_neck_s) && (dkey->arity == 2))
+		if ((dkey->val_off == g_neck_s) && (get_arity(dkey) == 2))
 			dkey++;
 
 		//DUMP_TERM("next", dkey, q->st.cur_ctx, 0);
@@ -1188,16 +2423,31 @@ bool has_next_key(query *q)
 				continue;
 		}
 
-		if (index_cmpkey(q->st.key, dkey, q->st.m, NULL) == 0)
+		if (q->st.key_args_checked || (index_cmpkey(q->st.key, dkey, q->st.m, NULL) == 0))
 			return true;
 	}
 
 	return false;
 }
 
+// A closure (1..9) always gets the caller's module. A goal (0, or ^ for one
+// with V^ in front) needs it only from outside user: an unresolved call falls
+// back to user anyway, and goals written at user level stay as written.
+
+static bool meta_arg_wants_module(const query *q, const cell *m)
+{
+	if (is_smallint(m) && (get_smallint(m) > 0) && (get_smallint(m) <= 9))
+		return true;
+
+	bool is_goal = (is_smallint(m) && (get_smallint(m) == 0))
+		|| (is_interned(m) && (m->val_off == g_caret_s));
+
+	return is_goal && (q->st.m != q->pl->user_m);
+}
+
 static bool expand_meta_predicate(query *q, predicate *pr)
 {
-	int arity = q->st.key->arity;
+	uint32_t arity = get_arity(q->st.key);
 	cell *tmp = alloc_heap(q, q->st.key->num_cells*3);	// allocate max possible
 	CHECKED(tmp);
 	cell *save_tmp = tmp;
@@ -1207,18 +2457,17 @@ static bool expand_meta_predicate(query *q, predicate *pr)
 
 	for (cell *k = q->st.key+1, *m = pr->meta_args+1; arity--; k += k->num_cells, m += m->num_cells) {
 		cell *k0 = deref(q, k, q->st.key_ctx);
+		pl_ctx k0_ctx = q->latest_ctx;
 
-		if ((k0->arity == 2) && (k0->val_off == g_colon_s) && is_atom(FIRST_ARG(k0)))
+		if ((get_arity(k0) == 2) && (k0->val_off == g_colon_s) && is_atom(deref(q, FIRST_ARG(k0), k0_ctx)))
 			;
 		else if (!is_interned(k0) || is_iso_list(k0))
-			;
-		else if (is_interned(k0) && ((k0->val_off == g_call_s) || (k0->val_off == g_once_s) || (k0->val_off == g_ignore_s)))
 			;
 		else if (is_interned(m) && (m->val_off == g_colon_s)) {
 			make_instr(tmp, g_colon_s, bif_iso_qualify_2, 2, 1+k->num_cells);
 			SET_OP(tmp, OP_XFY); tmp++;
 			make_atom(tmp++, new_atom(q->pl, q->st.m->name));
-		} else if (is_smallint(m) && is_positive(m) && (get_smallint(m) <= 9)) {
+		} else if (meta_arg_wants_module(q, m)) {
 			make_instr(tmp, g_colon_s, bif_iso_qualify_2, 2, 1+k->num_cells);
 			SET_OP(tmp, OP_XFY); tmp++;
 			make_atom(tmp++, new_atom(q->pl, q->st.m->name));
@@ -1232,28 +2481,210 @@ static bool expand_meta_predicate(query *q, predicate *pr)
 	return true;
 }
 
+int g_index_check = 0;
+unsigned long g_index_check_lookups = 0, g_index_check_bad = 0;
+
+static bool in_candidates(const rule **got, unsigned num_got, const rule *c)
+{
+	for (unsigned i = 0; i < num_got; i++) {
+		if (got[i] == c)
+			return true;
+	}
+
+	return false;
+}
+
+static void index_check(query *q, predicate *pr, cell *goal, pl_ctx goal_ctx, cell *key,
+	const rule **got, unsigned num_got, int idx_arg, skiplist *idx, bool composite)
+{
+	const uint64_t dbgen = q->pl->dbgen;
+	unsigned missing = 0;
+
+	g_index_check_lookups++;
+
+	for (const rule *c = pr->head; c; c = c->next) {
+		if (!can_view(q, dbgen, c))
+			continue;
+
+		cell *ch = get_head(((rule*)c)->cl.cells);
+		cell *ck = ch;
+
+		if (!composite && get_arity(ch))
+			ck = get_nth_arg(ch, idx_arg);
+
+		if (composite) {
+			if (index_cmpkey2(ck, key, pr, NULL) != 0)
+				continue;
+		} else if (index_cmpkey(ck, key, q->st.m, NULL) != 0)
+			continue;
+
+		if (in_candidates(got, num_got, c))
+			continue;
+
+		if (!missing) {
+			fprintf(stderr, "\n*** index-check FAILED for %s/%u (%s)\n",
+				C_STR(q, &pr->key), get_arity(&pr->key),
+				composite ? "composite" : "argument");
+			fprintf(stderr, "***   goal   ");
+			DUMP_TERM("", goal, goal_ctx, 1);
+		}
+
+		fprintf(stderr, "***   MISSING db_id=%llu  ",
+			(unsigned long long)c->db_id);
+		DUMP_TERM("", ch, q->st.cur_ctx, 1);
+
+		sliter *probe = sl_find_key(idx, ck);
+		const rule *probe_r;
+		bool self = false;
+
+		while (probe && sl_next_key(probe, (void*)&probe_r)) {
+			if (probe_r == c) {
+				self = true;
+				break;
+			}
+		}
+
+		if (probe)
+			sl_done(probe);
+
+		fprintf(stderr, "***     reachable by its own key: %s\n",
+			self ? "YES (ordering ok, query descent went astray)"
+			     : "NO (mis-filed on insert, or lost on removal)");
+		fprintf(stderr, "***     cmp(clause,goal)=%d\n",
+			index_cmpkey(ck, key, q->st.m, NULL));
+		missing++;
+	}
+
+	if (missing) {
+		fprintf(stderr, "***   indexed set had %u entr%s, %u missing\n",
+			num_got, num_got == 1 ? "y" : "ies", missing);
+		fprintf(stderr, "***   predicate has %u clauses, idx1=%s idx2(arg%u)=%s idx3=%s\n",
+			(unsigned)pr->cnt, pr->idx1 ? "yes" : "no", pr->idx2_arg + 1,
+			pr->idx2 ? "yes" : "no", pr->idx3 ? "yes" : "no");
+
+		g_index_check_bad++;
+	}
+}
+
+// A goal with both key arguments bound gets every clause sharing the first, and the candidate
+// filter rejects the rest one at a time. Once enough of those go by, build the index that
+// answers them directly. Counting is approximate under threads on purpose: it only decides when
+// to build, and the build itself takes the lock and re-checks.
+
+#define COMPOSITE_INDEX_THRESHOLD 100
+
+// With both keys bound, a chain this short is walked rather than the composite index consulted.
+
+#define SHORT_CHAIN 8
+
+// A key's chain in idx1 (k = 0) or idx2 (k = 1), or NULL if no clause has that key.
+
+static const void *chain_lookup(const predicate *pr, unsigned k, cell *key)
+{
+	const void *v = NULL;
+	return sl_get(k ? pr->idx2 : pr->idx1, key, &v) && kchain_first(v) ? v : NULL;
+}
+
+static void index_check_chain(query *q, predicate *pr, cell *goal, pl_ctx goal_ctx, cell *key,
+	const rule *first, unsigned k)
+{
+	unsigned n = 0, max = 32;
+	const rule **got = TPL_malloc(max * sizeof(*got));
+
+	for (const rule *r = first; r && got; r = r->knext[k]) {
+		if (n == max)
+			got = TPL_realloc(got, (max *= 2) * sizeof(*got));
+
+		if (got)
+			got[n++] = r;
+	}
+
+	if (got)
+		index_check(q, pr, goal, goal_ctx, key, got, n, k ? (int)pr->idx2_arg : 0, NULL, false);
+
+	TPL_free(got);
+}
+
+// Walk a key chain in place: dbe is its first clause, and next_key() follows the chain from there.
+
+static bool walk_chain(query *q, predicate *pr, cell *goal, pl_ctx goal_ctx, cell *key, const void *v, unsigned k)
+{
+	if (g_index_check)
+		index_check_chain(q, pr, goal, goal_ctx, key, v ? kchain_first(v) : NULL, k);
+
+	// Callers test dbe, not the result, so a key with no clauses must leave it NULL.
+
+	q->st.dbe = v ? kchain_first(v) : NULL;
+
+	if (!v)
+		return false;
+
+	q->st.kchain = true;
+	q->st.kchain2 = k;
+	return true;
+}
+
+static void composite_index_wanted(query *q, predicate *pr)
+{
+	if (++pr->idx3_want < COMPOSITE_INDEX_THRESHOLD)
+		return;
+
+	const bool mt = q->pl->is_multithreaded;
+
+	if (mt)
+		prolog_lock_mod(pr->m->pl, pr->m);
+
+	build_predicate_composite_index(pr);
+
+	if (mt)
+		prolog_unlock_mod(pr->m->pl, pr->m);
+}
+
 static bool find_key(query *q, predicate *pr, cell *key, pl_ctx key_ctx)
 {
 	q->st.iter = NULL;
+	q->st.iter_single = false;
+	q->st.kchain = false;
 	q->st.karg1_is_ground = q->st.karg2_is_ground = q->st.karg3_is_ground = false;
 	q->st.karg1_is_atomic = q->st.karg2_is_atomic = q->st.karg3_is_atomic = false;
+	q->st.key_args_checked = false;
 	q->st.key = key;
 	q->st.key_ctx = key_ctx;
+
+	if (!pr->idx1 && pr->needs_index) {
+		// First lookup since the predicate outgrew the threshold: build the index now.
+
+		const bool mt = q->pl->is_multithreaded;
+
+		if (mt)
+			prolog_lock_mod(pr->m->pl, pr->m);
+
+		build_predicate_index(pr);
+
+		if (mt)
+			prolog_unlock_mod(pr->m->pl, pr->m);
+	}
 
 	if (!pr->idx1) {
 		q->st.dbe = pr->head;
 
-		if (key->arity) {
+		if (get_arity(key)) {
 			if (pr->is_meta_predicate) {
 				if (!expand_meta_predicate(q, pr))
 					return false;
 			}
-
-			setup_key(q);
 		}
 
 		return true;
 	}
+
+	INDEX_PROFILE_START(pr);
+
+	// The goal is cloned only where the key needs it to be self-contained: the composite index
+	// compares whole heads, and a compound key argument may hold bound variables the comparator
+	// cannot follow. An atomic key argument is used where it derefs to (see wmd-profile.md).
+
+	bool cloned = false;
 
 	if (pr->is_meta_predicate) {
 		if (!expand_meta_predicate(q, pr))
@@ -1261,37 +2692,110 @@ static bool find_key(query *q, predicate *pr, cell *key, pl_ctx key_ctx)
 
 		key = q->st.key;
 		key_ctx = q->st.cur_ctx;
-	} else {
-		CHECKED(init_tmp_heap(q));
-		key = clone_term_to_tmp(q, key, key_ctx);
-		key_ctx = q->st.cur_ctx;
+		cloned = true;
 	}
 
-	cell *arg1 = key->arity ? FIRST_ARG(key) : NULL;
+	cell *arg1 = get_arity(key) ? deref(q, FIRST_ARG(key), key_ctx) : NULL;
 	skiplist *idx = pr->idx1;
+	cell *goal = key;
+	pl_ctx goal_ctx = key_ctx;
+	int idx_arg = 0, idx_arg2 = -1;
+	bool composite = false;
 
-	if (arg1 && (is_var(arg1) || pr->is_var_in_first_arg)) {
-		if (!pr->idx2) {
+	// A clause keyed f(_) is kept out of the overflow, so a compound key that might match it walks the clauses.
+
+	if (arg1 && (is_var(arg1) || pr->is_var_in_first_arg || (pr->is_open_first_arg && !key_chainable(arg1)))) {
+		if (!pr->idx2 || pr->is_var_in_idx2_arg) {
+			INDEX_PROFILE_MODE(ip, linear);
+			INDEX_PROFILE_CANDIDATES(ip, pr->cnt);
 			q->st.dbe = pr->head;
 			return true;
 		}
 
-		cell *arg2 = NEXT_ARG(arg1);
+		cell *arg2 = deref(q, get_nth_arg(key, pr->idx2_arg), key_ctx);
 
 		if (is_var(arg2)) {
+			INDEX_PROFILE_MODE(ip, linear);
+			INDEX_PROFILE_CANDIDATES(ip, pr->cnt);
 			q->st.dbe = pr->head;
 			return true;
 		}
 
 		key = arg2;
 		idx = pr->idx2;
+		idx_arg = pr->idx2_arg;
+		INDEX_PROFILE_MODE(ip, idx2);
+	} else if (arg1) {
+		cell *argn = pr->idx2_arg ? deref(q, get_nth_arg(key, pr->idx2_arg), key_ctx) : NULL;
+		const bool both_bound = argn && !is_var(argn) && !pr->is_var_in_first_arg
+			&& !pr->is_open_first_arg && !pr->is_var_in_idx2_arg;
+
+		// Both keys atomic: every clause with both is on both chains, so walk the shorter. Only two long
+		// chains call for the composite index, and once it is built the chains are not consulted.
+
+		if (both_bound && pr->idx2 && !pr->idx3 && key_chainable(arg1) && key_chainable(argn)) {
+			const void *v1 = chain_lookup(pr, 0, arg1), *v2 = v1 ? chain_lookup(pr, 1, argn) : NULL;
+
+			if (!v2)
+				return walk_chain(q, pr, goal, goal_ctx, v1 ? argn : arg1, NULL, v1 != NULL);
+
+			const unsigned k = kchain_count(v2) < kchain_count(v1);
+
+			if ((kchain_count(k ? v2 : v1) > SHORT_CHAIN) && !pr->no_idx3)
+				composite_index_wanted(q, pr);
+
+			INDEX_PROFILE_MODE(ip, idx1);
+			return walk_chain(q, pr, goal, goal_ctx, k ? argn : arg1, k ? v2 : v1, k);
+		} else if (both_bound && !pr->idx3 && !pr->no_idx3)
+			composite_index_wanted(q, pr);
+
+		if (both_bound && pr->idx3) {
+			// Keyed on both, so the whole goal is the key (see index_cmpkey2).
+			idx = pr->idx3;
+			idx_arg2 = pr->idx2_arg;
+			composite = true;
+			INDEX_PROFILE_MODE(ip, idx3);
+		} else {
+			// idx1 is keyed on Arg1 only (see assert_commit).
+			key = arg1;
+			INDEX_PROFILE_MODE(ip, idx1);
+		}
+	}
+
+	if (!arg1) {
+		INDEX_PROFILE_MODE(ip, idx1);
+	}
+
+	if (!cloned && (composite || is_compound(key))) {
+		CHECKED(init_tmp_heap(q));
+		goal = clone_term_to_tmp(q, goal, goal_ctx);
+		goal_ctx = q->st.cur_ctx;
+
+		if (composite)
+			key = goal;
+		else
+			key = idx_arg ? get_nth_arg(goal, idx_arg) : FIRST_ARG(goal);
 	}
 
 	q->st.dbe = NULL;
+
+	// A chainable key's clauses are chained in database order and walked in place, with no prefetch.
+	// Any other key is in the overflow, one entry per clause.
+
+	if (!composite && key_chainable(key))
+		return walk_chain(q, pr, goal, goal_ctx, key, chain_lookup(pr, idx_arg != 0, key), idx_arg != 0);
+
+	if (!composite)
+		idx = idx_arg ? pr->ovf2 : pr->ovf1;
+
 	sliter *iter;
 
-	if (!(iter = sl_find_key(idx, key)))
+	if (!(iter = sl_find_key(idx, key))) {
+		if (g_index_check)
+			index_check(q, pr, goal, goal_ctx, key, NULL, 0, idx_arg, idx, composite);
+
 		return false;
+	}
 
 	// If the index search has found just one (definite) solution
 	// then we can use it with no problems. If more than one then
@@ -1299,12 +2803,66 @@ static bool find_key(query *q, predicate *pr, cell *key, pl_ctx key_ctx)
 	// the results and return them sorted as an iterator...
 
 	skiplist *tmp_idx = NULL;
+	const rule *first = NULL;
 	const rule *r;
+	const rule **got = NULL;
+	unsigned num_got = 0, max_got = 0;
+	const unsigned key_arity = get_arity(goal);
+
+	// The candidate filter compares only atomic arguments, so resolve the goal's once here
+	// (NULL where not atomic) rather than dereferencing them again for every candidate.
+
+	cell *kargs[16];
+	const unsigned num_kargs = key_arity < 16 ? key_arity : 16;
+	cell *ka = key_arity ? FIRST_ARG(goal) : NULL;
+
+	for (unsigned n = 0; n < num_kargs; n++, ka = NEXT_ARG(ka)) {
+		cell *kd = deref(q, ka, goal_ctx);
+		kargs[n] = is_atomic(kd) ? kd : NULL;
+	}
 
 	while (sl_next_key(iter, (void*)&r)) {
+		INDEX_PROFILE_CANDIDATES(ip, 1);
+		if (g_index_check) {
+			if (num_got == max_got) {
+				max_got = max_got ? max_got * 2 : 32;
+				got = TPL_realloc(got, max_got * sizeof(*got));
+			}
+
+			got[num_got++] = r;
+		}
+
+		// The index keys on one argument, so candidates sharing that key can
+		// still differ in another: a clause whose atomic argument differs from
+		// the call's cannot unify, and is dropped here rather than prefetched
+		// and unified. Only atomic against atomic, so no walk of a compound.
+
+		if (num_kargs) {
+			cell *ch = get_head(((rule*)r)->cl.cells);
+			cell *ca = FIRST_ARG(ch);
+			bool may_match = true;
+
+			for (unsigned n = 0; n < num_kargs; n++, ca = NEXT_ARG(ca)) {
+				if (kargs[n] && ((int)n != idx_arg) && ((int)n != idx_arg2)
+					&& is_atomic(ca) && index_cmpkey(kargs[n], ca, q->st.m, NULL)) {
+					may_match = false;
+					break;
+				}
+			}
+
+			if (!may_match)
+				continue;
+		}
+
+		if (!first) {
+			first = r;
+			continue;
+		}
+
 		if (!tmp_idx) {
 			tmp_idx = sl_create(NULL, NULL, NULL);
 			sl_set_tmp(tmp_idx);
+			sl_app(tmp_idx, (void*)(size_t)first->db_id, (void*)first);
 		}
 
 		sl_app(tmp_idx, (void*)(size_t)r->db_id, (void*)r);
@@ -1312,8 +2870,23 @@ static bool find_key(query *q, predicate *pr, cell *key, pl_ctx key_ctx)
 
 	sl_done(iter);
 
-	if (!tmp_idx)
+	if (g_index_check) {
+		index_check(q, pr, goal, goal_ctx, key, got, num_got, idx_arg, idx, composite);
+		TPL_free(got);
+	}
+
+	if (!first)
 		return false;
+
+	if (!tmp_idx) {
+		q->st.dbe = (rule*)first;
+		q->st.iter = NULL;
+		q->st.iter_single = true;
+		return true;
+	}
+
+	// More than one: results must come back in database order, so the
+	// prefetch stands.
 
 	iter = sl_first(tmp_idx);
 
@@ -1323,37 +2896,76 @@ static bool find_key(query *q, predicate *pr, cell *key, pl_ctx key_ctx)
 	}
 
 	q->st.iter = iter;
+	q->st.iter_owner = q->st.cp;
 	return true;
+}
+
+// A predicate cached from a module destroy_module/1 emptied may since have
+// been revived in a module that took its place (see
+// module_bury_predicates()), so a revived one is only good when its module
+// is the one running. Others are left alone: library code runs in its
+// caller's module and relies on what it cached from its own. pr->m is only
+// compared, never followed: a builtin's cell holds its bif here, which the
+// caller searches past anyway.
+
+static inline bool match_in_view(const query *q, const predicate *pr)
+{
+	return !pr->is_revived || (pr->m == q->st.m);
+}
+
+// The predicate clause/retract act on. An explicit module, from M:Head,
+// is looked up every time: M may be bound at run time, so the head cell's
+// cached match could belong to another module. Reading it, clause/2 sees
+// what M inherits from user, as in SWI; changing it, retract/1 doesn't
+// reach past M, as in SWI and Scryer, so retract(m:foo) never takes a
+// clause of user's foo.
+
+static predicate *find_db_predicate(query *q, module *m, cell *c, bool inherit)
+{
+	predicate *pr = NULL;
+
+	if (m) {
+		if (is_cstring(c))
+			convert_to_literal(m, c);
+
+		pr = inherit ? search_predicate(m, c) : find_predicate(m, c);
+		return pr ? thread_local_shadow(pr) : NULL;
+	}
+
+	if (is_interned(c))
+		pr = c->match;
+	else if (is_cstring(c))
+		convert_to_literal(q->st.m, c);
+
+	if (pr && pr->is_abolished) {
+		if ((pr = search_predicate(q->st.m, c)) != NULL)
+			c->match = pr;
+	} else if (pr && !match_in_view(q, pr))
+		pr = search_predicate(q->st.m, c);
+
+	if (!pr || is_evaluable(c) || is_builtin(c)) {
+		pr = search_predicate(q->st.m, c);
+
+		if (pr)
+			c->match = pr;
+	}
+
+	return pr ? thread_local_shadow(pr) : NULL;
 }
 
 // Match HEAD :- BODY.
 
-bool match_rule(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
+bool match_rule(query *q, module *m, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 {
 	if (!q->retry) {
 		cell *c = deref(q, get_head(p1), p1_ctx);
 		pl_ctx c_ctx = q->latest_ctx;
-		predicate *pr = NULL;
-
-		if (is_interned(c))
-			pr = c->match;
-		else if (is_cstring(c))
-			convert_to_literal(q->st.m, c);
-
-		if (pr && pr->is_abolished)
-			pr = search_predicate(q->st.m, c);
-
-		if (!pr || is_evaluable(c) || is_builtin(c)) {
-			pr = search_predicate(q->st.m, c);
-
-			if (pr)
-				c->match = pr;
-		}
+		predicate *pr = find_db_predicate(q, m, c, false);
 
 		if (!pr) {
 			bool found = false;
 
-			if (get_builtin_term(q->st.m, c, &found, NULL), found)
+			if (get_builtin_term(m ? m : q->st.m, c, &found, NULL), found)
 				return throw_error(q, c, c_ctx, "permission_error", "modify,static_procedure");
 
 			q->st.dbe = NULL;
@@ -1368,14 +2980,19 @@ bool match_rule(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 		if (!pr->is_dynamic)
 			return throw_error(q, c, c_ctx, "permission_error", "modify,static_procedure");
 
-		find_key(q, pr, c, c_ctx);
+		// Enter before finding: find_key() reads pr->head and parks a
+		// rule pointer in q->st.dbe, and it is the refcount taken by
+		// enter_predicate() that stops leave_predicate() reclaiming
+		// what it parked.
 		enter_predicate(q, pr);
+		find_key(q, pr, c, c_ctx);
+		setup_chain_key(q);
 	} else {
 		next_key(q);
 	}
 
 	if (!q->st.dbe) {
-		leave_predicate(q, q->st.pr, true);
+		leave_predicate(q, q->st.pr, q->st.pr_dbgen, true);
 		return false;
 	}
 
@@ -1383,11 +3000,12 @@ bool match_rule(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 	cell *p1_body = deref(q, get_logical_body(p1), p1_ctx);
 	cell *orig_p1 = p1;
 
-	for (; q->st.dbe; q->st.dbe = q->st.dbe->next) {
+	for (; q->st.dbe; next_key(q)) {
 		if (!can_view(q, f->dbgen, q->st.dbe))
 			continue;
 
 		CHECKED(push_choice(q));
+		GET_CURR_CHOICE()->owns_pr = true;
 		clause *cl = &q->st.dbe->cl;
 		cell *c = cl->cells;
 		bool needs_true = false;
@@ -1406,6 +3024,9 @@ bool match_rule(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 		}
 
 		if (unify(q, p1, p1_ctx, c, q->st.cur_ctx)) {
+			if (q->did_throw)
+				return true;
+
 			int ok;
 
 			if (needs_true) {
@@ -1414,6 +3035,8 @@ bool match_rule(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 				cell tmp;
 				make_instr(&tmp, g_true_s, bif_iso_true_0, 0, 0);
 				ok = unify(q, p1_body, p1_body_ctx, &tmp, q->st.cur_ctx);
+				if (q->did_throw)
+					return true;
 			} else
 				ok = true;
 
@@ -1423,41 +3046,27 @@ bool match_rule(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 		retry_choice(q);
 	}
 
-	leave_predicate(q, q->st.pr, true);
-	drop_choice(q);
+	// Each choice this loop pushed was popped by its retry_choice(), so there is none of ours to drop.
+
+	leave_predicate(q, q->st.pr, q->st.pr_dbgen, true);
 	return false;
 }
 
 // Match HEAD.
 // Match HEAD :- true.
 
-bool match_clause(query *q, cell *p1, pl_ctx p1_ctx, cell **ret_body, enum clause_type is_retract)
+bool match_clause(query *q, module *m, cell *p1, pl_ctx p1_ctx, cell **ret_body, enum clause_type is_retract)
 {
 	if (!q->retry) {
 		cell *c = p1;
 		pl_ctx c_ctx = p1_ctx;
-		predicate *pr = NULL;
-
-		if (is_interned(c))
-			pr = c->match;
-		else if (is_cstring(c))
-			convert_to_literal(q->st.m, c);
-
-		if (pr && pr->is_abolished)
-			pr = search_predicate(q->st.m, c);
-
-		if (!pr || is_evaluable(c) || is_builtin(c)) {
-			pr = search_predicate(q->st.m, c);
-
-			if (pr)
-				c->match = pr;
-		}
+		predicate *pr = find_db_predicate(q, m, c, (is_retract == DO_CLAUSE) || (is_retract == DO_CLAUSE_STATIC));
 
 		if (!pr) {
 			bool found = false;
 
-			if (get_builtin_term(q->st.m, p1, &found, NULL), found) {
-				if (is_retract != DO_CLAUSE)
+			if (get_builtin_term(m ? m : q->st.m, p1, &found, NULL), found) {
+				if ((is_retract != DO_CLAUSE) && (is_retract != DO_CLAUSE_STATIC))
 					return throw_error(q, p1, p1_ctx, "permission_error", "modify,static_procedure");
 				else
 					return throw_error(q, p1, p1_ctx, "permission_error", "access,private_procedure");
@@ -1472,28 +3081,32 @@ bool match_clause(query *q, cell *p1, pl_ctx p1_ctx, cell **ret_body, enum claus
 			pr = pr->alias;
 		}
 
-		if (!pr->is_dynamic) {
-			if (is_retract == DO_CLAUSE) {
-				if (!q->access_private)
-					return throw_error(q, p1, p1_ctx, "permission_error", "access,private_procedure");
-			} else
-				return throw_error(q, p1, p1_ctx, "permission_error", "modify,static_procedure");
+		if (!pr->is_dynamic && (is_retract != DO_CLAUSE_STATIC)) {
+			if (is_retract == DO_CLAUSE)
+				return throw_error(q, p1, p1_ctx, "permission_error", "access,private_procedure");
+
+			return throw_error(q, p1, p1_ctx, "permission_error", "modify,static_procedure");
 		}
 
-		find_key(q, pr, c, c_ctx);
+		// Enter before finding: find_key() reads pr->head and parks a
+		// rule pointer in q->st.dbe, and it is the refcount taken by
+		// enter_predicate() that stops leave_predicate() reclaiming
+		// what it parked.
 		enter_predicate(q, pr);
+		find_key(q, pr, c, c_ctx);
+		setup_chain_key(q);
 	} else {
 		next_key(q);
 	}
 
 	if (!q->st.dbe) {
-		leave_predicate(q, q->st.pr, true);
+		leave_predicate(q, q->st.pr, q->st.pr_dbgen, true);
 		return false;
 	}
 
 	const frame *f = GET_CURR_FRAME();
 
-	for (; q->st.dbe; q->st.dbe = q->st.dbe->next) {
+	for (; q->st.dbe; next_key(q)) {
 		if (!can_view(q, f->dbgen, q->st.dbe))
 			continue;
 
@@ -1507,12 +3120,32 @@ bool match_clause(query *q, cell *p1, pl_ctx p1_ctx, cell **ret_body, enum claus
 			continue;
 
 		CHECKED(push_choice(q));
-		cell *tmp = import_term(q, c, q->st.cur_ctx);
-		CHECKED(tmp);
+		GET_CURR_CHOICE()->owns_pr = true;
+
+		// import_term() detaches a copy because unifying against the clause can leave the
+		// caller pointing into cells that retract is about to take away, and it keeps that
+		// copy until backtracking undoes past it - which a deterministic loop never does,
+		// so a retract loop kept one copy and one undo item per call. A fact whose arguments
+		// are all atomic cannot be pointed into: unify() copies such values into the caller's
+		// slots. Match against the clause itself and allocate nothing. clause/2 still gets a
+		// copy, since it hands the body back to its caller.
+
+		cell *tmp;
+
+		if ((is_retract != DO_CLAUSE) && (is_retract != DO_CLAUSE_STATIC) && cl->is_purgeable) {
+			tmp = c;
+		} else {
+			tmp = import_term(q, c, q->st.cur_ctx);
+			CHECKED(tmp);
+		}
+
 		cell *head = get_head(tmp);
 		body = get_body(tmp);
 
 		if (unify(q, p1, p1_ctx, head, q->st.cur_ctx)) {
+			if (q->did_throw)
+				return true;
+
 			if (ret_body)
 				*ret_body = body;
 
@@ -1522,7 +3155,7 @@ bool match_clause(query *q, cell *p1, pl_ctx p1_ctx, cell **ret_body, enum claus
 		retry_choice(q);
 	}
 
-	leave_predicate(q, q->st.pr, true);
+	leave_predicate(q, q->st.pr, q->st.pr_dbgen, true);
 	return false;
 }
 
@@ -1539,7 +3172,12 @@ bool match_head(query *q)
 			convert_to_literal(q->st.m, c);
 		}
 
-		if (pr && pr->is_abolished)
+		// One abolished and since redefined is cached afresh, or every call here would search for it.
+
+		if (pr && pr->is_abolished) {
+			if ((pr = search_predicate(q->st.m, c)) != NULL)
+				c->match = pr;
+		} else if (pr && !match_in_view(q, pr))
 			pr = search_predicate(q->st.m, c);
 
 		if (!pr || is_evaluable(c) || is_builtin(c)) {
@@ -1547,7 +3185,8 @@ bool match_head(query *q)
 
 			if (pr) {
 				c->match = pr;
-				c->flags = 0;
+				// Keep NEXT_CUT / TCO hints; only drop builtin tags.
+				c->flags &= ~(FLAG_INTERNED_BUILTIN | FLAG_INTERNED_EVALUABLE);
 			}
 		}
 
@@ -1567,18 +3206,83 @@ bool match_head(query *q)
 			pr = pr->alias;
 		}
 
-		find_key(q, pr, c, c_ctx);
+		if (pr->is_thread_local && !(pr = thread_local_shadow(pr)))
+			return throw_error(q, c, c_ctx, "resource_error", "memory");
+
+		// A predicate that exists in the module but has no clauses and is
+		// neither dynamic nor multifile (e.g. a static predicate left empty
+		// after a file reconsult removed its last clause) must be treated as
+		// an undefined procedure and honor the `unknown` flag, rather than
+		// silently failing.
+		if (!pr->head && !pr->is_dynamic && !pr->is_multifile && !pr->is_discontiguous && !pr->is_builtin) {
+			if (!is_end(c) && !(is_interned(c) && !strcmp(C_STR(q, c), "initialization"))) {
+				if (q->st.m->flags.unknown == UNK_ERROR)
+					return throw_error(q, c, c_ctx, "existence_error", "procedure");
+				return false;
+			} else {
+				q->error = true;
+				return false;
+			}
+		}
+
+		// Enter before finding: find_key() reads pr->head and parks a
+		// rule pointer in q->st.dbe, and it is the refcount taken by
+		// enter_predicate() that stops leave_predicate() reclaiming
+		// what it parked.
 		enter_predicate(q, pr);
+		find_key(q, pr, c, c_ctx);
 	} else
 		next_key(q);
 
 	if (!q->st.dbe) {
-		leave_predicate(q, q->st.pr, true);
+		leave_predicate(q, q->st.pr, q->st.pr_dbgen, true);
 		return false;
 	}
 
+	// Nothing under the index threshold has an index, so a call walks the chain and unifies
+	// every head until one takes. Most of those fail: 73% of attempts in chess. Summarise the
+	// goal's first argument once and throw out the clauses that cannot match it, which costs
+	// a compare instead of try_me()'s memset, a unify() and an undo_me().
+
+	uint64_t goal_sig[3] = {0};
+
+	if (!q->st.pr->sig_chosen)
+		choose_sig_args(q->st.pr, q->pl->is_multithreaded);
+
+	// Only where nothing else has narrowed the field: an index hit was filtered by find_key(), and a
+	// lone clause is tried whatever its head looks like. An indexed predicate whose goal fell back to
+	// the chain (neither indexed argument bound) walks it unfiltered too, so it gets the same test.
+
+	if ((!q->st.pr->idx1 || (!q->st.iter && !q->st.iter_single)) && chain_next(q, q->st.dbe) && get_arity(q->st.key)) {
+		const uint32_t arity = get_arity(q->st.key);
+		cell *ga = FIRST_ARG(q->st.key);
+
+		// A chain walk: set up what has_next_key() needs once, not per retry, sharing the dereferences where it can.
+
+		if (q->st.pr->sig_custom) {
+			for (unsigned i = 0; i < 3; i++)
+				goal_sig[i] = cell_signature(deref(q, get_nth_arg(q->st.key, q->st.pr->sig_args[i]), q->st.key_ctx));
+
+			if (!q->retry)
+				setup_chain_key(q);
+		} else {
+			cell *d[3] = {0};
+
+			for (unsigned i = 0; (i < 3) && (i < arity); i++, ga += ga->num_cells) {
+				d[i] = deref(q, ga, q->st.key_ctx);
+				goal_sig[i] = cell_signature(d[i]);
+			}
+
+			if (!q->retry)
+				setup_key(q, d[0], d[1], d[2]);
+		}
+	}
+
+	// Only now, so the choicepoint saves what setup_key() worked out and a retry has it for has_next_key().
+
 	CHECKED(check_frame(q, q->st.pr->max_vars));
 	CHECKED(push_choice(q));
+	GET_CURR_CHOICE()->owns_pr = true;
 	const frame *f = GET_CURR_FRAME();
 
 	for (; q->st.dbe; next_key(q)) {
@@ -1586,27 +3290,41 @@ bool match_head(query *q)
 			continue;
 
 		clause *cl = &q->st.dbe->cl;
+
+		if ((goal_sig[0] && cl->arg_sig[0] && (cl->arg_sig[0] != goal_sig[0]))
+			|| (goal_sig[1] && cl->arg_sig[1] && (cl->arg_sig[1] != goal_sig[1]))
+			|| (goal_sig[2] && cl->arg_sig[2] && (cl->arg_sig[2] != goal_sig[2])))
+			continue;
 		cell *head = get_head(cl->cells);
 
-		if (cl->num_vars > q->st.pr->max_vars)
-			CHECKED(check_slot(q, cl->num_vars));
+		if (cl->num_vars > q->st.pr->max_vars) {
+			CHECKED(check_slot(q, q->st.pr->max_vars=cl->num_vars));
+			GET_NEW_FRAME()->slots = q->st.sp;
+		}
 
 		try_me(q, cl->num_vars);
 		q->st.dbe->attempted++;
 
-		if (unify(q, q->st.key, q->st.key_ctx, head, q->st.fp)) {
+		if (unify_head(q, q->st.key, q->st.key_ctx, head, q->st.fp)) {
+			if (q->did_throw)
+				return true;
+
+			if (q->st.pr->is_dynamic)
+				touch_rule(q, q->st.dbe);
+
+			const bool head_has_vars = q->has_vars;
+
 			if (q->error)
 				break;
 
-			commit_frame(q);
+			commit_frame(q, head_has_vars);
 			return true;
 		}
 
 		undo_me(q);
 	}
 
-	leave_predicate(q, q->st.pr, true);
-	drop_choice(q);
+	leave_predicate_and_drop(q, q->st.pr, true);
 	return false;
 }
 
@@ -1618,7 +3336,7 @@ static bool any_outstanding_choices(query *q)
 		if (!ch->barrier)
 			break;
 
-		q->st.cp--;
+		pop_choice(q);
 	}
 
 	return q->st.cp > 0;
@@ -1638,29 +3356,24 @@ void do_cleanup(query *q, cell *c, pl_ctx c_ctx)
 
 static bool consultall(query *q, cell *l, pl_ctx l_ctx)
 {
-	if (is_string(l)) {
-		do_load_file(q, l, l_ctx);
-		return true;
-	}
-
 	if (is_cyclic_term(q, l, l_ctx))
 		return throw_error(q, l, l_ctx, "type_error", "callable");
 
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_list(l)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = deref(q, h, l_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
-		if (is_iso_list(h)) {
+		if (is_list(h)) {
 			if (consultall(q, h, h_ctx) != true)
 				return false;
 		} else {
 			do_load_file(q, h, h_ctx);
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = deref(q, l, l_ctx);
 		l_ctx = q->latest_ctx;
 	}
@@ -1674,7 +3387,10 @@ bool start(query *q)
 	bool done = false;
 
 	while (!done && !q->error) {
-		if (g_tpl_interrupt) {
+		if ((q->dirty_cnt >= q->purge_at) && !q->pl->is_multithreaded)
+			purge_reclaimed(q);
+
+		if (interrupt_pending(q)) {
 			switch (check_interrupt(q)) {
 				case 1: return true;
 				case -1: q->retry = true;
@@ -1683,7 +3399,11 @@ bool start(query *q)
 		}
 
 #if USE_THREADS
-		if (q->thread_ptr) {
+		// Not while a retry is pending: retry_choice() below would restore
+		// the choicepoint over the handler, and the signal, already taken
+		// off the queue, was lost. The next pass delivers it.
+
+		if (q->thread_ptr && !q->retry) {
 			thread *t = q->thread_ptr;
 
 			if (list_count(&t->signals)) {
@@ -1701,7 +3421,8 @@ bool start(query *q)
 			}
 		}
 
-		if (!is_callable(q->st.instr)) {
+		if (!is_callable(q->st.instr)
+			&& (q->run_init || !is_list(q->st.instr))) {
 			cell *p1 = deref(q, q->st.instr, q->st.cur_ctx);
 			pl_ctx p1_ctx = q->latest_ctx;
 
@@ -1718,6 +3439,38 @@ bool start(query *q)
 		pl_ctx save_ctx = q->st.cur_ctx;
 		q->cycle_error = q->did_throw = false;
 		q->total_goals++;
+
+		// A thread's stack_limit passed, or call_with_inference_limit/3's
+		// limit reached. Each is cleared before its throw, so the handler
+		// runs unlimited; call_with_inference_limit/3 puts back the next
+		// limit out. One test per goal while neither is armed.
+
+		if (q->goal_trap) {
+			const char *ball = NULL;
+
+			if (q->stack_over) {
+				q->stack_over = false;
+				ball = "error(resource_error(stack),stack_limit)";
+			} else if (q->inference_limit && (q->total_goals > q->inference_limit)) {
+				q->inference_limit = 0;
+				ball = "'$inference_limit_exceeded'";
+			}
+
+			q->goal_trap = q->stack_over || q->inference_limit;
+
+			if (ball) {
+				q->did_throw = true;
+				find_exception_handler(q, (char*)ball);
+
+				if (q->abort && !q->error)
+					break;
+
+				if (q->st.instr)
+					proceed(q);
+
+				goto MORE;
+			}
+		}
 
 		if (is_builtin(q->st.instr)) {
 			q->total_inferences++;
@@ -1738,19 +3491,35 @@ bool start(query *q)
 				continue;
 			}
 
-			if (!(q->total_goals % YIELD_INTERVAL)) {
-				q->s_cnt = 0;
+			// An unhandled throw has already drained every choicepoint,
+			// so there is no goal left to advance past. In an engine the
+			// bottom barrier then restores the instruction pointer it
+			// captured before the goal was installed - a NULL one, which
+			// proceed() dereferenced. MORE handles a NULL instr already.
 
-				if (!(q->s_cnt++ % 10000))
-					check_pressure(q);
+			if (q->did_throw) {
+				// An abort leaves q->error clear, so stop here rather than resume wherever unwinding left off.
+
+				if (q->abort && !q->error)
+					break;
+
+				if (q->st.instr)
+					proceed(q);
+
+				goto MORE;
+			}
+
+			if (!(q->total_goals % YIELD_INTERVAL)) {
+				check_pressure(q);
+				check_stack_limit(q);
 
 				if (q->yield_at && !q->run_hook) {
 					uint64_t now = wall_time_in_usec() / 1000;
 
-					if (now > q->yield_at)  {
-						do_yield_then(q, status);
+					// Only tasks, and WASI top-level queries, can yield; anything else carries on.
+
+					if ((now > q->yield_at) && !do_yield_then(q, status))
 						break;
-					}
 				}
 			}
 
@@ -1770,7 +3539,7 @@ bool start(query *q)
 
 			Trace(q, save_cell, save_ctx, EXIT);
 			proceed(q);
-		} else if (!q->run_init && is_iso_list(q->st.instr)) {
+		} else if (!q->run_init && is_list(q->st.instr)) {
 			if (!consultall(q, q->st.instr, q->st.cur_ctx)) {
 				Trace(q, q->st.instr, q->st.cur_ctx, FAIL);
 				q->retry = QUERY_RETRY;
@@ -1790,6 +3559,16 @@ bool start(query *q)
 				continue;
 			}
 
+			if (q->did_throw) {
+				if (q->abort && !q->error)
+					break;
+
+				if (q->st.instr)
+					proceed(q);
+
+				goto MORE;
+			}
+
 			if (q->run_hook)
 				do_post_unify_hook(q, false);
 		}
@@ -1804,10 +3583,13 @@ bool start(query *q)
 				continue;
 			}
 
-			if (q->top && !q->run_init && any_outstanding_choices(q)) {
+			// A task runs its goal once, with nobody to ask for more.
+
+			if (q->top && !q->run_init && !q->is_task && any_outstanding_choices(q)) {
 				if (!check_redo(q))
 					break;
 
+				q->status = true;
 				return true;
 			}
 
@@ -1830,12 +3612,53 @@ bool start(query *q)
 	return true;
 }
 
+// Frame 0 is one run from the first page's start, which grows to fit only while nothing else can point into it.
+
+static bool layout_frame0(query *q, unsigned num_vars)
+{
+	slot_page *a = q->slot_pages;
+	size_t size = a->end - a->slots;
+
+	if (num_vars > size) {
+		const uintptr_t lo = (uintptr_t)a->slots, hi = (uintptr_t)a->end;
+		size_t n = alloc_grow(q, (void**)&a->slots, sizeof(slot), num_vars, (size_t)num_vars * 5 / 4);
+
+		if (!n) {
+			q->error = true;
+			return false;
+		}
+
+		memset(a->slots + size, 0, sizeof(slot) * (n - size));
+		a->end = a->slots + n;
+
+		// Frames still pointing at the first page, unused ones included, follow it.
+
+		for (pl_idx i = 0; i < q->frame_pages_size; i++) {
+			for (unsigned j = 0; q->frame_pages[i] && (j < FRAME_PAGE_SIZE); j++) {
+				frame *f = q->frame_pages[i] + j;
+
+				if (((uintptr_t)f->slots >= lo) && ((uintptr_t)f->slots <= hi))
+					f->slots = a->slots + ((uintptr_t)f->slots - lo) / sizeof(slot);
+
+				if (((uintptr_t)f->ovf >= lo) && ((uintptr_t)f->ovf <= hi))
+					f->ovf = a->slots + ((uintptr_t)f->ovf - lo) / sizeof(slot);
+			}
+		}
+	}
+
+	frame *f = get_frame(q, 0);
+	f->slots = f->ovf = a->slots;
+	f->initial_slots = f->actual_slots = num_vars;
+	q->st.sp_page = a;
+	q->st.sp = a->slots + num_vars;
+	return true;
+}
+
 bool execute(query *q, cell *cells, unsigned num_vars)
 {
 	q->retry = q->halt = q->error = q->abort = false;
 	q->pl->did_dump_vars = false;
 	q->st.instr = cells;
-	q->st.sp = num_vars;
 	q->is_redo = false;
 
 	// There is an initial frame (fp=0), so this
@@ -1843,8 +3666,13 @@ bool execute(query *q, cell *cells, unsigned num_vars)
 
 	q->st.fp = 1;
 
-	frame *f = q->frames;
-	f->initial_slots = f->actual_slots = num_vars;
+	frame *f = GET_FRAME(0);
+
+	// engine_create() can leave frame 0 with an overflow run already, and sp above it.
+
+	if (((f->ovf == q->slot_pages->slots) || (f->actual_slots != num_vars)) && !layout_frame0(q, num_vars))
+		return false;
+
 	f->dbgen = ++q->pl->dbgen;
 	return start(q);
 }
@@ -1855,6 +3683,17 @@ void query_destroy(query *q)
 		return;
 
 	q->done = true;
+
+	// Off the registry before anything else, so a lookup from another
+	// thread can never resolve to a query that is mid-teardown. Safe to
+	// call unconditionally: unregister_task()/drain_mailbox() are no-ops
+	// for a query that never registered (transient sub-queries, most
+	// queries in a single-threaded program), and cheap ones - not worth
+	// gating behind is_task when the callee already returns at once for
+	// anything that never called task_self/1.
+
+	unregister_task(q);
+	drain_mailbox(q);
 
 	for (page *a = q->heap_pages; a;) {
 		cell *c = a->cells;
@@ -1868,20 +3707,33 @@ void query_destroy(query *q)
 		TPL_free(save);
 	}
 
-	slot *e = q->slots;
+	// Pages before sp's hold their used count of live slots, pages after it none.
 
-	for (pl_idx i = 0; i < q->st.sp; i++, e++) {
-		cell *c = &e->c;
-		unshare_cell(c);
+	for (slot_page *a = q->slot_pages; a; a = a->next) {
+		const slot *end = a == q->st.sp_page ? q->st.sp : a->slots + a->used;
+
+		for (slot *e = a->slots; e < end; e++)
+			unshare_cell(&e->c);
+
+		if (a == q->st.sp_page)
+			break;
 	}
 
-	for (int i = 0; i < MAX_QUEUES; i++) {
-		cell *c = q->queue[i];
-		for (pl_idx j = 0; j < q->qp[i]; j++, c++)
+	for (unsigned i = 0; i < q->queues_alloc; i++) {
+		cell *c = q->queues[i].queue;
+		for (pl_idx j = 0; j < q->queues[i].qp; j++, c++)
 			unshare_cell(c);
 
-		TPL_free(q->queue[i]);
+		TPL_free(q->queues[i].queue);
 	}
+
+	TPL_free(q->queues);
+
+	// Unlink first, destroy second: the queues are shared now, so a
+	// task still sitting in one would be left dangling by the free
+	// below. query_destroy() recurses, and each level unlinks its own.
+
+	sched_release(q);
 
 	while (q->tasks) {
 		query *task = q->tasks->next;
@@ -1889,29 +3741,60 @@ void query_destroy(query *q)
 		q->tasks = task;
 	}
 
-	undo_item *u;
+	// Choicepoints still live at teardown hold undo items of their own.
+	// Draining q->undo alone left them behind, so a query that halted -
+	// or simply succeeded - with choicepoints outstanding leaked
+	// whatever they were holding. Deepest first, the order backtracking
+	// would have taken.
 
-	while ((u = list_pop_back(&q->undo)) != NULL) {
-		if (u->is_bboard)
-			sl_del(u->m->keyval, u->key);
-		else {
-			unshare_cells(u->c, u->c->num_cells);
-			TPL_free(u->c);
-		}
+	for (pl_idx i = q->st.cp; i > 0; i--)
+		if (GET_CHOICE(i - 1)->undo)
+			undo_list_drain(GET_CHOICE(i - 1)->undo);
 
-		TPL_free(u);
-	}
+	undo_list_drain(&q->undo);
 
+	TPL_free(q->tab1);
+	TPL_free(q->tab2);
+	TPL_free(q->ignores);
 	mp_int_clear(&q->tmp_ival);
 	mp_rat_clear(&q->tmp_irat);
 	query_purge_dirty_list(q);
 	parser_destroy(q->p);
-	TPL_free(q->trails);
-	TPL_free(q->choices);
-	TPL_free(q->slots);
-	TPL_free(q->frames);
+	for (trail_page *a = q->trail_pages; a;) {
+		trail_page *save = a;
+		a = a->next;
+		TPL_free(save->entries);
+		TPL_free(save);
+	}
+	for (choice_page *a = q->choice_pages; a;) {
+		choice_page *save = a;
+		a = a->next;
+
+		for (pl_idx i = 0; i < save->page_size; i++)
+			TPL_free(save->entries[i].undo);
+
+		TPL_free(save->entries);
+		TPL_free(save);
+	}
+	free_slot_pages(q->slot_pages);
+	for (pl_idx i = 0; i < q->frame_pages_size; i++)
+		TPL_free(q->frame_pages[i]);
+	TPL_free(q->frame_pages);
 	TPL_free(q->tmp_heap);
 	TPL_free(q->tabs);
+	TPL_free(q->unify_seen);
+	TPL_free(q->vgens);
+	release_oom_reserve(q);
+
+	if (q->owns_top) {
+		parser_destroy(q->top);
+		q->top = NULL;
+	}
+
+	release_pl_terms(q);			// the embedding API's term handles
+	TPL_free(q->terms);
+	TPL_free(q->engine_ball);
+
 	q->pl->q_cnt--;
 	TPL_free(q);
 }
@@ -1919,18 +3802,37 @@ void query_destroy(query *q)
 static query *query_create_(module *m, bool is_toplevel)
 {
 	static pl_atomic uint64_t g_query_id = 0;
+
+#ifdef INDEX_PROFILE
+	if (!g_index_profile_registered) {
+		g_index_profile_registered = true;
+		atexit(index_profile_report);
+	}
+#endif
+
 	query *q = TPL_calloc(1, sizeof(query));
-	ENSURE(q);
-	q->p = parser_create(m);
+
+	if (q)
+		q->purge_at = PURGE_DIRTY_AT;
+
+	if (!q)
+		return NULL;
+
+	q->parser_m = m;
+
+	const bool is_main_root = !g_query_id;
 	q->qid = g_query_id++;
 	q->pl = m->pl;
 	q->pl->q_cnt++;
+
+	if (is_main_root)
+		m->pl->main_thread->q = q;
+
 	q->st.m = m;
 	q->trace = m->pl->trace;
 	q->flags = m->flags;
 	q->get_started = wall_time_in_usec();
-	q->time_cpu_last_started = q->st.cpu_time = cpu_time_in_usec();
-	q->ops_dirty = true;
+	q->cpu_time = q->time_cpu_last_started = q->st.cpu_time = cpu_time_in_usec();
 	q->max_depth = m->pl->def_max_depth;
 	q->vgen = 1;
 	q->dump_var_num = -1;
@@ -1950,27 +3852,60 @@ static query *query_create_(module *m, bool is_toplevel)
 
 	// Allocate these now...
 
-	q->frames_size = INITIAL_NBR_FRAMES;
-	q->choices_size = INITIAL_NBR_CHOICES;
-	q->slots_size = INITIAL_NBR_SLOTS;
-	q->trails_size = INITIAL_NBR_TRAILS;
+	q->frame_pages_size = 1;
 
-	ENSURE(q->frames = TPL_calloc(q->frames_size, sizeof(frame)), NULL);
-	ENSURE(q->choices = TPL_calloc(q->choices_size, sizeof(choice)), NULL);
-	ENSURE(q->slots = TPL_calloc(q->slots_size, sizeof(slot)), NULL);
-	ENSURE(q->trails = TPL_calloc(q->trails_size, sizeof(trail)), NULL);
+	// Undo what the setup above touched in the prolog state, or a failed
+	// query would leave a dangling main_thread->q and a bumped q_cnt.
+
+	#define BAIL_OUT() {									\
+		if (is_main_root) m->pl->main_thread->q = NULL;		\
+		q->pl->q_cnt--;										\
+		mp_int_clear(&q->tmp_ival);							\
+		mp_rat_clear(&q->tmp_irat);							\
+		if (q->frame_pages) TPL_free(q->frame_pages[0]);	\
+		TPL_free(q->frame_pages);							\
+		TPL_free(q);										\
+		return NULL;										\
+	}
+
+	q->frame_pages = TPL_calloc(q->frame_pages_size, sizeof(frame *));
+
+	if (!q->frame_pages)
+		BAIL_OUT();
+
+	q->frame_pages[0] = TPL_calloc(FRAME_PAGE_SIZE, sizeof(frame));
+
+	if (!q->frame_pages[0])
+		BAIL_OUT();
+
+	q->slot_pages = TPL_calloc(1, sizeof(slot_page));
+	slot *slots = TPL_calloc(INITIAL_NBR_SLOTS, sizeof(slot));
+
+	if (!q->slot_pages || !slots) {
+		TPL_free(q->slot_pages);
+		TPL_free(slots);
+		BAIL_OUT();
+	}
+
+	#undef BAIL_OUT
+
+	q->slot_pages->slots = q->st.sp = slots;
+	q->slot_pages->end = slots + INITIAL_NBR_SLOTS;
+	q->st.sp_page = q->slot_pages;
+
+	for (unsigned i = 0; i < FRAME_PAGE_SIZE; i++)
+		q->frame_pages[0][i].slots = q->frame_pages[0][i].ovf = slots;
 
 	// Allocate these later as needed...
 
 	q->heap_size = INITIAL_NBR_HEAP_CELLS;
 	q->tmph_size = INITIAL_NBR_CELLS;
 
-	for (int i = 0; i < MAX_QUEUES; i++)
-		q->q_size[i] = INITIAL_NBR_QUEUE_CELLS;
 
 	frame *f = GET_CURR_FRAME();
 	f->prev = CTX_NUL;
 
+	rearm_oom_reserve(q);
 	clear_write_options(q);
 	return q;
 }
@@ -1983,6 +3918,10 @@ query *query_create(module *m)
 query *query_create_threaded(module *m)
 {
 	query *t = query_create_(m, false);
+
+	if (!t)
+		return NULL;
+
 	t->is_thread = true;
 	return t;
 }
@@ -1992,6 +3931,7 @@ query *query_create_subquery(query *q, cell *instr)
 	query *subq = query_create_(q->st.m, false);
 	if (!subq) return NULL;
 	subq->parent = q;
+	subq->thread_ptr = q->thread_ptr;
 	subq->st.fp = 1;
 	subq->top = q->top;
 
@@ -2001,10 +3941,14 @@ query *query_create_subquery(query *q, cell *instr)
 	subq->st.instr = tmp;
 
 	frame *fsrc = GET_FRAME(q->st.cur_ctx);
-	frame *fdst = subq->frames;
-	fdst->initial_slots = fdst->actual_slots = fsrc->actual_slots;
+	frame *fdst = get_frame(subq, 0);
+
+	if (!layout_frame0(subq, fsrc->actual_slots)) {
+		query_destroy(subq);
+		return NULL;
+	}
+
 	fdst->dbgen = ++q->pl->dbgen;
-	subq->st.sp = fdst->actual_slots;
 	return subq;
 }
 
@@ -2014,4 +3958,47 @@ query *query_create_task(query *q, cell *instr)
 	if (!t) return NULL;
 	t->is_task = true;
 	return t;
+}
+
+// For a goal that has already been cloned and rebased into a numbering
+// of its own. query_create_subquery() copies by reference against the
+// caller's context, and a context is just a frame index - meaningless in
+// a query with its own frames, which is why a caller's bindings never
+// reached the task. Here the cells are taken as they stand and the
+// frame is sized from the goal itself, the way execute() does it for a
+// thread.
+
+query *query_create_task_rebased(query *q, cell *instr, unsigned num_vars)
+{
+	query *subq = query_create_(q->st.m, false);
+	if (!subq) return NULL;
+	subq->parent = q;
+
+	// Inherit the thread: a task belongs to the run queue of whichever
+	// thread object spawned it, not to the main thread's.
+
+	subq->thread_ptr = q->thread_ptr;
+	subq->st.fp = 1;
+	subq->top = q->top;
+	subq->is_task = true;
+
+	pl_idx num_cells = instr->num_cells;
+	cell *tmp = alloc_heap(subq, num_cells+1);
+
+	if (!tmp) {
+		query_destroy(subq);
+		return NULL;
+	}
+
+	dup_cells(tmp, instr, num_cells);
+	make_end(tmp+num_cells);
+	subq->st.instr = tmp;
+
+	if (!layout_frame0(subq, num_vars)) {
+		query_destroy(subq);
+		return NULL;
+	}
+
+	get_frame(subq, 0)->dbgen = ++q->pl->dbgen;
+	return subq;
 }

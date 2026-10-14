@@ -1,0 +1,4 @@
+quads: MALFORMED tests/issues/test1074.pl:8
+   ?- X=1.
+   not an answer: 1=X
+quads: 1 run, 0 passed, 1 failed.

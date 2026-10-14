@@ -1,0 +1,254 @@
+# Proposal: input in answer descriptions (issue #1099)
+
+Quads describe what a query *answers* and, since #1082, what it
+*writes*. Issue #1099 asks them to describe what a query *reads*.
+
+Revised after UWN's comments of 2026-08-05, which changed the design
+substantially: this supersedes the first draft rather than amending it.
+Written against `8e29354`.
+
+## 1. The use case
+
+Not `get_char/1` in isolation — the target is encoding the whole
+[syntax conformity suite](https://www.complang.tuwien.ac.at/ulrich/iso-prolog/conformity_testing),
+whose subject is `read/1`. UWN's shape:
+
+```prolog
+?- read(G_0), G_0.
+   inputs("writeq('\\n')."), peeks("\n"), outputs("'\\n'"), G_0 = ... .  % s#1
+   inputs("'\n"), syntax_error(...).                                     % s#2
+   inputs(")\n"), waits.                                                 % s#3
+```
+
+Three things follow immediately, and the first draft got all three
+wrong:
+
+- `inputs`, `peeks`, `outputs` and a binding **all occur in one
+  answer**. The draft proposed rejecting `inputs` together with `peeks`;
+  that would reject s#1, the central case.
+- `waits` is not a description of its own. It may follow `inputs`, as in
+  s#3: the query consumes what it is given and *then* asks for more.
+- `peeks/1` matters because a conforming reader must look one character
+  past an end token to know it is one. s#1 says so explicitly.
+
+`inputs/1` is always a list of characters and `peeks/1` a list of
+exactly one, so no DCG body — an answer says exactly what was read, and
+a nonterminal may stand for more than one string.
+
+## 2. How it is checked
+
+UWN's key observation is that the `0xff` sentinel does three jobs, not
+one, and between them they make an ordinary file sufficient. Nothing
+below needs a new stream type.
+
+Given `inputs(Cs)` and optionally `peeks([P])`, the input file holds
+
+```
+Cs ++ [P] ++ [0xff]
+```
+
+and the checks are:
+
+1. **Nothing is read past what was described.** Any read or peek beyond
+   the described characters reaches `0xff`, which raises
+   `representation_error(character)`. That is not the described answer,
+   so the quad fails. Free — a ball outcome already fails to match a
+   described solution.
+2. **Everything described was read.** After the query, the harness reads
+   the stream itself. With `peeks([P])` it must see `P` — still there,
+   because a peek does not consume — and then the sentinel. Without a
+   `peeks`, it must hit the sentinel at once.
+3. **The query really was waiting.** For `waits`, the sentinel *is* the
+   expected outcome: a query that asks for another character reaches it
+   and raises `representation_error(character)`. If that error does not
+   come, the query was not waiting.
+
+Point 3 is what removes the need for a blocking stream, a `popen` pipe,
+or a never-ready flag. It also removes the `waits`-versus-`loops`
+ambiguity that the first draft spent a section on: they are no longer
+the same observation, since `waits` is now an error rather than a
+timeout.
+
+Point 2 replaces the draft's proposed `'$capture_input_consumed'`
+builtin. The draft reached for C because `stream_property/2` position
+cannot distinguish a peek from a get — true, but beside the point. You
+do not inspect the position; you keep reading and see what is there.
+
+A peek that leaves no trace still cannot show, on its own, that it
+*happened*: a reader that never peeks also satisfies `peeks([P])`. UWN's
+answer is a fourth job for the sentinel — put it *in* the position to be
+peeked. Anyone who peeks (or gets) there raises the representation
+error; a reader that does not peek answers normally. So the two halves
+are told apart by a second execution of the same query:
+
+```prolog
+?- read(X).
+   inputs("1."), peeks("\n"), X = 1.   % what the peeked character is
+   inputs("1."), waits.                % that the peek happened at all
+```
+
+The second is `waits` by point 3 above: the character `read/1` must look
+at to confirm the end token (6.4.8) is the sentinel, so confirming it
+raises the error rather than completing the term.
+
+**Mechanism: option (a), a temporary file**, per UWN — "this remains
+within standard Prolog (except for the timeout) and in this manner
+problems like #1101 can be identified". The harness writes the
+characters through an ordinary text stream, so the system does its own
+UTF-8 encoding, then appends the sentinel byte through a binary stream.
+Stream state afterwards does not matter; it need only be closable.
+
+`inputs("")` means nothing is input. With no `peeks` either, nothing is
+read at all — and the sentinel makes the harness *enforce* that.
+
+## 3. Malformed shapes
+
+Per solution:
+
+- at most one `inputs/1`, one `peeks/1`, one `outputs/1`, one `waits` —
+  a query is run once against one input;
+- `inputs/1` a proper list of characters, `peeks/1` a list of exactly
+  one;
+- **`peeks(C), waits` is impossible.** A peek leaves `C` unconsumed, so
+  every later read returns it and the query can never be left waiting.
+  To wait it would have to have consumed `C`, which is
+  `inputs([C]), waits`. (UWN raised this; it also falls out of §2 —
+  `waits` is confirmed by reaching the sentinel, and a query that only
+  peeked `C` never gets there.)
+
+These belong with the #1074 malformed machinery — `malformed/2` in the
+library, which since #1078 reports rather than aborting the load.
+
+Note what is *not* rejected: `inputs` with `peeks` with `outputs` with a
+binding, all in one answer. That is s#1.
+
+## 4. Staging
+
+**Stage 1 — grammar and shape. Implemented.**
+
+`waits`, `inputs/1` and `peeks/1` accepted by `answer_description()` in
+`parser.c` and by `answer_atom/1` and `answer_item/1` in the library;
+the shape rules of §3 in `malformed/2`; `take_input/3` beside
+`take_output/3`, and a described input **skipped** the way `sto` then was.
+
+Skipping matters: a suite already written in this notation loads and
+runs, malformed uses are reported, and nothing passes on a claim that
+was not verified.
+
+**Stage 2 — interpretation. Implemented.**
+
+`take_input/3` collects the three annotations into one spec;
+`solution_expect/3` gives the outcome a solution describes, and
+`input_expect/3` overrides it with the sentinel's representation error
+when the answer says `waits`. `run_on_input/2` writes the file, runs the
+attempt with current input on it, and checks what is left unread.
+
+All of it is ordinary Prolog, which is the point: the harness has to run
+on the systems whose conformity it reports on.
+
+One restriction: a solution that names input must be the only one
+described, since the query is run once against one input and a second
+answer would need a second stream. Multi-answer input quads are not
+rejected outright, but they will not pass.
+
+**Stage 3 — the suite. Implemented, s#1..s#382.**
+
+Encoded in `tests/issues/test1099.pl`, against the row numbering on
+UWN's [syntax conformity
+page](https://www.complang.tuwien.ac.at/ulrich/iso-prolog/conformity_testing).
+Trealla passes all six: the two syntax errors (s#2, s#4), the wait
+(s#3), and the peek-one-character discipline that s#1 and the s#270/
+s#271 pair each test from a different angle - past an end token, and
+past an end token immediately or non-immediately followed by a
+comment.
+
+s#5..s#50 are in `tests/issues/test1099b.pl`, run with `strict_iso` on
+since the page describes ISO. Trealla passes all 45 after three fixes
+they turned up: `writeq/1` left an operator atom that cannot be prefix
+unbracketed as an operand, `* = a` for `(*)=a` (s#27); the reader took
+a minus after a postfix operator as prefix, so `1e-9` with `e` a postfix
+operator failed to read (s#50); and `\e` and `\d` were accepted in strict mode
+(s#17, s#19, s#21). A syntax error is described with how far the reader
+got, which the standard leaves open.
+
+s#51..s#100 are in `tests/issues/test1099c.pl`, the same way. Trealla
+passes all 50 after one more fix: in strict mode an operator taken as
+an atom, quoted or not, must stand alone, as an argument, a list element
+or between brackets, so `- = - .` and `write_canonical((-;))` are syntax
+errors, as in Scryer (s#76..s#78, s#86..s#89). By default they still
+read.
+
+s#101..s#150 are in `tests/issues/test1099d.pl`. A row starting `/**/`
+stands for the last row before it without one followed by its own text,
+so such rows run with that row's operators set up, as s#64, s#73 and
+s#74 in `test1099c.pl` now do too. Trealla passes all 50 after four
+fixes: a `-` before a numeral made a negative number only while `-` was
+a prefix operator, so after `op(0,fy,-)` even `integer(-1)` failed to
+read (s#64); `writeq/1` wrote `yf(fy(1))` as `fy 1 yf`, which reads back
+as `fy(yf(1))` (s#150); and in strict mode a back quoted string
+(s#111..s#113) and `0''` before anything but a quote (s#117) are syntax
+errors, while by default they still read as an atom and as 39.
+
+s#151..s#200 are in `tests/issues/test1099e.pl`. Trealla passes all 50
+after five fixes, three in the writer and two in the reader. `writeq/1`
+now brackets an `fy` term as the left operand of an infix operator of the
+same priority, `(fy 1) yfx 2` (s#153), an operand whose own operator could
+take a postfix one into its right side, `(1 xfy 2)yf` (s#156), and an
+operator atom as the operand of a postfix one, `('.')'.'` (s#169). A name
+that is both prefix and postfix is now read as the one that fits, so `0 f
+f` is `f(f(0))` (s#160), and tokens left over in an argument, list element
+or `{}` term are a syntax error instead of being dropped or taken for the
+next argument or the tail, so `1 p p p 2` with `p` both `fy` and `yfx` is
+an error inside `write_canonical/1` as it is at the top (s#162). A quoted
+`'.'` right before the end token was taken for it.
+
+s#201..s#250 are in `tests/issues/test1099f.pl`. Trealla passes all 50
+after two fixes in the reader. A comment between a name and `(` is
+layout, as a space is, so with `f` a prefix operator `f/*.*/(1,2)` is
+`f((1,2))` and not functional notation (s#234). And an atom with a NUL in
+it kept only the text before the NUL when consulted, so `'\x0\'` in a
+test file read as `''` (s#225, s#250). How `write_canonical/1` names a
+variable is left open, so s#226 and s#227 describe the output with a
+grammar.
+
+s#251..s#300 are in `tests/issues/test1099g.pl`, but for s#270 and s#271,
+which `test1099.pl` has, and s#273, which the page does not. Trealla
+passes all 47 after four fixes in the writer: `writeq/1` no longer
+escapes `` ` `` or, inside single quotes, `"` (s#264, and s#40 now writes
+the page's own example); it writes `+(1^2)` as `+ 1^2` without brackets
+(s#277); a list is written `[1]` without brackets when `.` is an operator
+(s#278, s#283); and `'$VAR'(0)` is written `A` under `numbervars` even
+when `'$VAR'` is a postfix operator (s#279, s#296).
+
+s#301..s#350 are in `tests/issues/test1099h.pl`. Trealla passes all 50
+without changes. How `writeq/1` names a variable is again left open
+(s#332), so a grammar describes it.
+
+s#351..s#382, the last rows, are in `tests/issues/test1099i.pl`. Trealla
+passes all 32 after one fix in the writer: with `ignore_ops(true)` a
+list is written as `'.'/2` terms, and the `.` and the elements were
+quoted even without `quoted(true)`, so `[' ']` came out as `'.'( ,[])`
+instead of `.( ,[])` (s#380). That completes the page: every row is
+encoded, under `strict_iso`, in `test1099.pl` and `test1099b.pl` to
+`test1099i.pl`.
+
+## 5. Dependencies
+
+#1101 (`peek_char/2` must not change the position of a stream) is
+closed. Two fixes went in: the reported position now subtracts the
+pushback (`052d819`), and a peek at an *ill-formed* sequence no longer
+consumes it — it is remembered as pending and the next get takes it.
+Both matter here, the second especially, since every check in §2 turns
+on peeking at the sentinel being repeatable and non-destructive.
+
+## 6. Open
+
+- The timeout stays as a safety net. Nothing in §2 should block, but an
+  implementation that waits on a file rather than reading the sentinel
+  would otherwise hang the suite.
+- `outputs/1` accepts a DCG body via `phrase/2`; `inputs/1` deliberately
+  does not. The asymmetry is intended — worth a line in the docs so it
+  does not read as an oversight.
+- Whether a `waits` that is *not* reached — the query answered without
+  asking for another character — should be reported differently from an
+  ordinary mismatch. It is the interesting failure for conformity work.

@@ -131,13 +131,20 @@ static cell *get_next_cell(query *q, list_reader_t *fmt, bool *is_var, pl_ctx *c
 
 static bool is_more_data(query *q, list_reader_t *fmt)
 {
-	(void)q;
-
 	if (fmt->src)
 		return fmt->srclen;
 
 	if (!fmt->p)
 		return false;
+
+	// A list can end in a packed string, as [H|T] does when T was taken
+	// from one, so read on from that as bytes.
+
+	if (is_string(fmt->p)) {
+		fmt->src = C_STR(q, fmt->p);
+		fmt->srclen = C_STRLEN(q, fmt->p);
+		return fmt->srclen;
+	}
 
 	return is_list(fmt->p);
 }
@@ -154,6 +161,35 @@ static bool is_more_data(query *q, list_reader_t *fmt)
 	}                                                       \
 	tmpbuf_free -= len;										\
 }
+
+// eval(q,c) LOOKS like an assignment but the macro body ends in three
+// bare return statements - q->did_throw, is_var, and the is_builtin
+// check in builtins.h. Inside do_format that returns past every
+// TPL_free(tmpbuf), leaking the 8 KB format buffer on any arithmetic
+// error: format("~d", [X]) with X unbound leaked 8192 bytes per call,
+// as did ~c ~e ~E ~f ~g ~G ~D ~r ~R with a non-evaluable argument.
+//
+// This is the same macro with the buffer released on each exit. It has
+// to be a macro too, because it declares p1 in the caller's scope and
+// because those returns must return from do_format.
+
+#define FMT_EVAL(p1, c)														\
+	cell p1 = is_evaluable(c) || is_builtin(c) ? (call_builtin(q,c,c##_ctx), q->accum) : \
+		is_callable(c) ? (call_userfun(q, c, c##_ctx), q->accum) : *c;		\
+	q->accum.flags = 0;														\
+	q->accum.num_cells = 1;													\
+	if (q->did_throw) {														\
+		TPL_free(tmpbuf);													\
+		return true;														\
+	}																		\
+	if (is_var(c)) {														\
+		TPL_free(tmpbuf);													\
+		return throw_error(q, c, q->st.cur_ctx, "instantiation_error", "number"); \
+	}																		\
+	if (is_builtin(c) && c->bif_ptr && (c->bif_ptr->fn != bif_iso_float_1) && (c->bif_ptr->fn != bif_iso_integer_1)) { \
+		TPL_free(tmpbuf);													\
+		return throw_error(q, c, q->st.cur_ctx, "type_error", "evaluable");	\
+	}
 
 bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cell *p2, pl_ctx p2_ctx)
 {
@@ -176,6 +212,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 	bool redo = false, start_of_line = true;
 	int tab_at = 1, tabs = 0, diff = 0, last_at = 0, tab_char = ' ';
 	int remainder = 0, tabs_seen = 0;
+	size_t tab_off = 0;
 	save_fmt1 = fmt1;
 	save_fmt2 = fmt2;
 
@@ -188,7 +225,9 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 
 	while (is_more_data(q, &fmt1)) {
 		int argval = 0, noargval = 1, argval_specified = 0;
-		int pos = strlen_utf8(tmpbuf) + 1;
+		const char *line_start = strrchr(tmpbuf, '\n');
+		line_start = line_start ? line_start + 1 : tmpbuf;
+		int pos = strlen_utf8(line_start) + 1;
 		list_reader_t tmp_fmt1 = fmt1, tmp_fmt2 = fmt2;
 		int ch = get_next_char(q, &fmt1);
 
@@ -196,6 +235,10 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			CHECK_BUF(MAX_BYTES_PER_CODEPOINT);
 			dst += put_char_utf8(dst, ch);
 			start_of_line = ch == '\n';
+
+			if (start_of_line)
+				last_at = 0;
+
 			continue;
 		}
 
@@ -216,7 +259,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 				return throw_error(q, p2, p2_ctx, "domain_error", "positive");
 			}
 
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (is_float(c)) {
@@ -244,7 +287,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			argval = ch;
 			ch = get_next_char(q, &fmt1);
 		} else {
-			while (isdigit(ch)) {
+			while (iswdigit(ch)) {
 				argval_specified = 1;
 				noargval = 0;
 				argval *= 10;
@@ -261,6 +304,8 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 				*dst++ = '\n';
 
 			*dst++ = '\n';
+			*dst = '\0';
+			last_at = 0;
 			start_of_line = true;
 			continue;
 		}
@@ -270,6 +315,8 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 				start_of_line = true;
 				CHECK_BUF(1);
 				*dst++ = '\n';
+				*dst = '\0';
+				last_at = 0;
 			}
 
 			continue;
@@ -280,6 +327,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 				save_fmt1 = tmp_fmt1;
 				save_fmt2 = tmp_fmt2;
 				tab_at = pos;
+				tab_off = dst - tmpbuf;
 				tabs++;
 			} else if (!redo) {
 				tabs++;
@@ -298,13 +346,10 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 		}
 
 		if (ch == '|') {
-			int at = last_at = argval ? argval : pos;
-
-			if (!argval)
-				last_at -= 1;
+			int at = last_at = argval ? argval : pos - 1;
 
 			if (!tabs) {
-				for (int i = 0; i < (argval+1)-pos; i++) {
+				for (int i = 0; i < (at+1)-pos; i++) {
 					CHECK_BUF(MAX_BYTES_PER_CODEPOINT);
 					dst += put_char_utf8(dst, tab_char);
 				}
@@ -325,7 +370,8 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 				} else {
 					fmt1 = save_fmt1;
 					fmt2 = save_fmt2;
-					dst = tmpbuf + tab_at - 1;
+					dst = tmpbuf + tab_off;
+					*dst = '\0';
 					int total = (at - pos) + 1;
 					diff = total / tabs;
 					remainder = total - (diff * tabs);
@@ -341,21 +387,22 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 
 		if (ch == '+') {
 			if (!redo) {
-				int at = last_at = argval ? (last_at+argval) : 8;
+				int at = last_at = last_at + (noargval ? 8 : argval);
 
 				if (!tabs) {
-					tab_at = pos;
-					dst = tmpbuf + tab_at - 1;
 					diff = (at - pos) + 1;
 
 					for (int i = 0; i < diff; i++) {
 						CHECK_BUF(MAX_BYTES_PER_CODEPOINT);
 						dst += put_char_utf8(dst, tab_char);
 					}
+
+					continue;
 				} else {
 					fmt1 = save_fmt1;
 					fmt2 = save_fmt2;
-					dst = tmpbuf + tab_at - 1;
+					dst = tmpbuf + tab_off;
+					*dst = '\0';
 					int total = (at - pos) + 1;
 					diff = total / tabs;
 					remainder = total - (diff * tabs);
@@ -372,6 +419,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 		if (ch == '~') {
 			CHECK_BUF(1);
 			*dst++ = '~';
+			*dst = '\0';
 			start_of_line = false;
 			continue;
 		}
@@ -407,13 +455,17 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 
 		switch(ch) {
 		case 's':
-			if (is_iso_list(c) && !check_list(q, c, c_ctx, &is_partial, NULL) && is_partial)
+			if (is_iso_list(c) && !check_list(q, c, c_ctx, &is_partial, NULL) && is_partial) {
+				TPL_free(tmpbuf);
 				return throw_error(q, c, c_ctx, "instantiation_error", "atom");
+			}
 
 			if (is_nil(c)) {
 			} else if (is_var(c)) {
+				TPL_free(tmpbuf);
 				return throw_error(q, c, c_ctx, "instantiation_error", "atom");
 			} else if (is_number(c)) {
+				TPL_free(tmpbuf);
 				return throw_error(q, c, c_ctx, "type_error", "atom");
 			} else if (is_atom(c)) {
 				int len = noargval ? (int)C_STRLEN_UTF8(c) : MIN_OF(argval, (int)C_STRLEN_UTF8(c));
@@ -451,7 +503,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			break;
 
 		case 'c': {
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (is_float(c)) {
@@ -476,7 +528,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 		}
 		case 'e':
 		case 'E': {
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (!is_float(c)) {
@@ -505,7 +557,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 		}
 		case 'g':
 		case 'G': {
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (!is_float(c)) {
@@ -533,7 +585,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			break;
 		}
 		case 'f': {
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (!is_float(c)) {
@@ -553,7 +605,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			break;
 		}
 		case 'I': {
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (is_float(c)) {
@@ -574,7 +626,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			break;
 		}
 		case 'd': {
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (is_float(c)) {
@@ -595,7 +647,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			break;
 		}
 		case 'D': {
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (is_float(c)) {
@@ -622,7 +674,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 				return throw_error(q, p1, p1_ctx, "domain_error", "radix_invalid");
 			}
 
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (is_float(c)) {
@@ -648,7 +700,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 				return throw_error(q, p1, p1_ctx, "domain_error", "radix_invalid");
 			}
 
-			cell p1 = eval(q, c);
+			FMT_EVAL(p1, c);
 			c = &p1;
 
 			if (is_float(c)) {
@@ -669,64 +721,31 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			break;
 		}
 		case 'p': {
-			cell *tmp;
-			pl_idx num_cells;
 			cell pc = {0};
 			make_atom(&pc, new_atom(q->pl, "portray"));
-			pc.arity = 1;
-
+			set_arity(&pc, 1);
 			predicate *pr = find_predicate(q->st.m, &pc);
 
+			// Render into the buffer like the rest, not straight to a stream: an
+			// atom(_) sink has none, and text before the ~p must come first.
+
 			if (pr && pr->cnt) {
-				if (str) {
-					cell p1[1+1+c->num_cells];
-					make_instr(p1+0, new_atom(q->pl, "$portray"), NULL, 2, 1+c->num_cells);
-					p1[1] = *str;
-					dup_cells_by_ref(p1+2, c, c_ctx, c->num_cells);
-					tmp = prepare_call(q, CALL_SKIP, p1, q->st.cur_ctx, 1);
-					num_cells = p1->num_cells;
-				} else {
-					cell p1[1+c->num_cells];
-					make_instr(p1+0, new_atom(q->pl, "$portray"), NULL, 1, c->num_cells);
-					dup_cells_by_ref(p1+1, c, c_ctx, c->num_cells);
-					tmp = prepare_call(q, CALL_SKIP, p1, q->st.cur_ctx, 1);
-					num_cells = p1->num_cells;
+				char *tmpbuf2 = portray_term_to_strbuf(q, c, c_ctx);
+
+				if (!tmpbuf2) {
+					TPL_free(tmpbuf);
+					return throw_error(q, c, q->st.cur_ctx, "resource_error", "memory");
 				}
 
-				make_end(tmp+num_cells);
-				query *q2 = query_create_subquery(q, tmp);
-				start(q2);
-				query_destroy(q2);
+				len = strlen(tmpbuf2);
+				CHECK_BUF(len);
+				strcpy(dst, tmpbuf2);
+				TPL_free(tmpbuf2);
 				clear_write_options(q);
 				break;
 			}
-
-			if (!str) {
-				int n = q->pl->current_output;
-				stream *str2 = &q->pl->streams[n];
-				q->quoted = 1;
-				q->numbervars = true;
-				print_term_to_stream(q, str2, c, c_ctx, 1);
-				q->numbervars = false;
-				q->quoted = 0;
-
-				if (isatty(fileno(str2->fp)))
-					fflush(str2->fp);
-			} else {
-				int n = get_stream(q, str);
-				stream *str2 = &q->pl->streams[n];
-				q->quoted = 1;
-				q->numbervars = true;
-				print_term_to_stream(q, str2, c, c_ctx, 1);
-				q->numbervars = false;
-				q->quoted = 0;
-
-				if (isatty(fileno(str2->fp)))
-					fflush(str2->fp);
-			}
-
-			break;
 		}
+		// fallthrough: no portray/1, so print as ~q does
 
 		case 'k':
 		case 'q':
@@ -736,7 +755,9 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			int saveq = q->quoted;
 			bool canonical = false, quoted = false;
 			q->numbervars = true;
-			q->double_quotes = true;
+
+			if ((ch != 'q') && (ch != 'p'))
+				q->double_quotes = true;
 
 			if (ch == 'k') {
 				canonical = true;
@@ -761,7 +782,8 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			char *tmpbuf2 = print_term_to_strbuf(q, c, c_ctx, 1);
 
 			if (q->cycle_error) {
-				TPL_free(tmpbuf);
+				TPL_free(tmpbuf2);		// the matching block below frees
+				TPL_free(tmpbuf);		// both; this one did not
 				return throw_error(q, c, q->st.cur_ctx, "resource_error", "cyclic");
 			}
 
@@ -795,10 +817,10 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 			q->numbervars = false;
 			cell *vnames = NULL;
 			pl_ctx vnames_ctx;
-			LIST_HANDLER(c2);
+			PROLOG_LIST_HANDLER(c2);
 
 			while (is_iso_list(c2)) {
-				cell *h = LIST_HEAD(c2);
+				cell *h = PROLOG_LIST_HEAD(c2);
 				h = deref(q, h, c2_ctx);
 				pl_ctx h_ctx = q->latest_ctx;
 
@@ -807,7 +829,7 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 					return true;
 				}
 
-				c2 = LIST_TAIL(c2);
+				c2 = PROLOG_LIST_TAIL(c2);
 				c2 = deref(q, c2, c2_ctx);
 				c2_ctx = q->latest_ctx;
 			}
@@ -876,28 +898,48 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 		const char *tmpsrc = tmpbuf;
 
 		while (len) {
-			size_t tmpbuf_free = net_write(tmpsrc, len, str);
+			size_t tmpbuf_free = tpl_write(tmpsrc, len, str);
+			FILE *fp_wr = str->fp_out ? str->fp_out : str->fp;
 
 			if (!tmpbuf_free) {
-				if (feof(str->fp) || ferror(str->fp)) {
+				if (feof(fp_wr) || ferror(fp_wr)) {
+					// A non-task socket is non-blocking now (see
+					// bif_net.c), so a zero-progress write here is
+					// routinely just EAGAIN - the peer's receive window
+					// is full, not a real error - and worth waiting out
+					// rather than raising. See the matching comment on
+					// bif_sys_bwrite_2() in bif_streams.c for why task
+					// queries are not covered by this yet, and for why
+					// this checks str->fp_out rather than str->fp (the
+					// read side - a different FILE* from what tpl_write()
+					// above actually writes through, so this was always
+					// dead before).
+					if (!q->is_task && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+						clearerr(fp_wr);
+
+						if (tpl_wait_fd_writable(q, fileno(fp_wr)))
+							continue;
+					}
+
+					// An output error must raise, not print to stderr
+					// and fail silently...
 					TPL_free(tmpbuf);
-					fprintf(stderr, "Error: end of file on write\n");
-					return false;
+					return throw_stream_gone(q, str);
 				}
 			}
 
-			clearerr(str->fp);
+			clearerr(fp_wr);
 			len -= tmpbuf_free;
 			tmpsrc += tmpbuf_free;
 		}
 
 		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
+			return throw_stream_gone(q, str);
 	} else if (is_compound(str)
 		&& ((CMP_STRING_TO_CSTR(q, str, "atom")
 		&& CMP_STRING_TO_CSTR(q, str, "chars")
 		&& CMP_STRING_TO_CSTR(q, str, "string"))
-		|| (str->arity > 1) || !is_var(str+1))) {
+		|| (get_arity(str) > 1) || !is_var(str+1))) {
 		TPL_free(tmpbuf);
 		return throw_error(q, str, str_ctx, "type_error", "structure");
 	} else if (is_compound(str) && !CMP_STRING_TO_CSTR(q, str, "atom")) {
@@ -923,23 +965,43 @@ bool do_format(query *q, cell *str, pl_ctx str_ctx, cell *p1, pl_ctx p1_ctx, cel
 		const char *tmpsrc = tmpbuf;
 
 		while (len) {
-			size_t tmpbuf_free = net_write(tmpsrc, len, str);
+			size_t tmpbuf_free = tpl_write(tmpsrc, len, str);
+			FILE *fp_wr = str->fp_out ? str->fp_out : str->fp;
 
 			if (!tmpbuf_free) {
-				if (feof(str->fp) || ferror(str->fp)) {
+				if (feof(fp_wr) || ferror(fp_wr)) {
+					// A non-task socket is non-blocking now (see
+					// bif_net.c), so a zero-progress write here is
+					// routinely just EAGAIN - the peer's receive window
+					// is full, not a real error - and worth waiting out
+					// rather than raising. See the matching comment on
+					// bif_sys_bwrite_2() in bif_streams.c for why task
+					// queries are not covered by this yet, and for why
+					// this checks str->fp_out rather than str->fp (the
+					// read side - a different FILE* from what tpl_write()
+					// above actually writes through, so this was always
+					// dead before).
+					if (!q->is_task && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+						clearerr(fp_wr);
+
+						if (tpl_wait_fd_writable(q, fileno(fp_wr)))
+							continue;
+					}
+
+					// An output error must raise, not print to stderr
+					// and fail silently...
 					TPL_free(tmpbuf);
-					fprintf(stderr, "Error: end of file on write\n");
-					return false;
+					return throw_stream_gone(q, str);
 				}
 			}
 
-			clearerr(str->fp);
+			clearerr(fp_wr);
 			len -= tmpbuf_free;
 			tmpsrc += tmpbuf_free;
 		}
 
 		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
+			return throw_stream_gone(q, str);
 	} else {
 		TPL_free(tmpbuf);
 		return throw_error(q, str, str_ctx, "domain_error", "stream_or_alias");

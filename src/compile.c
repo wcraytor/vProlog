@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "module.h"
 #include "parser.h"
@@ -22,7 +23,7 @@ static void calln_check(module *m, cell *p1)
 	} else if ((p1->bif_ptr = get_builtin_term(m, p1, &found, NULL)), found) {
 		p1->flags |= FLAG_INTERNED_BUILTIN;
 
-		if (p1->arity <= 2) {
+		if (get_arity(p1) <= 2) {
 			const char *functor = C_STR(m, p1);
 			unsigned specifier;
 
@@ -34,28 +35,113 @@ static void calln_check(module *m, cell *p1)
 	}
 }
 
-static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
+// A construct's first instruction ends with its source term and compiled length, so that
+// shift/1 can capture a construct still to come whole: see scan_cont_segment().
+
+static void make_block_info(cell **dst, cell *src)
 {
-	if (((*src)->val_off == g_conjunction_s) && ((*src)->arity == 2)) {
-		*src += 1;
-		compile_term(pr, cl, dst, src);		// LHS
-		compile_term(pr, cl, dst, src);		// RHS
+	make_ptr((*dst)++, src);
+	make_uint((*dst)++, 0);											// Dummy length
+}
+
+static void set_block_length(cell *start, const cell *end)
+{
+	make_uint(start + start->num_cells - 1, end - start);			// Real length
+}
+
+static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src);
+
+// Whether a goal's predicate is lists:member/2, itself or through the alias an import makes
+
+static bool is_lists_member(const predicate *pr)
+{
+	if (pr && pr->alias)
+		pr = pr->alias;
+
+	return pr && pr->m && !strcmp(pr->m->name, "lists")
+		&& (pr->key.val_off == g_member_s) && (get_arity(&pr->key) == 2);
+}
+
+// The eager callability check of issue #1110 clones the body at run time to keep a cyclic term safe, so
+// emit it only where the body could fail the check: a variable leaf, or one that is not callable at all.
+
+static bool body_needs_call_check(const cell *c)
+{
+	if (is_var(c))
+		return true;
+
+	if (!is_interned(c))
+		return true;
+
+	if ((get_arity(c) == 2)
+		&& ((c->val_off == g_conjunction_s) || (c->val_off == g_disjunction_s)
+			|| (c->val_off == g_if_then_s) || (c->val_off == g_soft_cut_s))) {
+		const cell *lhs = c + 1;
+		const cell *rhs = lhs + lhs->num_cells;
+		return body_needs_call_check(lhs) || body_needs_call_check(rhs);
+	}
+
+	return false;
+}
+
+// A var, call(Var) or non-callable: a goal only known at run time.
+
+static bool is_runtime_goal(const cell *c)
+{
+	return is_var(c) || !is_callable(c)
+		|| ((c->val_off == g_call_s) && (get_arity(c) == 1) && is_var(c+1));
+}
+
+// A Recovery only known at run time still goes through call/1, as catch/3 did.
+
+static void compile_catch_goal(predicate *pr, clause *cl, cell **dst, cell **src)
+{
+	cell *c = *src;
+
+	if (is_runtime_goal(c)) {
+		if (is_callable(c))
+			c++;
+
+		make_instr((*dst)++, g_call_s, bif_iso_call_1, 1, c->num_cells);
+		*dst += copy_cells(*dst, c, c->num_cells);
+		*src += (*src)->num_cells;
 		return;
 	}
 
+	if (is_builtin(c)) {
+		make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, c->num_cells);
+		*dst += copy_cells(*dst, c, c->num_cells);
+	}
+
+	compile_term(pr, cl, dst, src);
+}
+
+static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
+{
 	cell *c = (*src) + 1;
+
+	// T1 , T2
+
+	if (((*src)->val_off == g_conjunction_s) && (get_arity((*src)) == 2)) {
+		*src += 1;
+		compile_term(pr, cl, dst, src);								// LHS
+		compile_term(pr, cl, dst, src);								// RHS
+		return;
+	}
 
 	// T1 -> T2 ; T3
 
-	if (((*src)->val_off == g_disjunction_s) && ((*src)->arity == 2)
-		&& is_callable(c) && c->bif_ptr && (c->arity == 2)
+	if (((*src)->val_off == g_disjunction_s) && (get_arity((*src)) == 2)
+		&& c->bif_ptr && (get_arity(c) == 2)
 		&& (c->bif_ptr->fn == bif_iso_if_then_2)) {
+		cell *src0 = *src;
 		*src += 2;
 		unsigned var_num = cl->num_vars++;
 		cell *save_dst1 = *dst;
-		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 2, 2);
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
 		make_var((*dst)++, g_anon_s, var_num);
 		make_uint((*dst)++, 0);										// Dummy value1
+		make_block_info(dst, src0);
 		compile_term(pr, cl, dst, src);								// Arg1
 		make_instr((*dst)++, g_cut_s, bif_iso_cut_0, 0, 0);
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
@@ -68,20 +154,23 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		compile_term(pr, cl, dst, src);								// Arg3
 		make_uint(save_dst2+1, *dst - save_dst2);					// Real value2
 		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
 	// T1 *-> T2 ; T3
 
-	if (((*src)->val_off == g_disjunction_s) && ((*src)->arity == 2)
-		&& is_callable(c) && c->bif_ptr && (c->arity == 2)
+	if (((*src)->val_off == g_disjunction_s) && (get_arity((*src)) == 2)
+		&& c->bif_ptr && (get_arity(c) == 2)
 		&& (c->bif_ptr->fn == bif_soft_if_then_2)) {
+		cell *src0 = *src;
 		*src += 2;
 		unsigned var_num = cl->num_vars++;
 		cell *save_dst1 = *dst;
-		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 2, 2);
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
 		make_var((*dst)++, g_anon_s, var_num);
 		make_uint((*dst)++, 0);										// Dummy value1
+		make_block_info(dst, src0);
 		compile_term(pr, cl, dst, src);								// Arg1
 		make_instr((*dst)++, g_sys_cut_s, bif_sys_cut_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
@@ -95,16 +184,19 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		compile_term(pr, cl, dst, src);								// Arg3
 		make_uint(save_dst2+1, *dst - save_dst2);					// Real value2
 		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
 	// T1 ; T2
 
-	if (((*src)->val_off == g_disjunction_s) && ((*src)->arity == 2)) {
+	if (((*src)->val_off == g_disjunction_s) && (get_arity((*src)) == 2)) {
+		cell *src0 = *src;
 		*src += 1;
 		cell *save_dst1 = *dst;
-		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_1, 1, 1);
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_1, 3, 3);
 		make_uint((*dst)++, 0);										// Dummy value1
+		make_block_info(dst, src0);
 		compile_term(pr, cl, dst, src);								// LHS
 		cell *save_dst2 = *dst;
 		make_instr((*dst)++, g_sys_jump_s, bif_sys_jump_1, 1, 1);
@@ -113,46 +205,59 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		compile_term(pr, cl, dst, src);								// RHS
 		make_uint(save_dst2+1, *dst - save_dst2);					// Real value2
 		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
 	// T1 -> T2
 
-	if (((*src)->val_off == g_if_then_s) && ((*src)->arity == 2)) {
+	if (((*src)->val_off == g_if_then_s) && (get_arity((*src)) == 2)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
 		*src += 1;
-		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 1, 1);
+		cell *save_dst1 = *dst;
+		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 3, 3);
 		make_var((*dst)++, g_anon_s, var_num);
+		make_block_info(dst, src0);
 		compile_term(pr, cl, dst, src);								// Arg1
 		make_instr((*dst)++, g_cut_s, bif_iso_cut_0, 0, 0);
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
 		compile_term(pr, cl, dst, src);								// Arg2
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
 	// T1 *-> T2
 
-	if (((*src)->val_off == g_soft_cut_s) && ((*src)->arity == 2)) {
+	if (((*src)->val_off == g_soft_cut_s) && (get_arity((*src)) == 2)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
 		*src += 1;
-		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 1, 1);
+		cell *save_dst1 = *dst;
+		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 3, 3);
 		make_var((*dst)++, g_anon_s, var_num);
+		make_block_info(dst, src0);
 		compile_term(pr, cl, dst, src);								// Arg1
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
 		compile_term(pr, cl, dst, src);								// Arg2
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
-	if (((*src)->val_off == g_if_s) && ((*src)->arity == 3)) {
+	if (((*src)->val_off == g_if_s) && (get_arity((*src)) == 3)) {
+		cell *src0 = *src;
 		*src += 1;
 		unsigned var_num = cl->num_vars++;
 		cell *save_dst1 = *dst;
-		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 2, 2);
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
 		make_var((*dst)++, g_anon_s, var_num);
 		make_uint((*dst)++, 0);										// Dummy value1
+		make_block_info(dst, src0);
 		compile_term(pr, cl, dst, src);								// Arg1
+		make_instr((*dst)++, g_sys_cut_s, bif_sys_cut_1, 1, 1);
+		make_var((*dst)++, g_anon_s, var_num);
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
 		compile_term(pr, cl, dst, src);								// Arg2
@@ -163,39 +268,67 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		compile_term(pr, cl, dst, src);								// Arg3
 		make_uint(save_dst2+1, *dst - save_dst2);					// Real value2
 		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
-	if (((*src)->val_off == g_call_s) && ((*src)->arity > 1) && !is_var(c)) {
+	if (((*src)->val_off == g_call_s) && (get_arity((*src)) > 1) && is_callable(c)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
-		int arity = (*src)->arity - 1;
+		uint32_t arity = get_arity((*src)) - 1;
 		unsigned save_num_cells = (*src)->num_cells;
 		*src += 1;
-		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 1, 1);
+		cell *save_dst1 = *dst;
+		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 3, 3);
 		make_var((*dst)++, g_anon_s, var_num);
+		make_block_info(dst, src0);
 		make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, save_num_cells-1);
 		cell *save_dst = *dst;
 		copy_term(dst, src);										// Functor
-		save_dst->arity += arity;
+		cell *target = save_dst;
+
+		// call(M:Goal, A...) must append to GOAL, not to the ':'
+		// wrapper. Bumping the wrapper yields ':'/N with N>2 - a shape
+		// only bif_iso_qualify_n() understands, and one that took the
+		// runtime through a different module-resolution path than a
+		// plain M:Goal(A...) body goal. Appending to the inner goal
+		// keeps ':'/2, which bif_iso_qualify_2() already resolves in
+		// the module it names.
+
+		if (is_interned(save_dst) && (save_dst->val_off == g_colon_s)
+			&& (get_arity(save_dst) == 2)) {
+			cell *mod = save_dst + 1;
+			target = mod + mod->num_cells;
+		}
+
+		set_arity(target, get_arity(target) + arity);
 
 		while (arity--)
 			copy_term(dst, src);									// Args
 
-		save_dst->num_cells = *dst - save_dst;
-		calln_check(pr->m, save_dst);
+		target->num_cells = *dst - target;
+
+		if (target == save_dst)
+			calln_check(pr->m, save_dst);
+		else
+			save_dst->num_cells = *dst - save_dst;
 		*dst += copy_cells(*dst, save_dst, save_dst->num_cells);
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
-	if (((*src)->val_off == g_call_s) && ((*src)->arity == 1)) {
+	if (((*src)->val_off == g_call_s) && (get_arity((*src)) == 1)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
 		*src += 1;
-		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 1, 1);
+		cell *save_dst1 = *dst;
+		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 3, 3);
 		make_var((*dst)++, g_anon_s, var_num);
+		make_block_info(dst, src0);
 
-		if (is_builtin(*src)) {
+		if (is_var(*src) || (is_builtin(*src) && body_needs_call_check(*src))) {
 			make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, (*src)->num_cells);
 			*dst += copy_cells(*dst, *src, (*src)->num_cells);		// Arg2
 		}
@@ -203,16 +336,20 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		compile_term(pr, cl, dst, src);								// Arg1
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
-	if (((*src)->val_off == g_once_s) && ((*src)->arity == 1)) {
+	if (((*src)->val_off == g_once_s) && (get_arity((*src)) == 1)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
 		*src += 1;
-		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 1, 1);
+		cell *save_dst1 = *dst;
+		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 3, 3);
 		make_var((*dst)++, g_anon_s, var_num);
+		make_block_info(dst, src0);
 
-		if (is_builtin(*src)) {
+		if (is_var(*src) || (is_builtin(*src) && body_needs_call_check(*src))) {
 			make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, (*src)->num_cells);
 			*dst += copy_cells(*dst, *src, (*src)->num_cells);		// Arg2
 		}
@@ -221,18 +358,53 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		make_instr((*dst)++, g_cut_s, bif_iso_cut_0, 0, 0);
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
+		set_block_length(save_dst1, *dst);
 		return;
 	}
 
-	if (((*src)->val_off == g_ignore_s) && ((*src)->arity == 1)) {
+	// catch(Goal, Catcher, Recovery), left to catch/3 itself when Goal is only known at run time
+
+	if (((*src)->val_off == g_catch_s) && (get_arity((*src)) == 3) && !is_runtime_goal(c)) {
+		cell *src0 = *src;
+		unsigned var_num = cl->num_vars++;
+		*src += 1;
+		cell *catcher = *src + (*src)->num_cells;
+		cell *save_dst1 = *dst;
+		make_instr((*dst)++, g_sys_catch_s, bif_sys_catch_3, 5, 4+catcher->num_cells);
+		make_var((*dst)++, g_anon_s, var_num);
+		*dst += copy_cells(*dst, catcher, catcher->num_cells);		// Catcher
+		cell *save_skip = *dst;
+		make_uint((*dst)++, 0);										// Dummy value1
+		make_block_info(dst, src0);
+		compile_catch_goal(pr, cl, dst, src);						// Goal
+		make_instr((*dst)++, g_sys_block_catcher_s, bif_sys_block_catcher_1, 1, 1);
+		make_var((*dst)++, g_anon_s, var_num);
+		cell *save_dst2 = *dst;
+		make_instr((*dst)++, g_sys_jump_s, bif_sys_jump_1, 1, 1);
+		make_uint((*dst)++, 0);										// Dummy value2
+		make_uint(save_skip, *dst - save_dst1);						// Real value1
+		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		*src += (*src)->num_cells;									// Catcher
+		compile_catch_goal(pr, cl, dst, src);						// Recovery
+		make_instr((*dst)++, g_sys_catch_exit_s, bif_sys_catch_exit_1, 1, 1);
+		make_var((*dst)++, g_anon_s, var_num);
+		make_uint(save_dst2+1, *dst - save_dst2);					// Real value2
+		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst1, *dst);
+		return;
+	}
+
+	if (((*src)->val_off == g_ignore_s) && (get_arity((*src)) == 1)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
 		*src += 1;
 		cell *save_dst = *dst;
-		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 2, 2);
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
 		make_var((*dst)++, g_anon_s, var_num);
 		make_uint((*dst)++, 0);										// Dummy value
+		make_block_info(dst, src0);
 
-		if (is_builtin(*src)) {
+		if (is_var(*src) || (is_builtin(*src) && body_needs_call_check(*src))) {
 			make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, (*src)->num_cells);
 			*dst += copy_cells(*dst, *src, (*src)->num_cells);		// Arg2
 		}
@@ -243,52 +415,98 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		make_var((*dst)++, g_anon_s, var_num);
 		make_uint(save_dst+2, *dst - save_dst);						// Real value
 		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst, *dst);
 		return;
 	}
 
-	if (((*src)->val_off == g_negation_s) && ((*src)->arity == 1)
-		&& (c->val_off != g_negation_s)								// Hack
-	) {
+	if (((*src)->val_off == g_negation_s) && (get_arity((*src)) == 1)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
 		*src += 1;
 		cell *save_dst = *dst;
-		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 2, 2);
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
 		make_var((*dst)++, g_anon_s, var_num);
 		make_uint((*dst)++, 0);										// Dummy value
-		copy_term(dst, src);										// Not compile_term
+		make_block_info(dst, src0);
+
+		if (is_var(*src) || body_needs_call_check(*src)) {
+			make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, (*src)->num_cells);
+			*dst += copy_cells(*dst, *src, (*src)->num_cells);		// Arg2
+		}
+
+		compile_term(pr, cl, dst, src);
 		make_instr((*dst)++, g_cut_s, bif_iso_cut_0, 0, 0);
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
 		make_instr((*dst)++, g_fail_s, bif_iso_fail_0, 0, 0);
 		make_uint(save_dst+2, *dst - save_dst);						// Real value
 		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst, *dst);
 		return;
 	}
 
-#if 0
-	if (((*src)->val_off == g_reset_s) && ((*src)->arity == 3)) {
+	if (((*src)->val_off == g_forall_s) && (get_arity((*src)) == 2)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
+		unsigned var_num2 = cl->num_vars++;
 		*src += 1;
-		make_instr((*dst)++, g_sys_fail_on_retry_s, bif_sys_fail_on_retry_1, 1, 1);
+		cell *save_dst = *dst;
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
 		make_var((*dst)++, g_anon_s, var_num);
-		compile_term(pr, cl, dst, src);								// Arg1
+		make_uint((*dst)++, 0);										// Dummy value
+		make_block_info(dst, src0);
+
+		if (is_var(*src) || (is_builtin(*src) && body_needs_call_check(*src))) {
+			make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, (*src)->num_cells);
+			*dst += copy_cells(*dst, *src, (*src)->num_cells);		// Arg2
+		}
+
+		compile_term(pr, cl, dst, src);								// Cond
+
+		cell *save_dst2 = *dst;
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
+		make_var((*dst)++, g_anon_s, var_num2);
+		make_uint((*dst)++, 0);										// Dummy value
+		make_block_info(dst, src0);
+
+		if (is_var(*src) || (is_builtin(*src) && body_needs_call_check(*src))) {
+			make_instr((*dst)++, g_sys_call_check_s, bif_sys_call_check_1, 1, (*src)->num_cells);
+			*dst += copy_cells(*dst, *src, (*src)->num_cells);		// Arg2
+		}
+
+		compile_term(pr, cl, dst, src);								// Action
+
+		// Action held, so this solution of Cond is no counterexample: fail back into Cond for the next.
+
+		make_instr((*dst)++, g_cut_s, bif_iso_cut_0, 0, 0);
+		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
+		make_var((*dst)++, g_anon_s, var_num2);
+		make_instr((*dst)++, g_fail_s, bif_iso_fail_0, 0, 0);
+		make_uint(save_dst2+2, *dst - save_dst2);					// Real value
+		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing: Action failed
+		set_block_length(save_dst2, *dst);
+
+		// Which makes it a counterexample, so the whole thing fails.
+
+		make_instr((*dst)++, g_cut_s, bif_iso_cut_0, 0, 0);
 		make_instr((*dst)++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num);
-		*src += (*src)->num_cells;									// Arg2
-		make_instr((*dst)++, g_sys_set_if_var_s, bif_sys_set_if_var_2, 2, (*src)->num_cells+1);
-		compile_term(pr, cl, dst, src);								// Arg3
-		make_atom((*dst)++, g_none_s);
+		make_instr((*dst)++, g_fail_s, bif_iso_fail_0, 0, 0);
+		make_uint(save_dst+2, *dst - save_dst);						// Real value
+		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing: Cond ran out
+		set_block_length(save_dst, *dst);
 		return;
 	}
-#endif
 
-	if (((*src)->val_off == g_notunify_s) && ((*src)->arity == 2)) {
+	if (((*src)->val_off == g_notunify_s) && (get_arity((*src)) == 2)) {
+		cell *src0 = *src;
 		unsigned var_num = cl->num_vars++;
 		*src += 1;
 		cell *save_dst = *dst;
-		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 2, 2);
+		make_instr((*dst)++, g_sys_succeed_on_retry_s, bif_sys_succeed_on_retry_2, 4, 4);
 		make_var((*dst)++, g_anon_s, var_num);
 		make_uint((*dst)++, 0);										// Dummy value
+		make_block_info(dst, src0);
 		cell *save_dst1 = *dst;
 		make_instr((*dst), g_unify_s, bif_iso_unify_2, 2, 0);
 		SET_OP(*dst, OP_XFX); (*dst)++;
@@ -300,10 +518,11 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		make_instr((*dst)++, g_fail_s, bif_iso_fail_0, 0, 0);
 		make_uint(save_dst+2, *dst - save_dst);						// Real value
 		make_instr((*dst)++, g_true_s, bif_iso_true_0, 0, 0);		// Landing
+		set_block_length(save_dst, *dst);
 		return;
 	}
 
-	if (((*src)->val_off == g_colon_s) && ((*src)->arity == 2) && !is_var((c))) {
+	if (((*src)->val_off == g_colon_s) && (get_arity((*src)) == 2) && is_callable((c))) {
 		unsigned var_num1 = cl->num_vars++;
 		*src += 1;
 		make_instr((*dst)++, g_sys_module_s, bif_sys_module_1, 1, 1);
@@ -319,6 +538,21 @@ static void compile_term(predicate *pr, clause *cl, cell **dst, cell **src)
 		copy_term(dst, src);										// Arg2
 		make_instr((*dst)++, g_sys_module_s, bif_sys_module_1, 1, 1);
 		make_var((*dst)++, g_anon_s, var_num1);
+		return;
+	}
+
+	// member(X, L) that resolves to lists:member/2 runs as '$member'(X, L, V), V a hidden variable for its place in L
+
+
+	if (((*src)->val_off == g_member_s) && (get_arity(*src) == 2) && is_lists_member((*src)->match)) {
+		unsigned var_num = cl->num_vars++;
+		*src += 1;
+		cell *save_dst = *dst;
+		make_instr((*dst)++, g_sys_member_s, bif_sys_member_3, 3, 0);
+		copy_term(dst, src);										// X
+		copy_term(dst, src);										// L
+		make_var((*dst)++, g_anon_s, var_num);
+		save_dst->num_cells = *dst - save_dst;
 		return;
 	}
 
@@ -341,9 +575,23 @@ void compile_clause(predicate *pr, clause *cl, cell *body)
 
 	pl_idx num_cells = cl->cidx - (body - cl->cells);
 	cl->alt = TPL_malloc(sizeof(cell)*num_cells*100+1024); // FIXME
+
+	// The compiled body is an optimisation: query.c falls back to the
+	// clause itself when alt is null, so a failure here just leaves the
+	// predicate uncompiled.
+
+	if (!cl->alt)
+		return;
+
 	cell *dst = cl->alt, *src = body;
 	compile_term(pr, cl, &dst, &src);
 	assert(src->tag == TAG_END);
 	dst += copy_cells(dst, src, 1);
-	cl->alt = TPL_realloc(cl->alt, sizeof(cell)*((dst-cl->alt)));
+	cell *alt = TPL_realloc(cl->alt, sizeof(cell)*((dst-cl->alt)));
+
+	// Shrinking, so a failure is unlikely - but keep the larger buffer
+	// rather than losing it.
+
+	if (alt)
+		cl->alt = alt;
 }

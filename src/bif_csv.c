@@ -1,7 +1,9 @@
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 #include "module.h"
+#include "network.h"
 #include "query.h"
 
 bool do_parse_csv_line(query *q, parser *p, csv *params, const char *src, cell *p2, pl_ctx p2_ctx)
@@ -11,7 +13,7 @@ bool do_parse_csv_line(query *q, parser *p, csv *params, const char *src, cell *
 	SB(pr);
 
 	if (params->trim) {
-		while (iswspace(*src))
+		while (is_space_utf8(peek_char_utf8(src)))
 			get_char_utf8(&src);
 	}
 
@@ -34,6 +36,20 @@ bool do_parse_csv_line(query *q, parser *p, csv *params, const char *src, cell *
 		}
 
 		if (quoted && (ch == params->quote)) {
+			// RFC 4180: a doubled quote inside a quoted field is a
+			// literal quote and the field STAYS quoted. This used to
+			// fall through to the close-quote case below, so after
+			// "a""b" the parser was no longer in quoted state and the
+			// next separator was taken literally - `"a""b",c` came
+			// back as the single field `a"b,c` instead of two.
+
+			if (peek_char_utf8(src) == params->quote) {
+				get_char_utf8(&src);
+				SB_putchar(pr, params->quote);
+				chars++;
+				continue;
+			}
+
 			ch = get_char_utf8(&src);
 			quoted = 0;
 		}
@@ -50,7 +66,7 @@ bool do_parse_csv_line(query *q, parser *p, csv *params, const char *src, cell *
 			if (quoted && p->fp) {
 				ssize_t len;
 
-				if ((len = getline(&p->save_line, &p->n_line, p->fp)) == -1)
+				if ((len = tpl_getline_fp(&p->save_line, &p->n_line, p->fp)) == -1)
 					return true;
 
 				src = p->save_line;
@@ -77,7 +93,7 @@ bool do_parse_csv_line(query *q, parser *p, csv *params, const char *src, cell *
 			while (*tmp_src) {
 				if (*tmp_src == '.')
 					dots++;
-				else if (!isdigit(*tmp_src))
+				else if (!isdigit((unsigned char)*tmp_src))
 					bad++;
 
 				tmp_src++;
@@ -134,7 +150,8 @@ bool do_parse_csv_line(query *q, parser *p, csv *params, const char *src, cell *
 		SB_init(pr);
 
 		if (params->trim) {
-			while (iswspace(*src))				get_char_utf8(&src);
+			while (is_space_utf8(peek_char_utf8(src)))
+				get_char_utf8(&src);
 		}
 	}
 
@@ -212,6 +229,7 @@ bool bif_parse_csv_line_2(query *q)
 	GET_NEXT_ARG(p2,var);
 	csv params = {.sep=',', .quote='"', .arity=0, .trim=false, .numbers=false, .use_strings=is_string(p1), .functor=NULL};
 	parser *p = parser_create(q->st.m);
+	CHECKED(p);
 	bool ok = do_parse_csv_line(q, p, &params, C_STR(q,p1), p2, p2_ctx);
 	parser_destroy(p);
 	return ok;
@@ -226,13 +244,13 @@ bool bif_parse_csv_line_3(query *q)
 	const char *functor = NULL;
 	int sep = ',', quote = '"';
 	int arity = 0;
-	LIST_HANDLER(p3);
+	PROLOG_LIST_HANDLER(p3);
 
 	while (is_list(p3)) {
-		cell *h = LIST_HEAD(p3);
+		cell *h = PROLOG_LIST_HEAD(p3);
 		h = deref(q,h,p3_ctx);
 
-		if (is_compound(h) && (h->arity == 1)) {
+		if (is_compound(h) && (get_arity(h) == 1)) {
 			cell *c = h + 1;
 
 			if (!strcmp("trim", C_STR(q, h)) && is_atom(c) && (c->val_off == g_true_s))
@@ -255,13 +273,14 @@ bool bif_parse_csv_line_3(query *q)
 				quote = peek_char_utf8(C_STR(q, c));
 		}
 
-		p3 = LIST_TAIL(p3);
+		p3 = PROLOG_LIST_TAIL(p3);
 		p3 = deref(q,p3,p3_ctx);
 		p3_ctx = q->latest_ctx;
 	}
 
 	csv params = {.sep=sep, .quote=quote, .arity=arity, .trim=trim, .numbers=numbers, .use_strings=use_strings, .functor=functor};
 	parser *p = parser_create(q->st.m);
+	CHECKED(p);
 	bool ok = do_parse_csv_line(q, p, &params, C_STR(q,p1), !do_assert||!functor ? p2 : NULL, p2_ctx);
 	parser_destroy(p);
 	return ok;
@@ -276,18 +295,19 @@ bool bif_parse_csv_file_2(query *q)
 	const char *functor = NULL;
 	int sep = ',', quote = '"', comment = '#';
 	int arity = 0;
-	LIST_HANDLER(p3);
+	PROLOG_LIST_HANDLER(p3);
 	const char *ext = strrchr(C_STR(q, p1), '.');
 	parser *p = parser_create(q->st.m);
+	CHECKED(p);
 
 	if (ext && !strcmp(ext, ".tsv"))
 		sep = '\t';
 
 	while (is_list(p3)) {
-		cell *h = LIST_HEAD(p3);
+		cell *h = PROLOG_LIST_HEAD(p3);
 		h = deref(q,h,p3_ctx);
 
-		if (is_compound(h) && (h->arity == 1)) {
+		if (is_compound(h) && (get_arity(h) == 1)) {
 			cell *c = h + 1;
 
 			if (!strcmp("trim", C_STR(q, h)) && is_atom(c) && (c->val_off == g_true_s))
@@ -314,7 +334,7 @@ bool bif_parse_csv_file_2(query *q)
 				quote = peek_char_utf8(C_STR(q, c));
 		}
 
-		p3 = LIST_TAIL(p3);
+		p3 = PROLOG_LIST_TAIL(p3);
 		p3 = deref(q,p3,p3_ctx);
 		p3_ctx = q->latest_ctx;
 	}
@@ -331,7 +351,7 @@ bool bif_parse_csv_file_2(query *q)
 	ssize_t len;
 	csv params = {.sep=sep, .quote=quote, .arity=arity, .trim=trim, .numbers=numbers, .use_strings=use_strings, .functor=functor};
 
-	while ((len = getline(&p->save_line, &p->n_line, p->fp)) != -1) {
+	while ((len = tpl_getline_fp(&p->save_line, &p->n_line, p->fp)) != -1) {
 		CHECK_INTERRUPT();
 		char *line = p->save_line;
 		line_num++;
@@ -369,26 +389,68 @@ bool bif_parse_csv_file_2(query *q)
 	return true;
 }
 
+// RFC 4180: a field containing the separator, the quote character, CR
+// or LF must be written quoted, with any embedded quote doubled.
+//
+// Without this, write_csv_file(F, [[a,'b,c']], []) emitted
+//
+//     a,b,c
+//
+// which reads back as THREE fields - a silent round-trip corruption,
+// and the reader in this same file already handles the quoted form.
+
+static bool write_csv_field(FILE *fp, const char *src, size_t len, csv *params)
+{
+	bool quoted = false;
+
+	for (size_t i = 0; i < len; i++) {
+		if ((src[i] == params->sep) || (src[i] == params->quote)
+			|| (src[i] == '\n') || (src[i] == '\r')) {
+			quoted = true;
+			break;
+		}
+	}
+
+	if (!quoted)
+		return fwrite(src, 1, len, fp) == len;
+
+	if (fputc(params->quote, fp) == EOF)
+		return false;
+
+	for (size_t i = 0; i < len; i++) {
+		if (src[i] == params->quote) {
+			if (fputc(params->quote, fp) == EOF)
+				return false;
+		}
+
+		if (fputc(src[i], fp) == EOF)
+			return false;
+	}
+
+	return fputc(params->quote, fp) != EOF;
+}
+
 static bool do_write_csv_line(query *q, parser* p, csv *params, cell *l, pl_ctx l_ctx)
 {
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_list(l)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = deref(q,h,l_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
 		char *dst = print_term_to_strbuf(q, h, h_ctx, 1);
 		size_t len = strlen(dst);
 
-		if (fwrite(dst, 1, len, p->fp) < len) {
+		if (!write_csv_field(p->fp, dst, len, params)) {
 			printf("Error: write_csv_file\n");
-			return false;
+			TPL_free(dst);		// print_term_to_strbuf() returns a
+			return false;		// TPL_malloc'd buffer we own
 		}
 
 		TPL_free(dst);
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = deref(q,l,l_ctx);
 		l_ctx = q->latest_ctx;
 
@@ -410,18 +472,19 @@ bool bif_write_csv_file_3(query *q)
 	const char *functor = NULL;
 	int sep = ',', quote = '"', comment = '#';
 	int arity = 0;
-	LIST_HANDLER(p3);
+	PROLOG_LIST_HANDLER(p3);
 	const char *ext = strrchr(C_STR(q, p1), '.');
 	parser *p = parser_create(q->st.m);
+	CHECKED(p);
 
 	if (ext && !strcmp(ext, ".tsv"))
 		sep = '\t';
 
 	while (is_list(p3)) {
-		cell *h = LIST_HEAD(p3);
+		cell *h = PROLOG_LIST_HEAD(p3);
 		h = deref(q,h,p3_ctx);
 
-		if (is_compound(h) && (h->arity == 1)) {
+		if (is_compound(h) && (get_arity(h) == 1)) {
 			cell *c = h + 1;
 
 			if (!strcmp("trim", C_STR(q, h)) && is_atom(c) && (c->val_off == g_true_s))
@@ -450,7 +513,7 @@ bool bif_write_csv_file_3(query *q)
 				quote = peek_char_utf8(C_STR(q, c));
 		}
 
-		p3 = LIST_TAIL(p3);
+		p3 = PROLOG_LIST_TAIL(p3);
 		p3 = deref(q,p3,p3_ctx);
 		p3_ctx = q->latest_ctx;
 	}
@@ -459,23 +522,33 @@ bool bif_write_csv_file_3(query *q)
 	p->fp = fopen(C_STR(q, p1), append?"a":"w");
 	if (!p->fp) { parser_destroy(p); return throw_error(q, p1, p1_ctx, "existence_error", "source_sink"); }
 	q->double_quotes = true;
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_list(p2)) {
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		h = deref(q,h,p2_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
-		if (!is_list_or_nil(h))
+		// Both of these exits used to leak the parser (and the first
+		// leaked the open FILE* too). The fopen-failure path a few
+		// lines above has always done parser_destroy(p) - the three
+		// exits had simply drifted apart.
+
+		if (!is_list_or_nil(h)) {
+			fclose(p->fp);
+			p->fp = NULL;
+			parser_destroy(p);
 			return throw_error(q, h, h_ctx, "type_error", "list");
+		}
 
 		if (!do_write_csv_line(q, p, &params, h, h_ctx)) {
 			fclose(p->fp);
 			p->fp = NULL;
+			parser_destroy(p);
 			return false;
 		}
 
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q,p2,p2_ctx);
 		p2_ctx = q->latest_ctx;
 	}

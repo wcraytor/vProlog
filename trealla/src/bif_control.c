@@ -25,6 +25,9 @@ bool bif_sys_cut_1(query *q)
 {
 	GET_FIRST_ARG(p1,integer)
 	choice *ch = GET_CHOICE(get_smalluint(p1));
+
+	// The same flag as a reset/3 barrier: see is_reset_handler().
+
 	ch->reset = true;
 	return true;
 }
@@ -67,38 +70,62 @@ static bool bif_sys_cleanup_if_det_1(query *q)
 	return true;
 }
 
+// Whether a control construct holds a variable where a goal goes, so it
+// has to be run as a body rebuilt with that variable dereferenced. It only
+// walks the term's own cells, without following bindings, so it ends.
+
+static bool control_has_var(const cell *c)
+{
+	while (is_control_pair(c)) {
+		const cell *c1 = c + 1, *c2 = c1 + c1->num_cells;
+
+		if (is_var(c1) || is_var(c2) || control_has_var(c1))
+			return true;
+
+		c = c2;							// the right-hand chain in a loop, as body_cells() has it
+	}
+
+	return false;
+}
+
 bool call_check(query *q, cell *p1, bool *status, bool calln)
 {
 	cell *save_p1 = p1;
 
-	if (calln || !p1->arity) {
+	if (calln || !get_arity(p1)) {
+		// A goal built at run time is looked up on every call, so the lookups that found something are kept
+
+		unsigned gen = q->pl->pred_gen, arity = get_arity(p1);
+		lookup_entry *e = is_interned(p1) ? &q->lookup_cache[(p1->val_off + arity) % LOOKUP_CACHE_SIZE] : NULL;
 		bool found = false;
 
-		if ((p1->match = search_predicate(q->st.m, p1)) != NULL) {
+		if (e && (e->m == q->st.m) && (e->val_off == p1->val_off) && (e->arity == arity) && (e->gen == gen)) {
+			if (e->is_builtin) {
+				p1->bif_ptr = e->bif_ptr;
+				p1->flags |= FLAG_INTERNED_BUILTIN;
+			} else {
+				p1->match = e->match;
+				p1->flags &= ~FLAG_INTERNED_BUILTIN;
+			}
+		} else if ((p1->match = search_predicate(q->st.m, p1)) != NULL) {
 			p1->flags &= ~FLAG_INTERNED_BUILTIN;
+			if (e) *e = (lookup_entry){ .m = q->st.m, .match = p1->match, .gen = gen, .arity = arity, .val_off = p1->val_off };
 		} else if ((p1->bif_ptr = get_builtin_term(q->st.m, p1, &found, NULL)), found) {
 			p1->flags |= FLAG_INTERNED_BUILTIN;
-
-			if (calln && (p1->arity <= 2)) {
-				const char *functor = C_STR(q, p1);
-				unsigned specifier;
-
-				if (search_op(q->st.m, functor, &specifier, false))
-					SET_OP(p1, specifier);
-			}
+			if (e) *e = (lookup_entry){ .m = q->st.m, .bif_ptr = p1->bif_ptr, .gen = gen, .arity = arity, .val_off = p1->val_off, .is_builtin = true };
 		} else {
 			p1->flags &= ~FLAG_INTERNED_BUILTIN;
 		}
 	}
 
-	if ((p1->arity == 2) && is_builtin(p1)
+	if ((get_arity(p1) == 2) && is_builtin(p1)
 		&& ((p1->val_off == g_conjunction_s)
 			|| (p1->val_off == g_disjunction_s)
 			|| (p1->val_off == g_if_then_s)
 			|| (p1->val_off == g_soft_cut_s)
 			)
 		&& (p1 = check_body_callable(p1)) != NULL) {
-		*status = throw_error(q, p1, q->st.cur_ctx, "type_error", "callable");
+		*status = throw_error(q, save_p1, q->st.cur_ctx, "type_error", "callable");
 		return false;
 	}
 
@@ -118,9 +145,26 @@ bool bif_call_0(query *q, cell *p1, pl_ctx p1_ctx)
 			return status;
 	}
 
-	cell *tmp = prepare_call(q, CALL_SKIP, p1, p1_ctx, 3);
-	CHECKED(tmp);
-	pl_idx num_cells = p1->num_cells;
+	// A control construct with a variable in a goal position runs as its
+	// body, rebuilt with that dereferenced now (ISO 7.6.2), so a cut nested
+	// behind it is not hidden in a call.
+
+	cell *tmp;
+	pl_idx num_cells;
+
+	if (control_has_var(p1)) {
+		CHECKED(init_tmp_heap(q));
+		cell *p1_clone = clone_term_to_tmp(q, p1, p1_ctx);
+		CHECKED(p1_clone);
+		tmp = prepare_call_body(q, CALL_SKIP, p1_clone, p1, p1_ctx, 3);
+		CHECKED(tmp);
+		num_cells = tmp->num_cells;
+	} else {
+		tmp = prepare_call(q, CALL_SKIP, p1, p1_ctx, 3);
+		CHECKED(tmp);
+		num_cells = p1->num_cells;
+	}
+
 	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
 	make_call(q, tmp+num_cells);
@@ -133,7 +177,7 @@ static bool bif_iso_call_n(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 
-	if ((p1->val_off == g_colon_s) && (p1->arity == 2)) {
+	if ((p1->val_off == g_colon_s) && (get_arity(p1) == 2)) {
 		cell *cm = p1 + 1;
 		cm = deref(q, cm, p1_ctx);
 
@@ -153,7 +197,7 @@ static bool bif_iso_call_n(query *q)
 			return throw_error(q, p1, p1_ctx, "type_error", "callable");
 	}
 
-	int arity = p1->arity, args = 1, xarity = q->st.instr->arity;
+	uint32_t arity = get_arity(p1), args = 1, xarity = get_arity(q->st.instr);
 	CHECKED(init_tmp_heap(q));
 	CHECKED(append_to_tmp(q, p1, p1_ctx));
 
@@ -165,12 +209,13 @@ static bool bif_iso_call_n(query *q)
 
 	cell *tmp2 = get_tmp_heap(q, 0);
 	tmp2->num_cells = tmp_heap_used(q);
-	tmp2->arity = arity;
 
 	if (is_cstring(tmp2)) {
 		share_cell(tmp2);
 		convert_to_literal(q->st.m, tmp2);
 	}
+
+	set_arity(tmp2, arity);
 
 	tmp2->match = NULL;
 	bool status;
@@ -194,11 +239,35 @@ static bool bif_iso_call_n(query *q)
 	return true;
 }
 
+// Prepare a goal checked through clone (NULL if it wasn't): a control
+// construct runs as its body, built from the clone's structure with the
+// original's leaves (see prepare_call_body()), an atom runs the clone that
+// call_check() resolved, and anything else, or a goal that is no longer the
+// one cloned, as M:G is once unwrapped, runs by reference.
+
+static cell *prepare_checked_call(query *q, cell *clone, cell *p1, pl_ctx p1_ctx, unsigned extras, pl_idx *num_cells)
+{
+	cell *tmp;
+
+	if (clone && is_control_pair(clone) && is_control_pair(p1) && (clone->val_off == p1->val_off)) {
+		tmp = prepare_call_body(q, CALL_NOSKIP, clone, p1, p1_ctx, extras);
+		if (tmp) *num_cells = tmp->num_cells;
+	} else if (clone && !get_arity(clone) && !get_arity(p1)) {
+		tmp = prepare_call(q, CALL_NOSKIP, clone, q->st.cur_ctx, extras);
+		*num_cells = clone->num_cells;
+	} else {
+		tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, extras);
+		*num_cells = p1->num_cells;
+	}
+
+	return tmp;
+}
+
 bool bif_iso_call_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 
-	if ((p1->val_off == g_colon_s) && (p1->arity == 2)) {
+	if ((p1->val_off == g_colon_s) && (get_arity(p1) == 2)) {
 		cell *cm = p1 + 1;
 		cm = deref(q, cm, p1_ctx);
 
@@ -218,21 +287,26 @@ bool bif_iso_call_1(query *q)
 			return throw_error(q, p1, p1_ctx, "type_error", "callable");
 	}
 
-	if ((is_builtin(p1) && (p1->arity == 2)) || !p1->arity) {
-		CHECKED(init_tmp_heap(q));
-		p1 = clone_term_to_tmp(q, p1, p1_ctx);
-		CHECKED(p1);
-		bool status;
-		p1_ctx = q->st.cur_ctx;
+	// Check a clone, but run the goal through prepare_checked_call(): the
+	// clone alone holds its own copy of every term a variable was bound to,
+	// so nb_setarg/3 on one would not reach the caller's.
 
-		if (!call_check(q, p1, &status, false))
+	cell *p1_clone = NULL;
+
+	if ((is_builtin(p1) && (get_arity(p1) == 2)) || is_control_pair(p1) || !get_arity(p1)) {
+		CHECKED(init_tmp_heap(q));
+		p1_clone = clone_term_to_tmp(q, p1, p1_ctx);
+		CHECKED(p1_clone);
+		bool status;
+
+		if (!call_check(q, p1_clone, &status, false))
 			return status;
 	}
 
-	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, 3);
+	pl_idx num_cells;
+	cell *tmp = prepare_checked_call(q, p1_clone, p1, p1_ctx, 3, &num_cells);
 	CHECKED(tmp);
 	tmp->flags &= ~FLAG_INTERNED_TAIL_CALL;
-	pl_idx num_cells = p1->num_cells;
 	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
 	make_call(q, tmp+num_cells);
@@ -251,7 +325,7 @@ static bool bif_iso_once_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 
-	if ((p1->val_off == g_colon_s) && (p1->arity == 2)) {
+	if ((p1->val_off == g_colon_s) && (get_arity(p1) == 2)) {
 		cell *cm = p1 + 1;
 		cm = deref(q, cm, p1_ctx);
 
@@ -271,21 +345,26 @@ static bool bif_iso_once_1(query *q)
 			return throw_error(q, p1, p1_ctx, "type_error", "callable");
 	}
 
-	if ((is_builtin(p1) && (p1->arity == 2)) || !p1->arity) {
-		CHECKED(init_tmp_heap(q));
-		p1 = clone_term_to_tmp(q, p1, p1_ctx);
-		CHECKED(p1);
-		bool status;
-		p1_ctx = q->st.cur_ctx;
+	// Check a clone, but run the goal through prepare_checked_call(): the
+	// clone alone holds its own copy of every term a variable was bound to,
+	// so nb_setarg/3 on one would not reach the caller's.
 
-		if (!call_check(q, p1, &status, false))
+	cell *p1_clone = NULL;
+
+	if ((is_builtin(p1) && (get_arity(p1) == 2)) || is_control_pair(p1) || !get_arity(p1)) {
+		CHECKED(init_tmp_heap(q));
+		p1_clone = clone_term_to_tmp(q, p1, p1_ctx);
+		CHECKED(p1_clone);
+		bool status;
+
+		if (!call_check(q, p1_clone, &status, false))
 			return status;
 	}
 
-	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, 4);
+	pl_idx num_cells;
+	cell *tmp = prepare_checked_call(q, p1_clone, p1, p1_ctx, 4, &num_cells);
 	CHECKED(tmp);
 	tmp->flags &= ~FLAG_INTERNED_TAIL_CALL;
-	pl_idx num_cells = p1->num_cells;
 	make_instr(tmp+num_cells++, g_cut_s, bif_iso_cut_0, 0, 0);
 	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
@@ -305,18 +384,21 @@ static bool bif_ignore_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 
-	if ((is_builtin(p1) && (p1->arity == 2)) || !p1->arity) {
+	// As call/1: check a clone, run through prepare_checked_call().
+
+	cell *p1_clone = NULL;
+
+	if ((is_builtin(p1) && (get_arity(p1) == 2)) || is_control_pair(p1) || !get_arity(p1)) {
 		CHECKED(init_tmp_heap(q));
-		p1 = clone_term_to_tmp(q, p1, p1_ctx);
-		CHECKED(p1);
-		p1_ctx = q->st.cur_ctx;
+		p1_clone = clone_term_to_tmp(q, p1, p1_ctx);
+		CHECKED(p1_clone);
 		bool status;
 
-		if (!call_check(q, p1, &status, false))
+		if (!call_check(q, p1_clone, &status, false))
 			return status;
 	}
 
-	if ((p1->val_off == g_colon_s) && (p1->arity == 2)) {
+	if ((p1->val_off == g_colon_s) && (get_arity(p1) == 2)) {
 		cell *cm = p1 + 1;
 		cm = deref(q, cm, p1_ctx);
 
@@ -336,10 +418,10 @@ static bool bif_ignore_1(query *q)
 			return throw_error(q, p1, p1_ctx, "type_error", "callable");
 	}
 
-	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, q->st.cur_ctx, 4);
+	pl_idx num_cells;
+	cell *tmp = prepare_checked_call(q, p1_clone, p1, p1_ctx, 4, &num_cells);
 	CHECKED(tmp);
 	tmp->flags &= ~FLAG_INTERNED_TAIL_CALL;
-	pl_idx num_cells = p1->num_cells;
 	make_instr(tmp+num_cells++, g_cut_s, bif_iso_cut_0, 0, 0);
 	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
@@ -390,15 +472,15 @@ bool bif_soft_if_then_2(query *q)
 
 // if -> then ; else
 
-static bool do_if_then_else(query *q, cell *p1, cell *p2, cell *p3)
+static bool do_if_then_else(query *q, cell *p1, cell *p2, pl_ctx p1_ctx)
 {
-	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, q->st.cur_ctx, 3+p2->num_cells+2);
+	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, 3+p2->num_cells+2);
 	CHECKED(tmp);
 	pl_idx num_cells = p1->num_cells;
 	make_instr(tmp+num_cells++, g_cut_s, bif_iso_cut_0, 0, 0);
 	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
-	num_cells += dup_cells_by_ref(tmp+num_cells, p2, q->st.cur_ctx, p2->num_cells);
+	num_cells += dup_cells_by_ref(tmp+num_cells, p2, p1_ctx, p2->num_cells);
 	make_instr(tmp+num_cells++, g_true_s, bif_iso_true_0, 0, 0); // Why???
 	make_call(q, tmp+num_cells);
 	CHECKED(push_barrier(q));
@@ -408,16 +490,16 @@ static bool do_if_then_else(query *q, cell *p1, cell *p2, cell *p3)
 
 // if *-> then ; else
 
-static bool do_soft_if_then_else(query *q, cell *p1, cell *p2, cell *p3)
+static bool do_soft_if_then_else(query *q, cell *p1, cell *p2, pl_ctx p1_ctx)
 {
-	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, q->st.cur_ctx, 4+p2->num_cells+2);
+	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, 4+p2->num_cells+2);
 	CHECKED(tmp);
 	pl_idx num_cells = p1->num_cells;
 	make_instr(tmp+num_cells++, g_sys_cut_s, bif_sys_cut_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
 	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
-	num_cells += dup_cells_by_ref(tmp+num_cells, p2, q->st.cur_ctx, p2->num_cells);
+	num_cells += dup_cells_by_ref(tmp+num_cells, p2, p1_ctx, p2->num_cells);
 	make_instr(tmp+num_cells++, g_true_s, bif_iso_true_0, 0, 0); // Why???
 	make_call(q, tmp+num_cells);
 	CHECKED(push_barrier(q));
@@ -439,7 +521,7 @@ static bool bif_if_3(query *q)
 		return true;
 	}
 
-	return do_soft_if_then_else(q, p1, p2, p3);
+	return do_soft_if_then_else(q, p1, p2, q->st.cur_ctx);
 }
 
 // goal ; goal
@@ -451,25 +533,18 @@ static bool bif_iso_disjunction_2(query *q)
 		return true;
 	}
 
-	cell *c = q->st.instr+1;
+	GET_FIRST_ARG(p1,callable);
 
-	if (is_callable(c) && c->bif_ptr) {
-		if (c->bif_ptr->fn == bif_iso_if_then_2) {
-			cell *p1 = c + 1;
-			cell *p2 = p1 + p1->num_cells;
-			cell *p3 = p2 + p2->num_cells;
-			return do_if_then_else(q, p1, p2, p3);
-		}
+	// Deref first: the LHS may be a variable bound to (C -> T) at run time.
 
-		if (c->bif_ptr->fn == bif_soft_if_then_2) {
-			cell *p1 = c + 1;
-			cell *p2 = p1 + p1->num_cells;
-			cell *p3 = p2 + p2->num_cells;
-			return do_soft_if_then_else(q, p1, p2, p3);
-		}
+	if (is_interned(p1) && (get_arity(p1) == 2)) {
+		if (p1->val_off == g_if_then_s)
+			return do_if_then_else(q, p1+1, p1+1+p1[1].num_cells, p1_ctx);
+
+		if (p1->val_off == g_soft_cut_s)
+			return do_soft_if_then_else(q, p1+1, p1+1+p1[1].num_cells, p1_ctx);
 	}
 
-	GET_FIRST_ARG(p1,callable);
 	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, 2);
 	CHECKED(tmp);
 	pl_idx num_cells = p1->num_cells;
@@ -485,9 +560,22 @@ static bool bif_iso_disjunction_2(query *q)
 static bool bif_iso_negation_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
-	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, 5);
+
+	cell *p1_clone = NULL;
+
+	if ((is_builtin(p1) && (get_arity(p1) == 2)) || is_control_pair(p1) || !get_arity(p1)) {
+		CHECKED(init_tmp_heap(q));
+		p1_clone = clone_term_to_tmp(q, p1, p1_ctx);
+		CHECKED(p1_clone);
+		bool status;
+
+		if (!call_check(q, p1_clone, &status, false))
+			return status;
+	}
+
+	pl_idx num_cells;
+	cell *tmp = prepare_checked_call(q, p1_clone, p1, p1_ctx, 5, &num_cells);
 	CHECKED(tmp);
-	pl_idx num_cells = p1->num_cells;
 	make_instr(tmp+num_cells++, g_cut_s, bif_iso_cut_0, 0, 0);
 	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
 	make_uint(tmp+num_cells++, q->st.cp);
@@ -498,9 +586,66 @@ static bool bif_iso_negation_1(query *q)
 	return true;
 }
 
-static bool bif_sys_block_catcher_1(query *q)
+// forall(Cond, Action) met as a goal rather than compiled: the same shape compile_term() lays out, as
+// \+ (Cond, \+ Action), so a meta-call costs a barrier and not a clause.
+
+static bool bif_forall_2(query *q)
 {
-	GET_FIRST_RAW_ARG(p1,integer)
+	GET_FIRST_ARG(p1,callable);
+	GET_NEXT_ARG(p2,callable);
+
+	cell *tmp = prepare_call(q, CALL_NOSKIP, p1, p1_ctx, 1 + p2->num_cells + 5);
+	CHECKED(tmp);
+	pl_idx num_cells = p1->num_cells;
+	make_instr(tmp+num_cells++, g_negation_s, bif_iso_negation_1, 1, p2->num_cells);
+	num_cells += dup_cells_by_ref(tmp+num_cells, p2, p2_ctx, p2->num_cells);
+	make_instr(tmp+num_cells++, g_cut_s, bif_iso_cut_0, 0, 0);
+	make_instr(tmp+num_cells++, g_sys_drop_barrier_s, bif_sys_drop_barrier_1, 1, 1);
+	make_uint(tmp+num_cells++, q->st.cp);
+	make_instr(tmp+num_cells++, g_fail_s, bif_iso_fail_0, 0, 0);
+	make_call(q, tmp+num_cells);
+	CHECKED(push_succeed_on_retry_with_barrier(q, 0));
+	q->st.instr = tmp;
+	return true;
+}
+
+// Clears a stale choice index an untrailed binding left in a compiled control var.
+
+static cell *get_control_var(query *q, pl_ctx *p1_ctx)
+{
+	cell *c = q->st.instr + 1;
+	pl_ctx c_ctx = q->st.cur_ctx;
+
+	if (is_ref(c))
+		c_ctx = c->val_ctx;
+	else if (!is_var(c))
+		return NULL;
+
+	slot *e = get_slot(q, GET_FRAME(c_ctx), c->var_num);
+	cell *p1 = deref(q, c, c_ctx);
+	*p1_ctx = q->latest_ctx;
+
+	if (is_var(p1))
+		return p1;
+
+	if (!is_integer(p1))
+		return NULL;
+
+	unshare_cell(&e->c);
+	memset(e, 0, sizeof(slot));
+	*p1_ctx = c_ctx;
+	return &e->c;
+}
+
+bool bif_sys_block_catcher_1(query *q)
+{
+	cell *p1 = get_first_raw_arg(q);
+
+	// Compiled catch/3 passes a var bound to the index, catch/3 the index itself.
+
+	if (is_var(p1))
+		p1 = get_first_arg(q);
+
 	pl_idx cp = get_smalluint(p1);
 	choice *ch = GET_CHOICE(cp);
 
@@ -528,15 +673,21 @@ static bool bif_iso_catch_3(query *q)
 
 	if (q->retry && q->ball) {
 		GET_NEXT_ARG(p2,any);
-		return unify(q, p2, p2_ctx, q->ball, q->ball_ctx);
+
+		if (unify(q, p2, p2_ctx, q->ball, q->ball_ctx))
+			return true;
+
+		if (is_var(p2) && (q->oom || q->error || q->in_throw)) {
+			reset_var(q, p2, p2_ctx, q->ball, q->ball_ctx);
+			return true;
+		}
+		return false;
 	}
 
 	// Second time through? Try the recover goal...
 
 	if ((q->retry == QUERY_EXCEPTION) || (q->retry == QUERY_ABORT)) {
 		unsigned is_abort = q->retry == QUERY_ABORT;
-		check_pressure(q);
-		q->error = false;
 		GET_NEXT_ARG(p2,any);
 		GET_NEXT_ARG(p3,any);
 		q->retry = QUERY_OK;
@@ -551,7 +702,14 @@ static bool bif_iso_catch_3(query *q)
 		make_uint(tmp+num_cells++, q->st.cp);
 		if (is_abort) make_instr(tmp+num_cells++, g_sys_abort_s, bif_sys_abort_0, 0, 0);
 		make_call(q, tmp+num_cells);
-		CHECKED(push_catcher(q, QUERY_EXCEPTION));
+		if (!push_catcher(q, QUERY_EXCEPTION))
+			return false;
+
+		// NOT q->oom: see throw_error(). An oom still set here was never
+		// turned into a ball, so the allocation that failed is still
+		// unaccounted for and execution must not continue over it.
+
+		q->error = false;
 		q->st.instr = tmp;
 		return true;
 	}
@@ -574,6 +732,74 @@ static bool bif_iso_catch_3(query *q)
 	CHECKED(push_catcher(q, QUERY_RETRY));
 	q->st.instr = tmp;
 	return true;
+}
+
+// Compiled catch/3: $catch(Var, Catcher, Skip), then Goal, then Skip cells on a landing before Recovery.
+
+bool bif_sys_catch_3(query *q)
+{
+	if (q->retry && q->ball) {
+		GET_FIRST_ARG(p1,any);
+		GET_NEXT_ARG(p2,any);
+
+		if (unify(q, p2, p2_ctx, q->ball, q->ball_ctx))
+			return true;
+
+		if (is_var(p2) && (q->oom || q->error || q->in_throw)) {
+			reset_var(q, p2, p2_ctx, q->ball, q->ball_ctx);
+			return true;
+		}
+
+		return false;
+	}
+
+	if ((q->retry == QUERY_EXCEPTION) || (q->retry == QUERY_ABORT)) {
+		GET_FIRST_ARG(p1,any);
+		GET_NEXT_ARG(p2,any);
+		GET_NEXT_ARG(p3,integer);
+		bool is_abort = q->retry == QUERY_ABORT;
+		q->retry = QUERY_OK;
+		p1 = get_control_var(q, &p1_ctx);
+		CHECKED(p1);
+
+		// $catch_exit reads a negative index as an unwind to rethrow.
+
+		cell tmp;
+		make_int(&tmp, is_abort ? -(pl_int)q->st.cp-1 : (pl_int)q->st.cp);
+		CHECKED(push_catcher(q, QUERY_EXCEPTION));
+		CHECKED(unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx));
+
+		// NOT q->oom: see bif_iso_catch_3().
+
+		q->error = false;
+
+		// Not noskip: some callers run the instruction before stepping past it, so Recovery's first goal ran twice.
+
+		q->st.instr += get_smalluint(p3);
+		return true;
+	}
+
+	if (q->retry)
+		return false;
+
+	pl_ctx p1_ctx;
+	cell *p1 = get_control_var(q, &p1_ctx);
+	CHECKED(p1);
+	cell tmp;
+	make_uint(&tmp, (pl_uint)q->st.cp);
+	CHECKED(push_catcher(q, QUERY_RETRY));
+	return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
+}
+
+bool bif_sys_catch_exit_1(query *q)
+{
+	GET_FIRST_ARG(p1,integer)
+	pl_int v = get_smallint(p1);
+	pl_idx cp = v < 0 ? -v-1 : v;
+	q->total_inferences--;
+
+	drop_barrier(q, cp);
+	return v < 0 ? bif_sys_abort_0(q) : true;
 }
 
 bool bif_sys_set_if_var_2(query *q)
@@ -607,59 +833,254 @@ static bool bif_reset_3(query *q)
 	return true;
 }
 
-static bool find_reset_handler(query *q)
+// A soft-cut's $cut also sets reset, but only reset/3's barrier is fail-on-retry as well.
+
+static bool is_reset_handler(const choice *ch)
 {
-	if (!q->st.cp)
+	return ch->reset && ch->fail_on_retry;
+}
+
+// Return to the reset/3 at cp: if its Ball or Cont doesn't unify, shift/1 fails, as in Scryer.
+// The ball is passed in, never left in q->ball, where catch/3 would take a retry for an exception.
+
+static bool return_to_reset(query *q, pl_idx cp, cell *ball, pl_ctx ball_ctx)
+{
+	const choice *ch = GET_CHOICE(cp);
+	q->st.instr = ch->st.instr;
+	q->st.cur_ctx = ch->st.cur_ctx;
+	q->st.m = ch->st.m;
+	GET_FIRST_ARG0(p1, any, ch->st.instr);
+	GET_NEXT_ARG(p2, any);
+	GET_NEXT_ARG(p3, any);
+
+	if (!unify(q, p2, p2_ctx, ball, ball_ctx) || !unify(q, p3, p3_ctx, q->cont, q->cont_ctx))
 		return false;
 
-	choice *ch = GET_CURR_CHOICE();
+	// As when reset/3's goal exits: restore the cut generation, and drop the barrier unless the goal left choices.
+	// Its reset flag stays set, so backtracking into those choices can shift to it again.
 
-	for (; ch; ch--) {
-		if (ch->reset) {
-			ch->reset = false;
-			q->st.instr = ch->st.instr;
-			q->st.cur_ctx = ch->st.cur_ctx;
-			q->st.m = ch->st.m;
-			GET_FIRST_ARG0(p1, any, ch->st.instr);
-			GET_NEXT_ARG(p2, any);
-			GET_NEXT_ARG(p3, any);
-			cell tmp;
+	drop_barrier(q, cp);
+	return true;
+}
 
-			if (!q->ball) {
-				make_atom(&tmp, g_none_s);
-				return unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx);
-			}
+// A compiled control construct starts here if its first instruction carries its source term and length: see compile.c.
 
-			if (!unify(q, p2, p2_ctx, q->ball, q->ball_ctx))
-				return false;
+static bool is_compiled_block(const cell *c, const cell **src, pl_idx *len)
+{
+	if (!is_builtin(c))
+		return false;
 
-			q->ball = NULL;
+	unsigned arity = get_arity(c);
 
-			if (!unify(q, p3, p3_ctx, q->cont, q->cont_ctx))
-				return false;
+	if (!((c->val_off == g_sys_succeed_on_retry_s) && ((arity == 3) || (arity == 4)))
+		&& !((c->val_off == g_sys_fail_on_retry_s) && (arity == 3))
+		&& !((c->val_off == g_sys_catch_s) && (arity == 5)))
+		return false;
 
-			return true;
+	const cell *tail = c + c->num_cells;
+	*src = tail[-2].val_ptr;
+	*len = get_smalluint(tail-1);
+	return true;
+}
+
+// Collect every pending goal from the shift point up to (but excluding)
+// the reset barrier, appending each as a (cell*, ctx) pair. Two passes:
+// pass==0 just counts (goals + total goal cells), pass==1 fills the arrays.
+
+// Scan a run of goals starting at c (in ctx cc), appending each until the
+// clause end. Stops early (and sets *hit) at the reset's $drop_barrier
+// instruction, which marks the boundary of the captured continuation.
+
+static void scan_cont_segment(query *q, cell *c, pl_ctx cc, int pass,
+	cell **goals, pl_ctx *ctxs, unsigned *pn, unsigned *ptotal, bool *hit,
+	pl_idx reset_cp)
+{
+	while (c) {
+		// A heap-built call (call/1, once/1, a soft-cut, catch/3...) ends by returning to its caller's next goal.
+
+		if (is_end(c)) {
+			c = c->ret_instr;
+			continue;
 		}
 
-		if (ch == q->choices)
+		// A compiled construct still to come goes in whole, as its source term: its instructions only work in place.
+
+		const cell *src;
+		pl_idx len;
+
+		if (is_compiled_block(c, &src, &len)) {
+			if (pass) { goals[*pn] = (cell*)src; ctxs[*pn] = cc; }
+			*ptotal += src->num_cells;
+			(*pn)++;
+			c += len;
+			continue;
+		}
+
+		// These close off a construct the shift is inside, and only work in place too.
+
+		if (is_interned(c) && ((c->val_off == g_sys_block_catcher_s)
+			|| (c->val_off == g_sys_catch_exit_s) || (c->val_off == g_sys_cut_s))) {
+			c += c->num_cells;
+			continue;
+		}
+
+		// $drop_barrier ends the captured continuation ONLY when it is
+		// the barrier planted by our own reset/3: its operand is the
+		// choice-point index of that reset. Barriers from call/1,
+		// catch/3, findall/3 etc. sit BETWEEN the shift and the reset
+		// (eg. a tabled call under call/1, as Logtalk's debug wrapper
+		// does) and must be skipped, not treated as the delimiter -
+		// otherwise the continuation is truncated and answers come back
+		// with unbound variables.
+
+		if (is_interned(c) && (c->val_off == g_sys_drop_barrier_s)) {
+			if ((get_arity(c) == 1) && is_smallint(c+1)
+				&& (get_smallint(c+1) == (pl_int)reset_cp)) {
+				*hit = true;
+				return;
+			}
+
+			c += c->num_cells;
+			continue;
+		}
+
+		// Compiled if-then-else: a suspension inside a then-branch sees
+		// the jump-over-the-else in its pending goals. Follow the jump
+		// (its operand is the cell distance from the jump cell itself
+		// to the landing cell) instead of capturing it as a goal.
+
+		if (is_interned(c) && (c->val_off == g_sys_jump_s) && (get_arity(c) == 1)) {
+			c += get_smallint(c+1);
+			continue;
+		}
+
+		// The landing cell of an if-then-else is a bare true/0: harmless
+		// to capture, skip it to keep continuations tidy.
+
+		if (is_interned(c) && (c->val_off == g_true_s) && !get_arity(c) && c->bif_ptr) {
+			c += c->num_cells;
+			continue;
+		}
+
+		if (pass) { goals[*pn] = c; ctxs[*pn] = cc; }
+		*ptotal += c->num_cells;
+		(*pn)++;
+		c += c->num_cells;
+	}
+}
+
+// Collect every pending goal from the shift point up to (but excluding)
+// the nearest reset barrier. The barrier is recognised by the $drop_barrier
+// instruction that reset/3 installs after its goal. Two passes: pass==0
+// counts, pass==1 fills the arrays.
+
+static unsigned collect_cont_goals(query *q, int pass,
+	cell **goals, pl_ctx *ctxs, unsigned *out_total_cells, pl_idx reset_cp, bool *out_hit)
+{
+	unsigned n = 0, total = 0;
+	bool hit = false;
+
+	// Segment 0: the rest of the shift's own clause body.
+	scan_cont_segment(q, q->st.instr + q->st.instr->num_cells, q->st.cur_ctx,
+		pass, goals, ctxs, &n, &total, &hit, reset_cp);
+
+	// Walk up the frame chain; each frame contributes its caller's goals
+	// *after* the call that entered it (f->instr points at the call site).
+	pl_ctx f_ctx = q->st.cur_ctx;
+
+	while (!hit) {
+		const frame *f = GET_FRAME(f_ctx);
+
+		if (f->prev == (pl_ctx)CTX_NUL)
 			break;
+
+		if (f->instr)
+			scan_cont_segment(q, f->instr + f->instr->num_cells, f->prev,
+				pass, goals, ctxs, &n, &total, &hit, reset_cp);
+
+		if (f->prev == f_ctx)
+			break;
+
+		f_ctx = f->prev;
 	}
 
-	return false;
+	if (out_total_cells) *out_total_cells = total;
+	if (out_hit) *out_hit = hit;
+	return n;
 }
 
 static bool bif_shift_1(query *q)
 {
 	GET_FIRST_ARG(p1,nonvar);
-	q->ball = p1;
-	q->ball_ctx = p1_ctx;
-	cell *next = q->st.instr + q->st.instr->num_cells;
-	cell *tmp2 = alloc_heap(q, 1+next->num_cells);
-	make_instr(tmp2, g_cont_s, NULL, 1, next->num_cells);
-	dup_cells_by_ref(tmp2+1, next, q->st.cur_ctx, next->num_cells);
+
+	// The nearest reset/3 choice point that still encloses this shift, ie. whose
+	// $drop_barrier lies ahead. One whose goal has exited but left choices is passed over.
+
+	pl_idx reset_cp = 0;
+	unsigned n = 0, total_cells = 0;
+	bool hit = false;
+
+	for (pl_idx cp = q->st.cp; (cp > 0) && !hit; ) {
+		const choice *ch = GET_CHOICE(--cp);
+
+		if (!is_reset_handler(ch))
+			continue;
+
+		reset_cp = cp;
+		n = collect_cont_goals(q, 0, NULL, NULL, &total_cells, reset_cp, &hit);
+	}
+
+	// No reset/3 to return to: fail, as in Scryer.
+
+	if (!hit)
+		return false;
+
+	if (n == 0) {
+		// Empty continuation. NB. must be an executable true/0
+		// instruction (with its builtin resolved), not a bare atom:
+		// fabricated cells bypass the compiler's builtin lookup.
+		cell *tmp2 = alloc_heap(q, 2);
+		CHECKED(tmp2);
+		make_instr(tmp2, g_cont_s, NULL, 1, 1);
+		make_instr(tmp2+1, g_true_s, bif_iso_true_0, 0, 0);
+		q->cont = tmp2;
+		q->cont_ctx = q->st.cur_ctx;
+		return return_to_reset(q, reset_cp, p1, p1_ctx);
+	}
+
+	cell **goals = TPL_malloc(sizeof(cell*) * n);
+	pl_ctx *ctxs = TPL_malloc(sizeof(pl_ctx) * n);
+	CHECKED(goals); CHECKED(ctxs);
+	collect_cont_goals(q, 1, goals, ctxs, NULL, reset_cp, NULL);
+
+	// Right-nested conjunction: (n-1) comma cells + total goal cells,
+	// wrapped in cont(...). If n==1 there are no commas.
+	unsigned conj_cells = total_cells + (n - 1);
+	cell *tmp2 = alloc_heap(q, 1 + conj_cells);
+
+	if (!tmp2) { TPL_free(goals); TPL_free(ctxs); return false; }
+
+	make_instr(tmp2, g_cont_s, NULL, 1, conj_cells);
+	cell *dst = tmp2 + 1;
+
+	for (unsigned i = 0; i < n; i++) {
+		if (i < n - 1) {
+			// Cells after this comma header: the goals from here on, and the commas after this one
+			unsigned rest = 0;
+			for (unsigned j = i; j < n; j++) rest += goals[j]->num_cells;
+			rest += n - 2 - i;
+			make_instr(dst, g_conjunction_s, bif_iso_conjunction_2, 2, rest);
+			SET_OP(dst, OP_XFY);
+			dst++;
+		}
+
+		dst += copy_cells_by_ref(dst, goals[i], ctxs[i], goals[i]->num_cells);
+	}
+
+	TPL_free(goals); TPL_free(ctxs);
 	q->cont = tmp2;
 	q->cont_ctx = q->st.cur_ctx;
-	return find_reset_handler(q);
+	return return_to_reset(q, reset_cp, p1, p1_ctx);
 }
 
 bool bif_sys_call_cleanup_3(query *q)
@@ -669,8 +1090,20 @@ bool bif_sys_call_cleanup_3(query *q)
 	if (q->retry && q->ball) {
 		GET_NEXT_ARG(p2,any);
 		cell *tmp = clone_term_to_heap(q, q->ball, q->ball_ctx);
-		CHECKED(tmp);
-		return unify(q, p2, p2_ctx, tmp, q->st.cur_ctx);
+		if (!tmp) {
+			if (is_var(p2)) {
+				reset_var(q, p2, p2_ctx, q->ball, q->ball_ctx);
+				return true;
+			}
+			return false;
+		}
+		if (unify(q, p2, p2_ctx, tmp, q->st.cur_ctx))
+			return true;
+		if (is_var(p2) && (q->oom || q->error || q->in_throw)) {
+			reset_var(q, p2, p2_ctx, q->ball, q->ball_ctx);
+			return true;
+		}
+		return false;
 	}
 
 	// Second time through? Try the recover goal...
@@ -679,13 +1112,25 @@ bool bif_sys_call_cleanup_3(query *q)
 		GET_NEXT_ARG(p2,any);
 		GET_NEXT_ARG(p3,callable);
 		q->retry = QUERY_OK;
-		cell *tmp = prepare_call(q, CALL_NOSKIP, p3, p3_ctx, 3);
-		CHECKED(tmp);
-		pl_idx num_cells = p3->num_cells;
+		cell tmp2;
+		make_instr(&tmp2, g_call_s, bif_iso_call_1, 1, 0);
+		cell *tmp = prepare_call(q, CALL_NOSKIP, &tmp2, p3_ctx, p3->num_cells+3);
+		if (!tmp)
+			return false;
+		tmp->num_cells += p3->num_cells;
+		pl_idx num_cells = 1;
+		num_cells += dup_cells_by_ref(tmp+num_cells, p3, p3_ctx, p3->num_cells);
 		make_instr(tmp+num_cells++, g_sys_cleanup_if_det_s, bif_sys_cleanup_if_det_1, 1, 1);
 		make_uint(tmp+num_cells++, q->st.cp);
 		make_call(q, tmp+num_cells);
-		CHECKED(push_catcher(q, QUERY_EXCEPTION));
+		if (!push_catcher(q, QUERY_EXCEPTION))
+			return false;
+
+		// NOT q->oom: see throw_error(). An oom still set here was never
+		// turned into a ball, so the allocation that failed is still
+		// unaccounted for and execution must not continue over it.
+
+		q->error = false;
 		q->st.instr = tmp;
 		return true;
 	}
@@ -711,8 +1156,9 @@ bool bif_sys_call_check_1(query *q)
 	GET_FIRST_ARG(p1,callable);
 
 	if ((is_builtin(p1) && !is_evaluable(p1)
-		&& ((p1->val_off == g_conjunction_s) || (p1->val_off == g_disjunction_s))
-		) || !p1->arity) {
+		&& ((p1->val_off == g_conjunction_s) || (p1->val_off == g_disjunction_s)
+			|| (p1->val_off == g_if_then_s) || (p1->val_off == g_soft_cut_s))
+		) || !get_arity(p1)) {
 		CHECKED(init_tmp_heap(q));
 		p1 = clone_term_to_tmp(q, p1, p1_ctx);
 		CHECKED(p1);
@@ -755,18 +1201,37 @@ bool bif_sys_drop_barrier_1(query *q)
 	GET_FIRST_ARG(p1,integer)
 	q->total_inferences--;
 	drop_barrier(q, get_smalluint(p1));
-
-	if (q->st.cp) {
-		const choice *ch = GET_CURR_CHOICE();
-		q->st.cpu_time = ch->st.cpu_time;
-	}
-
 	return true;
 }
 
 bool bif_sys_fail_on_retry_1(query *q)
 {
-	GET_FIRST_ARG(p1,var);
+	cell *c = q->st.instr + 1;
+	pl_ctx c_ctx = q->st.cur_ctx;
+	unsigned var_num;
+
+	if (is_ref(c)) {
+		c_ctx = c->val_ctx;
+		var_num = c->var_num;
+	} else if (is_var(c)) {
+		var_num = c->var_num;
+	} else {
+		return throw_error(q, c, c_ctx, "type_error", "var");
+	}
+
+	slot *e = get_slot(q, GET_FRAME(c_ctx), var_num);
+	cell *p1 = deref(q, c, c_ctx);
+	pl_ctx p1_ctx = q->latest_ctx;
+
+	if (!is_var(p1)) {
+		if (!is_integer(p1))
+			return throw_error(q, p1, p1_ctx, "type_error", "var");
+		unshare_cell(&e->c);
+		memset(e, 0, sizeof(slot));
+		p1 = &e->c;
+		p1_ctx = c_ctx;
+	}
+
 	cell tmp;
 	make_uint(&tmp, (pl_uint)q->st.cp);
 	CHECKED(push_fail_on_retry_with_barrier(q));
@@ -790,6 +1255,151 @@ bool bif_sys_succeed_on_retry_2(query *q)
 	return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 }
 
+bool bif_sys_jump_1(query *q)
+{
+	GET_FIRST_ARG(p1,integer);
+	q->st.instr += get_smallint(p1);
+	return true;
+}
+
+// member/2 as compile.c emits it, '$member'(X, L, V). V is a hidden variable whose slot holds the rest of the
+// list between retries: it is written without trailing, so backtracking to this choicepoint leaves it be. A list
+// cell is kept by pointer, being on the heap or in a clause, and a string's tail, made in a temporary, by value.
+
+static void member_save(query *q, slot *e, cell *t, pl_ctx t_ctx)
+{
+	unshare_cell(&e->c);
+
+	if (is_var(t)) {
+		make_ref(&e->c, t->var_num, t_ctx);
+	} else if (is_string(t) || !is_compound(t)) {
+		e->c = *t;
+		share_cell(t);
+	} else
+		make_indirect(&e->c, t, t_ctx);
+}
+
+// An unbound tail is the Prolog definition's to extend: call member(X, Tail) in the rest's place.
+
+static bool member_rest(query *q, cell *p1, pl_ctx p1_ctx, cell *t, pl_ctx t_ctx)
+{
+	cell goal;
+	make_instr(&goal, g_member_s, NULL, 2, 0);
+	cell *tmp = prepare_call(q, CALL_NOSKIP, &goal, q->st.cur_ctx, p1->num_cells + t->num_cells + 2);
+	CHECKED(tmp);
+	pl_idx num_cells = 1;
+	num_cells += dup_cells_by_ref(tmp+num_cells, p1, p1_ctx, p1->num_cells);
+	num_cells += dup_cells_by_ref(tmp+num_cells, t, t_ctx, t->num_cells);
+	tmp->num_cells = num_cells;
+	make_call(q, tmp+num_cells);
+	q->st.instr = tmp;
+	return true;
+}
+
+bool bif_sys_member_3(query *q)
+{
+	GET_FIRST_ARG(p1,any);
+	GET_NEXT_ARG(p2,any);
+	GET_NEXT_RAW_ARG(p3,var);
+	slot *e = get_slot(q, GET_FRAME(is_ref(p3) ? p3->val_ctx : p3_ctx), p3->var_num);
+	cell *l = p2;
+	pl_ctx l_ctx = p2_ctx;
+
+	if (q->retry) {
+		if (is_indirect(&e->c)) {
+			l = e->c.val_ptr;
+			l_ctx = e->c.val_ctx;
+		} else {
+			l = deref(q, &e->c, q->st.cur_ctx);
+			l_ctx = q->latest_ctx;
+		}
+	}
+
+	if (is_var(l))
+		return member_rest(q, p1, p1_ctx, l, l_ctx);
+
+	if (!is_list(l))
+		return false;
+
+	PROLOG_LIST_HANDLER(l);
+	cell *h = PROLOG_LIST_HEAD(l);
+	h = deref(q, h, l_ctx);
+	pl_ctx h_ctx = q->latest_ctx;
+	cell *t = PROLOG_LIST_TAIL(l);
+	t = deref(q, t, l_ctx);
+	pl_ctx t_ctx = q->latest_ctx;
+
+	// No choicepoint when nothing can follow, so member(X, [a]) stays deterministic as first-argument indexing has it
+
+	if (is_list(t) || is_var(t)) {
+		member_save(q, e, t, t_ctx);
+		CHECKED(push_choice(q));
+	}
+
+	return unify(q, p1, p1_ctx, h, h_ctx);
+}
+
+bool bif_sys_jump_if_nil_2(query *q)
+{
+	GET_FIRST_ARG(p1,any);
+	GET_NEXT_ARG(p2,integer);
+
+	if (is_nil(p1))
+		q->st.instr += get_smallint(p2);
+
+	return true;
+}
+
+
+static pl_idx restore_streams_walk(query *q, const cell *src, cell *dst)
+{
+	// Engine handles print as '$engine'(N) rather than '$stream'(N), and come back just the same.
+
+	if (is_compound(src) && (get_arity(src) == 1)) {
+		const bool is_engine = !strcmp(C_STR(q, src), "$engine");
+		const cell *arg = src + 1;
+
+		if ((is_engine || !strcmp(C_STR(q, src), "$stream")) && is_smallint(arg)) {
+			make_int(dst, get_smallint(arg));
+			dst->flags |= FLAG_INT_STREAM | (is_engine ? FLAG_INT_ENGINE : 0);
+			return 1;
+		}
+	}
+
+	if (is_compound(src)) {
+		*dst = *src;
+		pl_idx cnt = 1;
+		const cell *p = src + 1;
+
+		for (unsigned i = 0; i < get_arity(src); i++) {
+			cnt += restore_streams_walk(q, p, dst + cnt);
+			p += p->num_cells;
+		}
+
+		dst->num_cells = cnt;
+		return cnt;
+	}
+
+	pl_idx nc = src->num_cells;
+
+	for (pl_idx i = 0; i < nc; i++)
+		dst[i] = src[i];
+
+	return nc;
+}
+
+static void restore_streams(query *q, cell *ball)
+{
+	if (!ball || !is_compound(ball))
+		return;
+
+	cell *buf = TPL_malloc(sizeof(cell) * ball->num_cells);
+	if (!buf) return;
+	pl_idx n = restore_streams_walk(q, ball, buf);
+	memcpy(ball, buf, sizeof(cell) * n);
+	TPL_free(buf);
+}
+
 static cell *parse_to_heap(query *q, const char *src)
 {
 	SB(s);
@@ -801,7 +1411,7 @@ static cell *parse_to_heap(query *q, const char *src)
 	p2->skip = true;
 	p2->srcptr = SB_cstr(s);
 	tokenize(p2, false, false);
-	process_clause(p2->m, p2->cl, NULL);
+	process_clause(p2->m, p2->cl);
 	p2->read_term_slots = 0;
 	SB_free(s);
 
@@ -813,15 +1423,39 @@ static cell *parse_to_heap(query *q, const char *src)
 	}
 
 
-	cell *tmp = clone_term_to_heap(q, p2->cl->cells, q->st.cur_ctx);
+	cell *tmp = alloc_heap(q, p2->cl->cells->num_cells);
 	if (!tmp) return NULL;
+	dup_cells(tmp, p2->cl->cells, p2->cl->cells->num_cells);
 	check_error(tmp, parser_destroy(p2));
 	parser_destroy(p2);
+	restore_streams(q, tmp);
 	return tmp;
 }
 
-static bool find_exception_handler(query *q, char *ball)
+// Non-static so a bif can raise a ball it built itself, rather than one
+// throw_error3() composes from a type/expected pair. bif_dcgs.c needs
+// this to reproduce library/dcgs.pl's [culprit-Term] error context,
+// which is not a Name/Arity context and so cannot come from
+// throw_error3(). Ownership of `ball` stays with the caller.
+
+// Sentinel control-throws ($abort, unwind/1) are always shaped by
+// throw_error3() as error(Sentinel, Context) - never bare. A ball from
+// plain throw/1 (e.g. throw(bar)) has no such guarantee: peeking at
+// ball+1 without first confirming that shape reads whatever heap cell
+// happens to follow a 1-cell ball, which is how issue #1152 turned a
+// deeply nested throw into a bogus "$abort"/"unwind" match.
+
+static bool is_sentinel_control(query *q, cell *ball, const char *name)
 {
+	return is_compound(ball) && (get_arity(ball) == 2)
+		&& !CMP_STRING_TO_CSTR(q, ball, "error")
+		&& !strcmp(C_STR(q, ball+1), name);
+}
+
+bool find_exception_handler(query *q, char *ball)
+{
+	errno = 0;
+
 	while (retry_choice(q)) {
 		const choice *ch = GET_CHOICE(q->st.cp);
 
@@ -832,23 +1466,48 @@ static bool find_exception_handler(query *q, char *ball)
 			continue;
 
 		q->ball = parse_to_heap(q, ball);
-		CHECKED(q->ball);
+
+		// Reparsing the ball needs memory, and the throw that got us
+		// here may itself be the memory error. Failing silently would
+		// turn the exception into a quiet failure, so flag it and let
+		// the toplevel report a memory error, re issue #801.
+
+		if (!q->ball) {
+			q->oom = q->error = true;
+			return false;
+		}
+
 		q->ball_ctx = q->st.cur_ctx;
 
-		if (!strcmp(C_STR(q, q->ball+1), "$abort")) {
+		if (is_sentinel_control(q, q->ball, "$abort")) {
 			break;
-		} else if (!strcmp(C_STR(q, q->ball+1), "unwind")) {
+		} else if (is_sentinel_control(q, q->ball, "unwind")) {
 			q->retry = QUERY_ABORT;
 		} else {
 			q->retry = QUERY_EXCEPTION;
 		}
 
-		if (!bif_iso_catch_3(q)) {
+		// Use the catcher's own builtin (catch/3 or $call_cleanup/3).
+		// Hardcoding bif_iso_catch_3 breaks $call_cleanup's rethrow path.
+
+		builtins *bif = q->st.instr->bif_ptr;
+		bool (*fn)(query *) = (bif && bif->fn) ? bif->fn : bif_iso_catch_3;
+
+		if (!fn(q)) {
 			q->ball = NULL;
 			continue;
 		}
 
 		q->ball = NULL;
+
+		// Phase 2: arm the recover goal. A nested throw during phase 1
+		// may already have done this (retry cleared to QUERY_OK).
+
+		if ((q->retry == QUERY_EXCEPTION) || (q->retry == QUERY_ABORT)) {
+			if (!fn(q))
+				continue;
+		}
+
 		return true;
 	}
 
@@ -856,7 +1515,12 @@ static bool find_exception_handler(query *q, char *ball)
 	pl_ctx e_ctx = q->st.cur_ctx;
 	q->did_unhandled_exception = true;
 
-	if (!strcmp(C_STR(q, e+1), "unwind") || !strcmp(C_STR(q, e+1), "$abort")) {
+	if (!e) {
+		q->oom = q->error = true;
+		return false;
+	}
+
+	if (is_sentinel_control(q, e, "unwind") || is_sentinel_control(q, e, "$abort")) {
 		if (!q->is_thread && !q->is_task)
 			fprintf(stdout, "%% Execution aborted\n");
 
@@ -866,12 +1530,18 @@ static bool find_exception_handler(query *q, char *ball)
 		return false;
 	} else {
 		q->ball = clone_term_to_heap(q, e, e_ctx);
-		CHECKED(q->ball);
+		if (!q->ball)
+			return false;
 		q->ball_ctx = q->st.cur_ctx;
 		rebase_term(q, q->ball, 0, false);
 	}
 
-	if (!q->thread_ptr) {
+	// An engine keeps the ball for engine_next/2 to rethrow in its caller, printing it only if it can't.
+
+	TPL_free(q->engine_ball);
+	q->engine_ball = q->is_engine ? TPL_strdup(ball) : NULL;
+
+	if (!q->thread_ptr && !q->engine_ball) {
 		prolog_lock(q->pl);
 
 		if (!q->is_redo)
@@ -904,7 +1574,16 @@ static bool find_exception_handler(query *q, char *ball)
 
 static bool bif_iso_throw_1(query *q)
 {
-	GET_FIRST_ARG(p1,nonvar);
+	GET_FIRST_ARG(p1,any);
+
+	if (is_var(p1))
+		return throw_error(q, p1, p1_ctx, "instantiation_error", "var");
+
+	// This may be a saved memory error rethrown by call_cleanup/2. More
+	// generally, an explicit throw can itself happen under memory pressure.
+
+	release_oom_reserve(q);
+	q->fullstop = q->nl = false;
 	q->parens = q->numbervars = true;
 	//q->is_dump_vars = true;
 	q->quoted = true;
@@ -918,7 +1597,7 @@ static bool bif_iso_throw_1(query *q)
 	}
 
 	TPL_free(ball);
-	return bif_iso_catch_3(q);
+	return true;
 }
 
 bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const char *expected, cell *goal)
@@ -926,6 +1605,12 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 	if (/*g_tpl_interrupt ||*/ q->halt || q->pl->halt)
 		return false;
 
+	if (q->in_throw) {
+		q->oom = q->error = true;
+		return false;
+	}
+
+	q->in_throw = true;
 	q->did_throw = true;
 	q->quoted = 0;
 
@@ -963,6 +1648,10 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 	if (!c) c = &tmpc;
 	if (!goal) goal = &tmpc;
 
+	// A goal naming nothing took its name from atom index zero, printing dummy/0, re issue #801.
+
+	const bool no_context = is_end(goal) || is_empty(goal);
+
 	if (!is_var(c) || q->cycle_error) {
 		char *tmpbuf = DUP_STRING(q, goal);
 		snprintf(functor, sizeof(functor), "%s", tmpbuf);
@@ -980,7 +1669,9 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 
 	bool is_abolish = false;
 
-	if (!strcmp(C_STR(q, instr), "abolish"))
+	// These take Name/Arity, which their errors report as it is.
+
+	if (!strcmp(C_STR(q, instr), "abolish") || !strcmp(C_STR(q, instr), "thread_local"))
 		is_abolish = true;
 
 	if (!strcmp(C_STR(q, instr), "$call_check"))
@@ -1002,7 +1693,7 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		make_cstring(tmp+num_cells++, err_type);
 		make_cstring(tmp+num_cells, expected);
 	} else if (!strcmp(err_type, "unwind")) {
-		//printf("error(%s(%s),(%s)/%u).\n", err_type, C_STR(q, c), functor, goal->arity);
+		//printf("error(%s(%s),(%s)/%u).\n", err_type, C_STR(q, c), functor, get_arity(goal));
 		tmp = alloc_heap(q, 6+(c->num_cells-1));
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1013,10 +1704,10 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
 	} else if (!strcmp(err_type, "type_error") && !strcmp(expected, "var")) {
 		err_type = "uninstantiation_error";
-		//printf("error(%s(%s),(%s)/%u).\n", err_type, C_STR(q, c), functor, goal->arity);
+		//printf("error(%s(%s),(%s)/%u).\n", err_type, C_STR(q, c), functor, get_arity(goal));
 		tmp = alloc_heap(q, 6+(c->num_cells-1));
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1027,9 +1718,9 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
 	} else if (!strcmp(err_type, "type_error") && !strcmp(expected, "evaluable")) {
-		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, C_STR(q, c), c->arity, functor, goal->arity);
+		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, C_STR(q, c), get_arity(c), functor, get_arity(goal));
 		tmp = alloc_heap(q, 9);
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1040,15 +1731,15 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		tmp[num_cells] = *c;
 		share_cell(c);
-		if (is_callable(c)) { tmp[num_cells].arity = 0; tmp[num_cells].num_cells = 1; CLR_OP(tmp+num_cells); }
+		if (is_callable(c)) { tmp[num_cells].num_cells = 1; CLR_OP(tmp+num_cells); set_arity(&tmp[num_cells], 0); }
 		num_cells++;
-		make_int(tmp+num_cells++, c->arity);
+		make_int(tmp+num_cells++, get_arity(c));
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
-	} else if (!strcmp(err_type, "permission_error") && is_compound(c) && CMP_STRING_TO_CSTR(q, c, "/") && is_var(FIRST_ARG(c))) {
-		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, tmpbuf, c->arity, functor, goal->arity);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
+	} else if (!strcmp(err_type, "permission_error") && is_compound(c) && CMP_STRING_TO_CSTR(q, c, "/") && (c->num_cells > 1) && is_var(FIRST_ARG(c))) {
+		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, tmpbuf, get_arity(c), functor, get_arity(goal));
 		tmp = alloc_heap(q, 9+extra);
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1077,15 +1768,15 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		tmp[num_cells] = *c;
 		share_cell(c);
-		if (is_callable(c)) { tmp[num_cells].arity = 0; tmp[num_cells].num_cells = 1; CLR_OP(tmp+num_cells); }
+		if (is_callable(c)) { tmp[num_cells].num_cells = 1; CLR_OP(tmp+num_cells); set_arity(&tmp[num_cells], 0); }
 		num_cells++;
-		make_int(tmp+num_cells++, c->arity);
+		make_int(tmp+num_cells++, get_arity(c));
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
-	} else if (!strcmp(err_type, "permission_error") && (is_builtin || (is_op && c->arity)) && !is_abolish) {
-		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, tmpbuf, c->arity, functor, goal->arity);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
+	} else if (!strcmp(err_type, "permission_error") && (is_builtin || (is_op && get_arity(c))) && !is_abolish) {
+		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, tmpbuf, get_arity(c), functor, get_arity(goal));
 		tmp = alloc_heap(q, 9+extra);
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1114,15 +1805,15 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		tmp[num_cells] = *c;
 		share_cell(c);
-		if (is_callable(c)) { tmp[num_cells].arity = 0; tmp[num_cells].num_cells = 1; CLR_OP(tmp+num_cells); }
+		if (is_callable(c)) { tmp[num_cells].num_cells = 1; CLR_OP(tmp+num_cells); set_arity(&tmp[num_cells], 0); }
 		num_cells++;
-		make_int(tmp+num_cells++, c->arity);
+		make_int(tmp+num_cells++, get_arity(c));
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
 	} else if (!strcmp(err_type, "instantiation_error")) {
-		//printf("error(%s,(%s)/%u).\n", err_type, functor, goal->arity);
+		//printf("error(%s,(%s)/%u).\n", err_type, functor, get_arity(goal));
 		tmp = alloc_heap(q, 5);
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1131,9 +1822,9 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
 	} else if (!strcmp(err_type, "existence_error") && !strcmp(expected, "procedure") && is_callable(c)) {
-		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, tmpbuf, c->arity, functor, goal->arity);
+		//printf("error(%s(%s,(%s)/%u),(%s)/%u).\n", err_type, expected, tmpbuf, get_arity(c), functor, get_arity(goal));
 		tmp = alloc_heap(q, 9);
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1142,17 +1833,17 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		make_cstring(tmp+num_cells++, expected);
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
-		make_cstring(tmp+num_cells++, C_STR(q, c));
-		make_int(tmp+num_cells++, c->arity);
+		make_atom(tmp+num_cells++, new_atom(q->pl, C_STR(q, c)));
+		make_int(tmp+num_cells++, get_arity(c));
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
 	} else if (!strcmp(err_type, "representation_error")
 		|| !strcmp(err_type, "evaluation_error")
 		|| !strcmp(err_type, "syntax_error")
 		|| !strcmp(err_type, "resource_error")) {
-		//printf("error(%s(%s),(%s)/%u).\n", err_type, expected, functor, goal->arity);
+		//printf("error(%s(%s),(%s)/%u).\n", err_type, expected, functor, get_arity(goal));
 		tmp = alloc_heap(q, 6);
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1162,9 +1853,9 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
 	} else {
-		//printf("error(%s(%s,(%s)),(%s)/%u).\n", err_type, expected, C_STR(q, c), functor, goal->arity);
+		//printf("error(%s(%s,(%s)),(%s)/%u).\n", err_type, expected, C_STR(q, c), functor, get_arity(goal));
 		tmp = alloc_heap(q, 7+(c->num_cells-1)+extra);
 		CHECKED(tmp);
 		pl_idx num_cells = 0;
@@ -1193,9 +1884,30 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 		make_instr(tmp+num_cells, g_slash_s, NULL, 2, 2);
 		SET_OP(tmp+num_cells, OP_YFX); num_cells++;
 		make_atom(tmp+num_cells++, new_atom(q->pl, functor));
-		make_int(tmp+num_cells, !is_string(goal)?goal->arity:0);
+		make_int(tmp+num_cells, !is_string(goal)?get_arity(goal):0);
 	}
 
+	// Every branch that names a culprit ends with the '/' instr and its two args; swap them for a var.
+
+	if (no_context && (tmp->num_cells > 2)) {
+		cell *culprit = tmp + tmp->num_cells - 3;
+
+		if (is_compound(culprit) && (culprit->val_off == g_slash_s)
+			&& (get_arity(culprit) == 2)) {
+			// A fresh slot: var zero would print the frame's first binding, and failing must not corrupt the term.
+
+			int var_num = create_vars(q, 1);
+
+			if (var_num >= 0) {
+				make_ref(culprit, var_num, q->st.cur_ctx);
+				tmp->num_cells -= 2;
+			}
+		}
+	}
+
+	// See bif_iso_throw_1: clear leftover portray_clause fullstop/nl so the
+	// ball is a single term, not "error(...).\n." (#948).
+	q->fullstop = q->nl = false;
 	q->parens = q->numbervars = true;
 	q->quoted = true;
 	char *ball = print_term_to_strbuf(q, tmp, c_ctx, 1);
@@ -1203,10 +1915,12 @@ bool throw_error3(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 
 	if (find_exception_handler(q, ball)) {
 		TPL_free(ball);
-		return bif_iso_catch_3(q);
+		q->in_throw = false;
+		return true;
 	}
 
 	TPL_free(ball);
+	q->in_throw = false;
 	return false;
 }
 
@@ -1214,7 +1928,7 @@ bool throw_error2(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const c
 {
 	cell tmp;
 	tmp = goal[1];
-	tmp.arity = get_smallint(&goal[2]);
+	set_arity(&tmp, get_smallint(&goal[2]));
 	return throw_error3(q, c, c_ctx, err_type, expected, &tmp);
 }
 
@@ -1222,6 +1936,33 @@ bool throw_error(query *q, cell *c, pl_ctx c_ctx, const char *err_type, const ch
 {
 	if ((q->st.m->flags.syntax_error == UNK_FAIL) && !strcmp(err_type, "syntax_error"))
 		return false;
+
+	bool is_memory_error = !strcmp(err_type, "resource_error")
+		&& expected && !strcmp(expected, "memory");
+
+	// Exception handling prints and reparses the ball after unwinding to
+	// the catcher. Release the query's emergency reserve before doing
+	// any of that work; push_catcher() rearms it after recovery is ready.
+
+	if (is_memory_error)
+		release_oom_reserve(q);
+
+	// An allocation failure becomes a catchable ball HERE, and from here
+	// on the ordinary exception machinery owns it - so drop q->oom now.
+	//
+	// The catchers used to clear it instead, unconditionally. That let
+	// catch/3 recover (issue #1094) but it also cleared an oom that had
+	// NOT been turned into a ball: the failed alloc_grow() returned 0, so
+	// the array never grew, and execution simply carried on over an
+	// undersized stack. Clearing at the throw keeps #1094 working while
+	// leaving a genuinely unhandled OOM set, so the query loop still
+	// hard-stops on it.
+	//
+	// If throw_error3()'s own allocations fail below, oom is set again -
+	// which is right: that one really is unrecoverable.
+
+	if (is_memory_error)
+		q->oom = false;
 
 	q->max_depth = 10;
 	return throw_error3(q, c, c_ctx, err_type, expected, q->st.instr);
@@ -1262,12 +2003,15 @@ builtins g_control_bifs[] =
 	{"*->", 2, bif_soft_if_then_2, ":callable,:callable", false, false, BLAH},
 	{"if", 3, bif_if_3, ":callable,:callable,:callable", false, false, BLAH},
 	{"ignore", 1, bif_ignore_1, ":callable", false, false, BLAH},
+	{"forall", 2, bif_forall_2, ":callable,:callable", false, false, BLAH},
 	{"reset", 3, bif_reset_3, ":callable,?term,-term", false, false, BLAH},
 	{"shift", 1, bif_shift_1, "+term", false, false, BLAH},
 	{"abort", 0, bif_abort_0, NULL, false, false, BLAH},
 
 	{"$cut", 1, bif_sys_cut_1, "+integer", false, false, BLAH},
 	{"$block_catcher", 1, bif_sys_block_catcher_1, NULL, false, false, BLAH},
+	{"$catch", 5, bif_sys_catch_3, NULL, false, false, BLAH},
+	{"$catch_exit", 1, bif_sys_catch_exit_1, NULL, false, false, BLAH},
 	{"$set_if_var", 2, bif_sys_set_if_var_2, "?term,+term", false, false, BLAH},
 	{"$cleanup_if_det", 1, bif_sys_cleanup_if_det_1, NULL, false, false, BLAH},
 	{"$call_check", 1, bif_sys_call_check_1, "+callable", false, false, BLAH},
@@ -1278,6 +2022,12 @@ builtins g_control_bifs[] =
 	{"$fail_on_retry", 1, bif_sys_fail_on_retry_1, "-integer", false, false, BLAH},
 	{"$succeed_on_retry", 1, bif_sys_succeed_on_retry_1, "+integer", false, false, BLAH},
 	{"$succeed_on_retry", 2, bif_sys_succeed_on_retry_2, "-integer,+integer", false, false, BLAH},
+	{"$fail_on_retry", 3, bif_sys_fail_on_retry_1, NULL, false, false, BLAH},
+	{"$succeed_on_retry", 3, bif_sys_succeed_on_retry_1, NULL, false, false, BLAH},
+	{"$succeed_on_retry", 4, bif_sys_succeed_on_retry_2, NULL, false, false, BLAH},
+	{"$jump", 1, bif_sys_jump_1, NULL, false, false, BLAH},
+	{"$jump_if_nil", 2, bif_sys_jump_if_nil_2, "+term,+integer", false, false, BLAH},
+	{"$member", 3, bif_sys_member_3, "?term,?term,-var", false, false, BLAH},
 	{"$abort", 0, bif_sys_abort_0, NULL, false, false, BLAH},
 
 	{0}

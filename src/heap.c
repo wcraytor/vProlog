@@ -15,13 +15,29 @@ size_t alloc_grow(query *q, void **addr, size_t elem_size, size_t min_elements, 
 	if (min_elements > max_elements)
 		max_elements = min_elements;
 
+	// Cap single allocations when memory limiting is enabled (8GB).
+	// If only the optimistic max overshoots (e.g. check_slot's num*3/2),
+	// clamp to the largest fitting size instead of failing when min fits.
+	const uint64_t limit_bytes = 1024ULL * 1024ULL * 1024ULL * 8ULL;
+	const size_t effective_limit = limit_bytes > SIZE_MAX ? SIZE_MAX : (size_t)limit_bytes;
+
+	if (q->pl->limit && elem_size) {
+		size_t capped = effective_limit / elem_size;
+
+		if (max_elements > capped) {
+			if (capped < min_elements) {
+				q->oom = true;
+				return 0;
+			}
+
+			max_elements = capped;
+		}
+	}
+
 	size_t elements = max_elements;
 	void *mem = NULL;
 
 	do {
-		if (q->pl->limit && (elem_size * elements) > (1024LL*1024*1024*4))
-			break;
-
 		mem = TPL_realloc(*addr, elem_size * elements);
 		if (mem) break;
 		elements = min_elements + (elements - min_elements) / 2;
@@ -67,19 +83,184 @@ cell *alloc_tmp(query *q, unsigned num_cells)
 	return c;
 }
 
+static inline bool ref_is_live(const query *q, const cell *c)
+{
+	if (c->val_ctx >= q->st.fp)
+		return false;
+
+	const frame *f = GET_FRAME(c->val_ctx);
+	return c->var_num < f->actual_slots;
+}
+
 #define deep_copy(c) \
-	(!q->noderef || (is_ref(c) && (c->val_ctx <= q->st.cur_ctx) && !is_anon(c)))
+ (!q->noderef || (is_ref(c) && (c->val_ctx <= q->st.cur_ctx) && ref_is_live(q, c) && !is_anon(c)))
+
+// The slot a variable ultimately names, following the chain of refs the
+// way deref() does.
+
+static slot *ultimate_slot(const query *q, const cell *c, pl_ctx c_ctx)
+{
+	if (is_ref(c))
+		c_ctx = c->val_ctx;
+
+	const frame *f = GET_FRAME(c_ctx);
+	slot *e = get_slot(q, f, c->var_num);
+
+	while (is_var(&e->c)) {
+		c_ctx = e->c.val_ctx;
+		c = &e->c;
+
+		if (is_ref(c))
+			c_ctx = c->val_ctx;
+
+		f = GET_FRAME(c_ctx);
+		slot *e2 = get_slot(q, f, c->var_num);
+
+		if (e == e2)
+			break;
+
+		e = e2;
+	}
+
+	return e;
+}
+
+// Whether a variable in the term being copied denotes the same thing as
+// the variable copy_term/2 is replacing, so that a reference back to it
+// becomes the target variable instead of a newly invented one.
+//
+// Comparing var_num and context is not enough, and neither is comparing
+// slots. Given
+//
+//     cyclic(X) :- X = f(g(X,_),_).
+//     wrap(X, Y) :- copy_term(X, Y).
+//
+// the back-reference inside the term names the slot of whoever built it
+// (cyclic/1's X), while copy_term/2 is handed the term through another
+// slot again (wrap/2's X), arguments being passed by value. All three
+// name the same term, which is what makes the reference a cycle, so a
+// bound variable is compared by the term it denotes. Getting this wrong
+// left copy_term/2 with nothing to replace, and it then invented a
+// variable for the back-reference: an acyclic unrolling of a cyclic
+// term, with one variable too many (#1002).
+//
+// A term is a cell together with a context, and both halves have to
+// match: activations of a recursive clause share its cells and are told
+// apart only by their context.
+
+static bool denotes_same(query *q, cell *c, pl_ctx c_ctx, const cell *from_val, pl_ctx from_val_ctx, const slot *from_e)
+{
+	if (!from_val)
+		return ultimate_slot(q, c, c_ctx) == from_e;
+
+	const pl_ctx save_latest_ctx = q->latest_ctx;
+	const cell *val = deref(q, c, c_ctx);
+	const pl_ctx val_ctx = q->latest_ctx;
+	q->latest_ctx = save_latest_ctx;
+	return (val == from_val) && (val_ctx == from_val_ctx);
+}
+
+// Whether a dereferenced argument is a reference back to the whole term
+// being copied. Only the raw argument tells us: dereferencing it lands
+// on the term itself, and it is the variable that named it which has to
+// be kept, for copy_vars() to turn into the target variable. Descending
+// instead copies one level of the cycle before catching it, so that each
+// copy of a cyclic term came out larger than the last.
+//
+// The context matters as much as the cell: the arguments of a recursive
+// clause's head are the same cells at every depth, and comparing cells
+// alone takes the deeper one for the term the copy started from.
+//
+// Callers test the raw argument for being a variable first: that cell has
+// just been read, whereas this walks off into the query.
+
+static bool cycles_back(const query *q, const cell *c, pl_ctx c_ctx)
+{
+	return q->clone_root && (c == q->clone_root) && (c_ctx == q->clone_root_ctx);
+}
+
+// A variable as a map key. Its frame and slot must not share bits, or two variables become one, as ctx*100+var_num
+// once made a frame's hundredth variable the next frame's first. A 64-bit pointer holds the pair; a 32-bit one points at it.
+
+static const void *var_key(uint64_t *buf, pl_ctx ctx, unsigned var_num)
+{
+	*buf = ((uint64_t)ctx << 32) | var_num;
+#if SIZE_MAX > UINT32_MAX
+	return (const void*)(size_t)*buf;
+#else
+	return buf;
+#endif
+}
+
+#if SIZE_MAX > UINT32_MAX
+static skiplist *var_map_create(void)
+{
+	return sl_create(NULL, NULL, NULL);
+}
+
+static bool var_map_app(skiplist *m, const void *k, const void *v)
+{
+	return sl_app(m, k, v);
+}
+#else
+static int var_key_cmp(const void *k1, const void *k2, const void *p, void *l)
+{
+	(void)p; (void)l;
+	const uint64_t a = *(const uint64_t*)k1, b = *(const uint64_t*)k2;
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static void var_key_del(void *k, void *v, const void *p)
+{
+	(void)v; (void)p;
+	TPL_free(k);
+}
+
+static skiplist *var_map_create(void)
+{
+	return sl_create(var_key_cmp, var_key_del, NULL);
+}
+
+static bool var_map_app(skiplist *m, const void *k, const void *v)
+{
+	uint64_t *copy = TPL_malloc(sizeof(uint64_t));
+
+	if (!copy)
+		return false;
+
+	*copy = *(const uint64_t*)k;
+
+	if (sl_app(m, copy, v))
+		return true;
+
+	TPL_free(copy);
+	return false;
+}
+#endif
+
+static void record_clone_def(query *q, pl_ctx ctx, unsigned var_num, pl_idx tmp_offset);
 
 // Note: convert vars to refs
 // Note: doesn't increment ref counts
 
+// Used by clone_term_to_tmp_internal() to walk plain (non-list) compound
+// terms iteratively instead of recursing, one frame per unfinished compound.
+// 'e'/'save_vgen' belong to the *parent* argument slot that caused us to
+// descend into this node, and are restored once this node (and everything
+// beneath it) has been fully cloned - i.e. at the point the recursive call
+// would otherwise have returned.
+
+typedef struct { lnode hdr; cell *p1; pl_ctx p1_ctx; uint32_t arity; pl_idx save_idx; unsigned depth; slot *e; uint32_t save_vgen; } snode;
+
 static cell *clone_term_to_tmp_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
 {
+#if 0
 	if (depth >= g_max_depth) {
 		printf("*** OOPS %s %d\n", __FILE__, __LINE__);
 		q->cycle_error = true;
 		return NULL;
 	}
+#endif
 
 	pl_idx save_idx = tmp_heap_used(q);
 	cell *tmp = alloc_tmp(q, 1);
@@ -108,11 +289,18 @@ static cell *clone_term_to_tmp_internal(query *q, cell *p1, pl_ctx p1_ctx, unsig
 			pl_ctx h_ctx = p1_ctx;
 			uint32_t save_vgen = 0;
 			int both = 0;
-			if (deep_copy(h)) DEREF_CHECKED(any1, both, save_vgen, e, e->vgen, h, h_ctx, q->vgen);
-			if (both) q->cycle_error = true;
+			if (deep_copy(h)) DEREF_CHECKED(any1, both, save_vgen, e, h, h_ctx, q->vgen);
+			if (both) q->cycle_error = q->cycle_dropped = true;
+
+			if (is_var(p1 + 1) && cycles_back(q, h, h_ctx)) {
+				h = p1 + 1;
+				h_ctx = p1_ctx;
+				q->cycle_error = true;
+			}
+
 			cell *rec = clone_term_to_tmp_internal(q, h, h_ctx, depth+1);
 			if (!rec) return NULL;
-			if (e) e->vgen = save_vgen;
+			if (e) set_vgen(q, e, save_vgen);
 
 			p1 = p1 + 1; p1 += p1->num_cells;
 			cell *t = p1;
@@ -124,10 +312,25 @@ static cell *clone_term_to_tmp_internal(query *q, cell *p1, pl_ctx p1_ctx, unsig
 			}
 
 			both = 0;
-			if (deep_copy(t)) DEREF_CHECKED(any2, both, save_vgen, e, e->vgen, t, t_ctx, q->vgen);
+			bool t_was_var = is_var(t);
+			unsigned t_var_num = t_was_var ? t->var_num : 0;
+			pl_ctx t_owning_ctx = t_was_var ? (is_ref(t) ? t->val_ctx : t_ctx) : 0;
+			if (deep_copy(t)) DEREF_CHECKED(any2, both, save_vgen, e, t, t_ctx, q->vgen);
+
+			// Slot is about to be flattened in for the first time: remember
+			// where, so a later back-edge to it (issue #1121) has something
+			// to bind to instead of coming out dangling.
+			if (q->close_cycles && t_was_var && !both && is_compound(t))
+				record_clone_def(q, t_owning_ctx, t_var_num, tmp_heap_used(q));
 
 			if (both)
+				q->cycle_error = q->cycle_dropped = true;
+
+			if (is_var(p1) && cycles_back(q, t, t_ctx)) {
+				t = p1;
+				t_ctx = p1_ctx;
 				q->cycle_error = true;
+			}
 
 			p1 = t;
 			p1_ctx = t_ctx;
@@ -163,35 +366,156 @@ static cell *clone_term_to_tmp_internal(query *q, cell *p1, pl_ctx p1_ctx, unsig
 		return tmp;
 	}
 
-	int arity = p1->arity;
-	p1++;
+	// Transform recursion into stack iteration (as in terms.c)...
 
-	while (arity--) {
+	list stack = {0};
+	snode *n = TPL_malloc(sizeof(snode));
+	if (!n) return NULL;
+	n->arity = get_arity(p1);
+	n->p1 = p1 + 1;
+	n->p1_ctx = p1_ctx;
+	n->save_idx = save_idx;
+	n->depth = depth;
+	n->e = NULL;
+	n->save_vgen = 0;
+	list_push_back(&stack, n);
+
+	cell *result = NULL;
+
+	while ((n = (snode*)list_back(&stack)) != NULL) {
+		if (!n->arity) {
+			// This node's arguments are all done, so finalize it. This is
+			// the point at which a recursive call would have returned.
+			tmp = get_tmp_heap(q, n->save_idx);
+			tmp->num_cells = tmp_heap_used(q) - n->save_idx;
+
+			if (!q->has_vars)
+				tmp->flags |= FLAG_INTERNED_GROUND;
+
+			result = tmp;
+			slot *pending_e = n->e;
+			uint32_t pending_vgen = n->save_vgen;
+
+			list_pop_back(&stack);
+			TPL_free(n);
+
+			if (pending_e)
+				set_vgen(q, pending_e, pending_vgen);
+
+			continue;
+		}
+
+		n->arity--;
 		slot *e = NULL;
-		cell *c = p1;
-		pl_ctx c_ctx = p1_ctx;
+		cell *c = n->p1;
+		pl_ctx c_ctx = n->p1_ctx;
 		uint32_t save_vgen = 0;
 		bool any = false;
 		int both = 0;
-		if (deep_copy(c)) DEREF_CHECKED(any, both, save_vgen, e, e->vgen, c, c_ctx, q->vgen);
-		if (both) q->cycle_error = true;
-		cell *rec = clone_term_to_tmp_internal(q, c, c_ctx, depth+1);
-		if (!rec) return NULL;
-		if (e) e->vgen = save_vgen;
-		p1 += p1->num_cells;
+		if (deep_copy(c)) DEREF_CHECKED(any, both, save_vgen, e, c, c_ctx, q->vgen);
+		if (both) q->cycle_error = q->cycle_dropped = true;
+
+		if (is_var(n->p1) && cycles_back(q, c, c_ctx)) {
+			c = n->p1;
+			c_ctx = n->p1_ctx;
+			q->cycle_error = true;
+		}
+
+		n->p1 += n->p1->num_cells;
+
+		if (is_compound(c) && !is_iso_list(c)) {
+			// Instead of recursing, push a new frame and keep iterating.
+			// The (e, save_vgen) pair travels with the child frame and is
+			// restored once the child (its whole subtree) is finished.
+			pl_idx child_idx = tmp_heap_used(q);
+			cell *child = alloc_tmp(q, 1);
+
+			if (!child) {
+				while ((n = (snode*)list_pop_back(&stack)) != NULL)
+					TPL_free(n);
+
+				return NULL;
+			}
+
+			copy_cells(child, c, 1);
+
+			snode *cn = TPL_malloc(sizeof(snode));
+
+			if (!cn) {
+				while ((n = (snode*)list_pop_back(&stack)) != NULL)
+					TPL_free(n);
+
+				return NULL;
+			}
+
+			cn->arity = get_arity(c);
+			cn->p1 = c + 1;
+			cn->p1_ctx = c_ctx;
+			cn->save_idx = child_idx;
+			cn->depth = n->depth + 1;
+			cn->e = e;
+			cn->save_vgen = save_vgen;
+			list_push_back(&stack, cn);
+		} else {
+			// Atoms, variables and lists still recurse (lists have their
+			// own cycle-aware traversal above, and atoms/variables only
+			// ever recurse one level deep).
+			cell *rec = clone_term_to_tmp_internal(q, c, c_ctx, n->depth+1);
+
+			if (!rec) {
+				while ((n = (snode*)list_pop_back(&stack)) != NULL)
+					TPL_free(n);
+
+				return NULL;
+			}
+
+			if (e) set_vgen(q, e, save_vgen);
+		}
 	}
 
-	tmp = get_tmp_heap(q, save_idx);
-	tmp->num_cells = tmp_heap_used(q) - save_idx;
+	return result;
+}
 
-	if (!q->has_vars)
-		tmp->flags |= FLAG_INTERNED_GROUND;
+// A slice points into a stream's mmap, which goes when the query does, so a
+// term that is to outlive the query - asserted, put on the blackboard, tabled,
+// sent to a task - is given bytes of its own on the way in. An owned string is
+// measured in 32 bits, so one too large to have an owned form is refused here
+// rather than quietly cut down to one: checked first, so a refusal leaves the
+// cells as they were.
 
-	return tmp;
+bool unslice_cells(cell *c, pl_idx num_cells)
+{
+	cell *p = c;
+
+	for (pl_idx i = 0; i < num_cells; i++, p++) {
+		if (is_slice(p) && (p->str_len > UINT32_MAX))
+			return false;
+	}
+
+	for (pl_idx i = 0; i < num_cells; i++, c++) {
+		if (!is_slice(c))
+			continue;
+
+		cell tmp;
+		unsigned arity = get_arity(c);
+
+		if (is_string(c))
+			make_stringn(&tmp, c->val_str, c->str_len);
+		else
+			make_cstringn(&tmp, c->val_str, c->str_len);
+
+		tmp.flags |= c->flags & (FLAG_CSTR_CODES | FLAG_CSTR_BYTES);
+		tmp.num_cells = c->num_cells;
+		set_arity(&tmp, arity);
+		*c = tmp;
+	}
+
+	return true;
 }
 
 cell *clone_term_to_tmp(query *q, cell *p1, pl_ctx p1_ctx)
 {
+	q->cycle_dropped = false;
 	if (++q->vgen == 0) q->vgen = 1;
 	q->has_vars = false;
 	cell *rec = clone_term_to_tmp_internal(q, p1, p1_ctx, 0);
@@ -207,17 +531,35 @@ cell *append_to_tmp(query *q, cell *p1, pl_ctx p1_ctx)
 	return tmp;
 }
 
-static int accum_slot(query *q, size_t slot_nbr, unsigned var_num)
-{
-	const void *vnbr;
+// close_cycles only (see internal.h): first-write-wins, so a slot keeps
+// the offset of its own definition rather than some later revisit of it.
 
-	if (q->vars && sl_get(q->vars, (void*)slot_nbr, &vnbr))
+static void record_clone_def(query *q, pl_ctx ctx, unsigned var_num, pl_idx tmp_offset)
+{
+	uint64_t buf;
+	const void *k = var_key(&buf, ctx, var_num), *v;
+
+	if (q->clone_defs && sl_get(q->clone_defs, k, &v))
+		return;
+
+	if (!q->clone_defs)
+		q->clone_defs = var_map_create();
+
+	var_map_app(q->clone_defs, k, (void*)(size_t)tmp_offset);
+}
+
+static int accum_slot(query *q, pl_ctx ctx, unsigned var_num, unsigned new_var_num)
+{
+	uint64_t buf;
+	const void *k = var_key(&buf, ctx, var_num), *vnbr;
+
+	if (q->vars && sl_get(q->vars, k, &vnbr))
 		return (unsigned)(size_t)vnbr;
 
 	if (!q->vars)
-		q->vars = sl_create(NULL, NULL, NULL);
+		q->vars = var_map_create();
 
-	sl_app(q->vars, (void*)slot_nbr, (void*)(size_t)var_num);
+	var_map_app(q->vars, k, (void*)(size_t)new_var_num);
 	return -1;
 }
 
@@ -225,24 +567,70 @@ static bool copy_vars(query *q, cell *c, bool copy_attrs, cell *from, pl_ctx fro
 {
 	unsigned num_cells = c->num_cells;
 	unsigned cnt = 0;
+	const slot *from_e = NULL;			// the slot 'from' names
+	cell *from_val = NULL;				// the term it denotes, if bound
+	pl_ctx from_val_ctx = 0;
+
+	if (from) {
+		const pl_ctx save_latest_ctx = q->latest_ctx;
+		from_val = deref(q, from, from_ctx);
+		from_val_ctx = q->latest_ctx;
+		q->latest_ctx = save_latest_ctx;
+		from_e = ultimate_slot(q, from, from_ctx);
+
+		if (is_var(from_val))
+			from_val = NULL;
+	}
 
 	for (unsigned i = 0; i < num_cells; i++, c++) {
 		if (!is_ref(c))
 			continue;
 
-		c->flags |= FLAG_VAR_LOCAL;
+		// NB. do not stamp FLAG_VAR_LOCAL here: unify_var()'s occurs-check
+		// gate reads it to skip the cyclic-term scan, and this loop runs
+		// on every var copy_term produces, so it was silently disabling
+		// occurs-check on any goal run via copy_term (e.g. quads'
+		// call_nth), re issue #1135.
 
-		if (from && (c->var_num == from->var_num) && (c->val_ctx == from_ctx)) {
+		if (from && denotes_same(q, c, c->val_ctx, from_val, from_val_ctx, from_e)) {
 			c->var_num = to->var_num;
 			c->val_ctx = to_ctx;
+
+			// BUGFIX: the replacement fast-path must still carry over
+			// attributes from the source variable onto the target.
+
+			if (copy_attrs && !c->tmp_attrs) {
+				cell *attrs = from_e->c.val_attrs;
+
+				if (attrs) {
+					cell *save_tmp_heap = q->tmp_heap;
+					pl_idx save_tmp_hp = q->tmphp;
+					pl_idx save_tmph_size = q->tmph_size;
+					q->tmp_heap = NULL;
+					c->tmp_attrs = copy_term_to_heap(q, attrs, q->st.cur_ctx, false);
+					TPL_free(q->tmp_heap);
+					q->tmp_heap = save_tmp_heap;
+					q->tmphp = save_tmp_hp;
+					q->tmph_size = save_tmph_size;
+					CHECKED(c->tmp_attrs);
+				}
+			}
 		} else {
 			const frame *f = GET_FRAME(c->val_ctx);
-			const slot *e = get_slot(q, f, c->var_num);
-			cell *attrs = copy_attrs && c->tmp_attrs ? c->tmp_attrs : e->c.val_attrs;
-			const size_t slot_nbr = get_ordered_slot_num(q, f, c->var_num);
+			// NB. The key is pure arithmetic (no deref), so it is safe
+			// even when c->val_ctx names a long-dead frame, as happens
+			// when rebasing an imported (detached) term image. Only
+			// consult the slot itself when attributes are wanted:
+			// dereferencing a dead frame's slot is undefined.
+			cell *attrs = NULL;
+
+			if (copy_attrs) {
+				const slot *e = get_slot(q, f, c->var_num);
+				attrs = c->tmp_attrs ? c->tmp_attrs : e->c.val_attrs;
+			}
 			int var_num;
 
-			if ((var_num = accum_slot(q, slot_nbr, q->varno)) == -1) {
+			if ((var_num = accum_slot(q, c->val_ctx, c->var_num, q->varno)) == -1) {
 				var_num = q->varno++;
 				cnt++;
 
@@ -261,19 +649,20 @@ static bool copy_vars(query *q, cell *c, bool copy_attrs, cell *from, pl_ctx fro
 			if (copy_attrs && attrs) {
 				cell *save_tmp_heap = q->tmp_heap;
 				pl_idx save_tmp_hp = q->tmphp;
+				pl_idx save_tmph_size = q->tmph_size;
 				q->tmp_heap = NULL;
 
 				if (!c->tmp_attrs) {
-					cell *tmp =
+					c->tmp_attrs =
 						from ?copy_term_to_heap_with_replacement(q, attrs, q->st.cur_ctx, false, from, from_ctx, to, to_ctx)
 						:copy_term_to_heap(q, attrs, q->st.cur_ctx, false);
-					CHECKED(tmp);
-					c->tmp_attrs = tmp;
 				}
 
 				TPL_free(q->tmp_heap);
 				q->tmp_heap = save_tmp_heap;
 				q->tmphp = save_tmp_hp;
+				q->tmph_size = save_tmph_size;
+				CHECKED(c->tmp_attrs);
 			}
 		}
 	}
@@ -318,7 +707,20 @@ static cell *copy_term_to_tmp_with_replacement(query *q, cell *p1, pl_ctx p1_ctx
 {
 	cell *c = deref(q, p1, p1_ctx);
 	pl_ctx c_ctx = q->latest_ctx;
+
+	// Have the walk stop at references back to the whole term, but only
+	// when there is a target variable for such a reference to become:
+	// without one it has to be a newly invented variable wherever the
+	// cycle is caught, and catching it later at least keeps a level of
+	// the structure.
+
+	cell *save_root = q->clone_root;
+	pl_ctx save_root_ctx = q->clone_root_ctx;
+	q->clone_root = (from && to && is_compound(c)) ? c : NULL;
+	q->clone_root_ctx = c_ctx;
 	cell *tmp = clone_term_to_tmp(q, c, c_ctx);
+	q->clone_root = save_root;
+	q->clone_root_ctx = save_root_ctx;
 
 	if (!tmp)
 		return NULL;
@@ -334,7 +736,10 @@ static cell *copy_term_to_tmp_with_replacement(query *q, cell *p1, pl_ctx p1_ctx
 
 	bool ok = copy_vars(q, tmp, copy_attrs, from, from_ctx, to, to_ctx);
 
-	if (created) {
+	// close_cycles needs q->vars alive a bit longer, to resolve interior
+	// back-edges once the heap copy exists - see close_clone_cycles().
+
+	if (created && !q->close_cycles) {
 		if (q->vars)
 			sl_destroy(q->vars);
 
@@ -348,8 +753,10 @@ static cell *copy_term_to_tmp_with_replacement(query *q, cell *p1, pl_ctx p1_ctx
 			const frame *f = GET_FRAME(c->val_ctx);
 			slot *e = get_slot(q, f, c->var_num);
 			e->c.val_attrs = c->tmp_attrs;
+			q->attrs_used = true;
 			c->tmp_attrs = NULL;
-			add_trail(q, c->val_ctx, c->var_num, NULL);
+			if (!add_trail(q, c->val_ctx, c->var_num, NULL))
+				return NULL;
 		}
 	}
 
@@ -374,13 +781,19 @@ cell *alloc_heap(query *q, unsigned num_cells)
 		a->cells = TPL_calloc(a->page_size=n, sizeof(cell));
 		if (!a->cells) { TPL_free(a); return NULL; }
 		a->num = q->st.hp_num++;
+		a->base = a->next ? a->next->base + a->next->idx : 0;
 		q->heap_pages = a;
 		q->st.hp = 0;
+		check_stack_limit(q);
 	}
 
 	cell *c = q->heap_pages->cells + q->st.hp;
 	q->st.hp += num_cells;
 	q->heap_pages->idx = q->st.hp;
+
+	if ((q->heap_pages->base + q->st.hp) > q->hw_heap)
+		q->hw_heap = q->heap_pages->base + q->st.hp;
+
 	return c;
 }
 
@@ -412,6 +825,88 @@ void trim_heap(query *q)
 	}
 }
 
+// Would trim_heap() back to frame f's heap mark take c? Reusing f for a tail call does that.
+
+bool is_heap_since(const query *q, const frame *f, const cell *c)
+{
+	const page *a = q->heap_pages;
+
+	for (; a && (a->num > f->hp_num); a = a->next) {
+		if ((c >= a->cells) && (c < (a->cells + a->idx)))
+			return true;
+	}
+
+	return a && (c >= (a->cells + f->hp)) && (c < (a->cells + a->idx));
+}
+
+// Is c anywhere in the heap's pages? A term that isn't, such as a clause's own, no trim can take.
+
+bool is_on_heap(const query *q, const cell *c)
+{
+	for (const page *a = q->heap_pages; a; a = a->next) {
+		if ((c >= a->cells) && (c < (a->cells + a->page_size)))
+			return true;
+	}
+
+	return false;
+}
+
+// Cleans up q->clone_defs/q->vars when a close_cycles copy bails out
+// (e.g. OOM) before close_clone_cycles() gets to run them.
+
+void abandon_clone_cycles(query *q)
+{
+	if (q->clone_defs) {
+		sl_destroy(q->clone_defs);
+		q->clone_defs = NULL;
+	}
+
+	if (q->vars) {
+		sl_destroy(q->vars);
+		q->vars = NULL;
+	}
+}
+
+// close_cycles only: bind each fresh var created for an interior back-edge
+// (record_clone_def) to where its slot's value landed in the heap copy.
+
+static void close_clone_cycles(query *q, cell *tmp2)
+{
+	if (!q->close_cycles)
+		return;
+
+	if (q->clone_defs) {
+		sliter *iter = sl_first(q->clone_defs);
+		void *offset_v;
+
+		while (sl_next(iter, &offset_v)) {
+			const void *var_v;
+
+			if (!q->vars || !sl_get(q->vars, sl_key(iter), &var_v))
+				continue;
+
+			unsigned var_num = (unsigned)(size_t)var_v;
+			const frame *f = GET_FRAME(q->st.cur_ctx);
+			slot *e = get_slot(q, f, var_num);
+			make_indirect(&e->c, tmp2 + (pl_idx)(size_t)offset_v, q->st.cur_ctx);
+			add_trail(q, q->st.cur_ctx, var_num, NULL);
+		}
+
+		// Every other sl_first() in the tree is paired with sl_done() to
+		// return the iterator to the skiplist's pool; this was the one
+		// site that dropped it instead, leaking sizeof(sliter) on every
+		// copy_term/2 (etc.) of a term with an interior cycle.
+		sl_done(iter);
+		sl_destroy(q->clone_defs);
+		q->clone_defs = NULL;
+	}
+
+	if (q->vars) {
+		sl_destroy(q->vars);
+		q->vars = NULL;
+	}
+}
+
 cell *clone_term_to_heap(query *q, cell *p1, pl_ctx p1_ctx)
 {
 	if (!init_tmp_heap(q))
@@ -436,6 +931,7 @@ cell *copy_term_to_heap_with_replacement(query *q, cell *p1, pl_ctx p1_ctx, bool
 	cell *tmp2 = alloc_heap(q, tmp->num_cells);
 	if (!tmp2) return NULL;
 	dup_cells(tmp2, tmp, tmp->num_cells);
+	close_clone_cycles(q, tmp2);
 
 	if (!copy_attrs)
 		return tmp2;
@@ -447,6 +943,7 @@ cell *copy_term_to_heap_with_replacement(query *q, cell *p1, pl_ctx p1_ctx, bool
 			const frame *f = GET_FRAME(c->val_ctx);
 			slot *e = get_slot(q, f, c->var_num);
 			e->c.val_attrs = c->tmp_attrs;
+			q->attrs_used = true;
 			c->tmp_attrs = NULL;
 		}
 	}
@@ -465,6 +962,7 @@ cell *copy_term_to_heap(query *q, cell *p1, pl_ctx p1_ctx, bool copy_attrs)
 	cell *tmp2 = alloc_heap(q, tmp->num_cells);
 	if (!tmp2) return NULL;
 	dup_cells(tmp2, tmp, tmp->num_cells);
+	close_clone_cycles(q, tmp2);
 
 	if (!copy_attrs)
 		return tmp2;
@@ -476,8 +974,10 @@ cell *copy_term_to_heap(query *q, cell *p1, pl_ctx p1_ctx, bool copy_attrs)
 			const frame *f = GET_FRAME(c->val_ctx);
 			slot *e = get_slot(q, f, c->var_num);
 			e->c.val_attrs = c->tmp_attrs;
+			q->attrs_used = true;
 			c->tmp_attrs = NULL;
-			add_trail(q, c->val_ctx, c->var_num, NULL);
+			if (!add_trail(q, c->val_ctx, c->var_num, NULL))
+				return NULL;
 		}
 	}
 
@@ -513,8 +1013,8 @@ cell *append_list(query *q, const cell *c)
 	tmp->tag = TAG_INTERNED;
 	tmp->num_cells = 1 + c->num_cells;
 	tmp->val_off = g_dot_s;
-	tmp->arity = 2;
 	tmp->flags = 0;
+	set_arity(tmp, 2);
 	tmp++;
 	copy_cells(tmp, c, c->num_cells);
 	return save;
@@ -527,7 +1027,8 @@ cell *end_list(query *q)
 	tmp->tag = TAG_INTERNED;
 	tmp->num_cells = 1;
 	tmp->val_off = g_nil_s;
-	tmp->arity = tmp->flags = 0;
+	tmp->flags = 0;
+	set_arity(tmp, 0);
 
 	if (is_nil(get_tmp_heap(q, 0))) {
 		init_tmp_heap(q);
@@ -551,7 +1052,8 @@ cell *end_list_unsafe(query *q)
 	tmp->tag = TAG_INTERNED;
 	tmp->num_cells = 1;
 	tmp->val_off = g_nil_s;
-	tmp->arity = tmp->flags = 0;
+	tmp->flags = 0;
+	set_arity(tmp, 0);
 
 	if (is_nil(get_tmp_heap(q, 0))) {
 		init_tmp_heap(q);
@@ -577,8 +1079,8 @@ cell *allocate_structure(query *q, const char *functor, const cell *c)
 	tmp->tag = TAG_INTERNED;
 	tmp->num_cells = 1;
 	tmp->val_off = new_atom(q->pl, functor);
-	tmp->arity = 0;
 	tmp->flags = 0;
+	set_arity(tmp, 0);
 	append_structure(q, c);
 	return get_tmp_heap(q, 0);
 }
@@ -589,7 +1091,7 @@ cell *append_structure(query *q, const cell *c)
 	if (!tmp) return NULL;
 	copy_cells(tmp, c, c->num_cells);
 	tmp = q->tmp_heap;
-	tmp->arity++;
+	set_arity(tmp, get_arity(tmp) + 1);
 	return tmp;
 }
 
@@ -612,23 +1114,39 @@ cell *end_structure_heap(query *q)
 
 cell *alloc_queuen(query *q, unsigned qnum, const cell *c)
 {
-	if (!q->queue[qnum]) {
-		q->queue[qnum] = TPL_malloc(sizeof(cell)*q->q_size[qnum]);
-		if (!q->queue[qnum]) return NULL;
+	if (!ensure_queuen(q, qnum))
+		return NULL;
+
+	qbuf *b = &q->queues[qnum];
+
+	if (!b->queue) {
+		b->queue = TPL_malloc(sizeof(cell)*b->q_size);
+		if (!b->queue) return NULL;
 	}
 
-	while ((q->qp[qnum]+c->num_cells) >= q->q_size[qnum]) {
-		size_t n = q->q_size[qnum] + q->q_size[qnum] / 2;
-		void *ptr = TPL_realloc(q->queue[qnum], sizeof(cell)*n);
+	while ((b->qp+c->num_cells) >= b->q_size) {
+		size_t n = b->q_size + b->q_size / 2;
+		void *ptr = TPL_realloc(b->queue, sizeof(cell)*n);
 		if (!ptr) return NULL;
-		q->queue[qnum] = ptr;
-		q->q_size[qnum] = n;
+		b->queue = ptr;
+		b->q_size = n;
 	}
 
-	cell *dst = q->queue[qnum] + q->qp[qnum];
-	q->qp[qnum] += dup_cells(dst, c, c->num_cells);
-	q->qcnt[qnum]++;
+	cell *dst = b->queue + b->qp;
+	b->qp += dup_cells(dst, c, c->num_cells);
+	b->qcnt++;
 	return dst;
+}
+
+// Release a detached term image built for import_term().
+
+void free_detached_term(cell *c)
+{
+	if (!c)
+		return;
+
+	unshare_cells(c, c->num_cells);
+	TPL_free(c);
 }
 
 cell *import_term(query *q, cell *c, pl_ctx c_ctx)

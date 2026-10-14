@@ -1,0 +1,9 @@
+spawner_need_not_wait: ok
+owner_waits_child_runs: ok
+nesting_is_recursive: ok
+gap_in_chain_does_not_sever: ok
+spawn_order_is_fifo: ok
+end_wait_releases_first_wait: ok
+end_wait_releases_second_wait: ok
+end_wait_without_wait: ok
+wait_with_no_tasks: ok

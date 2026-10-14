@@ -7,13 +7,29 @@
 #include <string.h>
 #include <sys/time.h>
 
-#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__)
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
+
+#if defined(__APPLE__)
+#include <Availability.h>
+#endif
+
+#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__)
 #include <spawn.h>
 #include <sys/wait.h>
 #endif
 
+#if !defined(_WIN32) && !defined(__wasi__)
+#include <sys/ioctl.h>
+#if defined(__sun)
+#include <sys/termios.h>
+#endif
+#endif
+
 #include "history.h"
 #include "module.h"
+#include "network.h"
 #include "parser.h"
 #include "query.h"
 
@@ -85,15 +101,41 @@ static int clock_gettime_realtime(struct timespec *tv)
 	return 0;
 }
 
+#ifdef CLOCK_PROCESS_CPUTIME_ID
+static int clock_gettime_process(struct timespec *tv)
+{
+	FILETIME creation, exit, kernel, user;
+	ULARGE_INTEGER kernelTime, userTime;
+
+	if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	kernelTime.LowPart = kernel.dwLowDateTime;
+	kernelTime.HighPart = kernel.dwHighDateTime;
+	userTime.LowPart = user.dwLowDateTime;
+	userTime.HighPart = user.dwHighDateTime;
+	ULONGLONG hnsTime = kernelTime.QuadPart + userTime.QuadPart;
+	tv->tv_sec = (time_t)(hnsTime / HNS_PER_SEC);
+	tv->tv_nsec = (long)((hnsTime % HNS_PER_SEC) * NS_PER_HNS);
+	return 0;
+}
+#endif
+
 static int my_clock_gettime(clockid_t type, struct timespec *tp)
 {
 	if (type == CLOCK_MONOTONIC)
 		return clock_gettime_monotonic(tp);
 	else if (type == CLOCK_REALTIME)
 		return clock_gettime_realtime(tp);
+#ifdef CLOCK_PROCESS_CPUTIME_ID
+	else if (type == CLOCK_PROCESS_CPUTIME_ID)
+		return clock_gettime_process(tp);
+#endif
 
-    errno = ENOTSUP;
-    return -1;
+	errno = ENOTSUP;
+	return -1;
 }
 #else
 #define my_clock_gettime clock_gettime
@@ -114,6 +156,13 @@ uint64_t wall_time_in_usec(void)
 {
 	struct timespec now = {0};
 	my_clock_gettime(CLOCK_REALTIME, &now);
+	return (uint64_t)(now.tv_sec * 1000 * 1000) + (now.tv_nsec / 1000);
+}
+
+uint64_t monotonic_time_in_usec(void)
+{
+	struct timespec now = {0};
+	my_clock_gettime(CLOCK_MONOTONIC, &now);
 	return (uint64_t)(now.tv_sec * 1000 * 1000) + (now.tv_nsec / 1000);
 }
 
@@ -203,7 +252,7 @@ static bool bif_unsetenv_1(query *q)
 	return true;
 }
 
-static bool bif_sleep_1(query *q)
+bool bif_sleep_1(query *q)
 {
 	if (q->retry)
 		return true;
@@ -216,19 +265,56 @@ static bool bif_sleep_1(query *q)
 	if (is_bigint(p1))
 		return throw_error(q, p1, p1_ctx, "domain_error", "small_integer_range");
 
-	int ms = (is_float(p1) ? (double)get_float(p1) : (double)get_smallint(p1)) * 1000;
+	double secs = is_float(p1) ? get_float(p1) : get_smallint(p1);
+
+	if (secs > 1e9)
+		secs = 1e9;
 
 	if (q->is_task)
-		return do_yield(q, ms);
+		return do_yield(q, (int)(secs * 1000));
 
-	while ((ms > 0) && !q->halt) {
+	// Sleep to a deadline: counting slices down adds up each one's oversleep,
+	// and that grows when threads compete for the cores.
+
+	const uint64_t until = monotonic_time_in_usec() + (uint64_t)(secs * 1000000);
+	uint64_t now;
+
+	while (((now = monotonic_time_in_usec()) < until) && !q->halt && !q->pl->halt) {
 		CHECK_INTERRUPT();
-		msleep(1);
 
-		if (errno == EINTR)
-			return false;
+#if USE_THREADS
+		// A thread signal runs now, as in SWI, not when the sleep is over:
+		// go on as sleep(Remaining), so the engine delivers it first.
 
-		ms -= 1;
+		thread *t = q->thread_ptr;
+
+		if (t && list_count(&t->signals)) {
+			cell goal[2];
+			make_instr(goal, new_atom(q->pl, "sleep"), bif_sleep_1, 1, 1);
+			make_float(goal+1, (until - now) / 1000000.0);
+			cell *tmp = prepare_call(q, CALL_NOSKIP, goal, q->st.cur_ctx, 1);
+			CHECKED(tmp);
+			make_call(q, tmp+goal->num_cells);
+			q->st.instr = tmp;
+			return true;
+		}
+#endif
+
+		const uint64_t left = until - now;
+		errno = 0;
+		msleep(left < 10000 ? (int)((left + 999) / 1000) : 10);
+
+		if (errno == EINTR) {
+#if USE_THREADS
+			// Woken by thread_signal/2: loop round to run it as above,
+			// rather than retrying the goal, which would sleep it all again.
+
+			if (t && list_count(&t->signals) && !cancel_pending(q))
+				continue;
+#endif
+
+			return throw_timeout(q);
+		}
 	}
 
 	return true;
@@ -342,49 +428,110 @@ static bool bif_date_time_6(query *q)
 	return true;
 }
 
-static bool bif_sys_alarm_1(query *q)
+
+// Hosts with no usable POSIX per-thread timer - see USE_POLLED_ALARMS.
+// Polling a monotonic deadline from the normal interrupt checks preserves
+// nested timers and avoids a helper thread (WASI builds are deliberately
+// threadless).
+
+struct alarm_entry_ {
+	alarm_entry *next;
+	uint64_t deadline;
+	bool fired;
+};
+
+// How long until the earliest alarm this thread is waiting on, so the
+// scheduler can sleep exactly that long instead of waking on a timer of
+// its own to go and look. False when nothing is pending.
+
+bool next_alarm_delay(query *q, unsigned *ms)
 {
-#if defined(_WIN32) || !defined(ITIMER_REAL)
+	thread *self = q->thread_ptr ? q->thread_ptr : q->pl->main_thread;
+
+	if (!self->alarms)
+		return false;
+
+	uint64_t now = monotonic_time_in_usec(), best = 0;
+	bool found = false;
+
+	for (alarm_entry *e = self->alarms; e; e = e->next) {
+		if (e->fired)
+			continue;
+
+		if (!found || (e->deadline < best)) {
+			best = e->deadline;
+			found = true;
+		}
+	}
+
+	if (!found)
+		return false;
+
+	*ms = best <= now ? 0 : (unsigned)((best - now + 999) / 1000);
+	return true;
+}
+
+bool has_expired_alarm(query *q)
+{
+	thread *self = q->thread_ptr ? q->thread_ptr : q->pl->main_thread;
+	uint64_t now = monotonic_time_in_usec();
+
+	for (alarm_entry *e = self->alarms; e; e = e->next) {
+		if (!e->fired && now >= e->deadline) {
+			e->fired = true;
+			return true;
+		}
+	}
+
 	return false;
-#else
+}
+
+static bool bif_sys_alarm_2(query *q)
+{
 	GET_FIRST_ARG(p1,number);
-	int time0 = 0;
+	GET_NEXT_ARG(p2,integer_or_var);
+	int time_ms = 0;
+	thread *self = q->thread_ptr ? q->thread_ptr : q->pl->main_thread;
 
 	if (is_bigint(p1))
 		return throw_error(q, p1, p1_ctx, "domain_error", "positive_integer");
 
-	g_tpl_interrupt = 0;
-
 	if (is_float(p1))
-		time0 = get_float(p1) * 1000;
+		time_ms = get_float(p1) * 1000;
 	else
-		time0 = get_smallint(p1);
+		time_ms = get_smallint(p1);
 
-	if (time0 < 0)
+	if (time_ms < 0)
 		return throw_error(q, p1, p1_ctx, "domain_error", "positive_integer");
 
-	struct itimerval it = {0};
+	if (time_ms == 0) {
+		if (!is_integer(p2))
+			return throw_error(q, p2, p2_ctx, "instantiation_error", "timer");
 
-	if (time0 == 0) {
-		setitimer(ITIMER_REAL, &it, NULL);
+		alarm_entry *e = get_voidptr(p2);
+		alarm_entry **slot = &self->alarms;
+
+		while (*slot && (*slot != e))
+			slot = &(*slot)->next;
+
+		if (!*slot)
+			return throw_error(q, p2, p2_ctx, "domain_error", "timer");
+
+		*slot = e->next;
+		TPL_free(e);
 		return true;
 	}
 
-	struct sigaction sa = {0};
-    sa.sa_handler = sigfn;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; // Notice we DO NOT use SA_RESTART
-    sigaction(SIGALRM, &sa, NULL);
+	alarm_entry *e = TPL_calloc(1, sizeof(alarm_entry));
+	CHECKED(e);
+	e->deadline = monotonic_time_in_usec() + ((uint64_t)time_ms * 1000);
+	e->next = self->alarms;
+	self->alarms = e;
+	self->timedout = 0;
 
-   	int ms = time0;
-	int secs = ms / 1000;
-	ms -= secs * 1000;
-
-	it.it_value.tv_sec = secs;
-	it.it_value.tv_usec = ms * 1000;
-	setitimer(ITIMER_REAL, &it, NULL);
-	return true;
-#endif
+	cell tmp;
+	make_ptr(&tmp, e);
+	return unify(q, p2, p2_ctx, &tmp, q->st.cur_ctx);
 }
 
 static bool bif_busy_1(query *q)
@@ -407,16 +554,22 @@ static bool bif_busy_1(query *q)
 	pl_uint started = wall_time_in_usec() / 1000;
 	pl_uint end = started + elapse;
 
-	while ((wall_time_in_usec() / 1000)  < end) {
+	while (((wall_time_in_usec() / 1000)  < end) && !q->halt && !q->pl->halt) {
 		CHECK_INTERRUPT();
 	}
 
 	return true;
 }
 
+// The baseline is q->cpu_time, not q->st.cpu_time: the latter is part of
+// the machine state, so it is restored on backtracking and a REDO would be
+// timed from the original call rather than from the redo (issue #1050).
+// It is also the query start time that statistics/2 and cpu_time/1 report
+// against, which time/1 has no business resetting.
+
 static bool bif_sys_timer_0(query *q)
 {
-	q->st.cpu_time = cpu_time_in_usec();
+	q->cpu_time = cpu_time_in_usec();
 	q->total_inferences = 0;
 	return true;
 }
@@ -425,7 +578,7 @@ static bool bif_sys_elapsed_0(query *q)
 {
 	q->total_inferences--;
 	uint64_t cpu_now = cpu_time_in_usec();
-	uint64_t cpu_elapsed = cpu_now - q->st.cpu_time;
+	uint64_t cpu_elapsed = cpu_now - q->cpu_time;
 	double lips = (1.0 / ((double)cpu_elapsed/1000/1000)) * q->total_inferences;
 	cell tmp;
 	make_int(&tmp, q->total_inferences);
@@ -434,7 +587,7 @@ static bool bif_sys_elapsed_0(query *q)
 	fprintf(stderr, "%% CPU elapsed %.3fs, %s inferences, %.3f MLips\n", (double)cpu_elapsed/1000/1000, tmpbuf, lips/1000/1000);
 	if (q->is_redo) fprintf(stdout, "  ");
 	q->total_inferences = 0;
-	q->st.cpu_time = cpu_now;
+	q->cpu_time = cpu_now;
 	return true;
 }
 
@@ -482,13 +635,13 @@ static bool bif_get_unbuffered_code_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	int ch = history_getch_fd(fileno(str->fp));
+	int ch = str->is_string ? tpl_getc(str) : history_getch_fd(fileno(str->fp));
 
 	if (ch == 4)
 		ch = -1;
 
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
 		return do_yield(q, 1);
 	}
 
@@ -499,7 +652,7 @@ static bool bif_get_unbuffered_code_1(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_int(&tmp, -1);
@@ -515,6 +668,43 @@ static bool bif_get_unbuffered_code_1(query *q)
 	make_int(&tmp, ch);
 	return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 }
+
+#if !defined(_WIN32) && !defined(__wasi__)
+// The live window size, which is not the same thing as the terminfo
+// 'li'/'co' numbers: those are the type's nominal size (24x80 for an
+// xterm) and do not move when the window is resized.
+//
+// Tries each of the standard streams because any one of them may be a
+// pipe while another is still the terminal - `tpl < script.pl` being the
+// obvious case. Fails silently when none of them is a terminal, so a
+// caller can fall back rather than having to catch.
+
+static bool bif_sys_tty_size_2(query *q)
+{
+	GET_FIRST_ARG(p1,var);
+	GET_NEXT_ARG(p2,var);
+	static const int fds[] = {STDOUT_FILENO, STDERR_FILENO, STDIN_FILENO};
+	struct winsize ws = {0};
+	bool got = false;
+
+	for (unsigned i = 0; !got && (i < sizeof(fds)/sizeof(fds[0])); i++) {
+		if (!ioctl(fds[i], TIOCGWINSZ, &ws) && ws.ws_row && ws.ws_col)
+			got = true;
+	}
+
+	if (!got)
+		return false;
+
+	cell tmp;
+	make_int(&tmp, ws.ws_row);
+
+	if (!unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx))
+		return false;
+
+	make_int(&tmp, ws.ws_col);
+	return unify(q, p2, p2_ctx, &tmp, q->st.cur_ctx);
+}
+#endif
 
 static bool bif_get_unbuffered_char_1(query *q)
 {
@@ -540,13 +730,13 @@ static bool bif_get_unbuffered_char_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	int ch = history_getch_fd(fileno(str->fp));
+	int ch = str->is_string ? tpl_getc(str) : history_getch_fd(fileno(str->fp));
 
 	if (ch == 4)
 		ch = -1;
 
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
 		return do_yield(q, 1);
 	}
 
@@ -557,7 +747,7 @@ static bool bif_get_unbuffered_char_1(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_atom(&tmp, g_eof_s);
@@ -589,91 +779,71 @@ static bool bif_popen_4(query *q)
 	GET_NEXT_ARG(p2,atom);
 	GET_NEXT_ARG(p3,var);
 	GET_NEXT_ARG(p4,list_or_nil);
-	int n = new_stream(q->pl);
-	char *src = NULL;
 
-	if (n < 0)
-		return throw_error(q, p1, p1_ctx, "resource_error", "too_many_streams");
+	// Options are validated BEFORE new_stream() and before the filename
+	// is allocated, so no error exit below has a slot or a buffer to
+	// unwind. Previously both were taken first and every exit had to
+	// release them by hand - see bif_threads.c for the same change.
+	//
+	// std_alias records alias(current_input/output/error), which needs
+	// the slot number and so can only be applied after the commit.
 
-	char *filename = NULL;
+	// Shape-check the command first, so that a bad command still wins
+	// over a bad option exactly as it did before. This allocates
+	// nothing - the string is only materialised after the loop.
 
-	if (is_atom(p1))
-		filename = src = DUP_STRING(q, p1);
-	else if (!is_iso_list(p1))
+	if (!is_atom(p1) && !is_iso_list(p1))
 		return throw_error(q, p1, p1_ctx, "domain_error", "source_sink");
 
-	if (is_iso_list(p1)) {
-		size_t len = scan_is_chars_list(q, p1, p1_ctx, true);
+	if (is_iso_list(p1) && !scan_is_chars_list(q, p1, p1_ctx, true))
+		return throw_error(q, p1, p1_ctx, "type_error", "atom");
 
-		if (!len)
-			return throw_error(q, p1, p1_ctx, "type_error", "atom");
-
-		src = chars_list_to_string(q, p1, p1_ctx);
-		filename = src;
-	}
-
-	stream *str = &q->pl->streams[n];
-	str->is_pipe = true;
-	CHECKED(str->alias = sl_create((void*)fake_strcmp, (void*)keyfree, NULL));
-	CHECKED(str->filename = strdup(filename));
-	CHECKED(str->mode = DUP_STRING(q, p2));
+	cell *alias = NULL;
+	int std_alias = 0;			// 0 none, 1 input, 2 output, 3 error
 	bool binary = false;
-	uint8_t eof_action = eof_action_eof_code;
-	bool is_alias = false;
-	LIST_HANDLER(p4);
+	int eof_action = eof_action_eof_code;
+	PROLOG_LIST_HANDLER(p4);
 
 	while (is_list(p4)) {
-		cell *h = LIST_HEAD(p4);
+		cell *h = PROLOG_LIST_HEAD(p4);
 		cell *c = deref(q, h, p4_ctx);
 
 		if (is_var(c))
 			return throw_error(q, c, q->latest_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 
-		if (is_compound(c) && (c->arity == 1)) {
+		if (is_compound(c) && (get_arity(c) == 1)) {
 			cell *name = c + 1;
 			name = deref(q, name, q->latest_ctx);
-
 
 			if (get_named_stream(q->pl, C_STR(q, name), C_STRLEN(q, name)) >= 0)
 				return throw_error(q, c, q->latest_ctx, "permission_error", "open,source_sink");
 
 			if (!CMP_STRING_TO_CSTR(q, c, "alias")) {
-				if (!CMP_STRING_TO_CSTR(q, name, "current_input")) {
-					q->pl->current_input = n;
-				} else if (!CMP_STRING_TO_CSTR(q, name, "current_output")) {
-					q->pl->current_output = n;
-				} else if (!CMP_STRING_TO_CSTR(q, name, "current_error")) {
-					q->pl->current_error = n;
-				} else {
-					sl_app(str->alias, DUP_STRING(q, name), NULL);
-#if 0
-					cell tmp;
-					make_atom(&tmp, new_atom(q->pl, C_STR(q, name)));
-
-					if (!unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx))
-						return false;
-
-					is_alias = true;
-#endif
-				}
+				if (!CMP_STRING_TO_CSTR(q, name, "current_input"))
+					std_alias = 1;
+				else if (!CMP_STRING_TO_CSTR(q, name, "current_output"))
+					std_alias = 2;
+				else if (!CMP_STRING_TO_CSTR(q, name, "current_error"))
+					std_alias = 3;
+				else
+					alias = name;
 			} else if (!CMP_STRING_TO_CSTR(q, c, "type")) {
-				if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "binary")) {
+				if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "binary"))
 					binary = true;
-				} else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "text"))
+				else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "text"))
 					binary = false;
 			} else if (!CMP_STRING_TO_CSTR(q, c, "eof_action")) {
-				if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "error")) {
+				if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "error"))
 					eof_action = eof_action_error;
-				} else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "eof_code")) {
+				else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "eof_code"))
 					eof_action = eof_action_eof_code;
-				} else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "reset")) {
+				else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "reset"))
 					eof_action = eof_action_reset;
-				}
 			}
 		} else
 			return throw_error(q, c, q->latest_ctx, "domain_error", "stream_option");
 
-		p4 = LIST_TAIL(p4);
+		p4 = PROLOG_LIST_TAIL(p4);
 		p4 = deref(q, p4, p4_ctx);
 		p4_ctx = q->latest_ctx;
 
@@ -681,41 +851,218 @@ static bool bif_popen_4(query *q)
 			return throw_error(q, p4, p4_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 	}
 
+	// Now materialise the command name. Already shape-checked above,
+	// so this cannot fail and nothing below has to release it early.
+
+	char *src = is_atom(p1) ? DUP_STRING(q, p1)
+	                        : chars_list_to_string(q, p1, p1_ctx);
+	char *filename = src;
+
+	// Commit. From here only popen() itself can fail, and that path
+	// still has to release the slot.
+
+	int n = new_stream(q->pl);
+
+	if (n < 0) {
+		TPL_free(src);
+		return throw_error(q, p1, p1_ctx, "resource_error", "too_many_streams");
+	}
+
+	stream *str = &q->pl->streams[n];
+	str->is_pipe = true;
+	str->is_popen = true;
+	CHECKED(str->alias = sl_create((void*)fake_strcmp, (void*)keyfree, NULL));
+	CHECKED(str->filename = TPL_strdup(filename));
+	CHECKED(str->mode = DUP_STRING(q, p2));
 	str->binary = binary;
 	str->eof_action = eof_action;
+
+	if (std_alias == 1)
+		q->pl->current_input = n;
+	else if (std_alias == 2)
+		q->pl->current_output = n;
+	else if (std_alias == 3)
+		q->pl->current_error = n;
+	else if (alias)
+		sl_app(str->alias, DUP_STRING(q, alias), NULL);
 
 	if (!strcmp(str->mode, "read"))
 		str->fp = popen(filename, binary?"rb":"r");
 	else if (!strcmp(str->mode, "write"))
 		str->fp = popen(filename, binary?"wb":"w");
-	else
+	else {
+		TPL_free(src);
+		unwind_stream(q, n);
 		return throw_error(q, p2, p2_ctx, "domain_error", "io_mode");
+	}
 
 	TPL_free(src);
 
 	if (!str->fp) {
-		if ((errno == EACCES) || (strcmp(str->mode, "read") && (errno == EROFS)))
+		bool is_read = !strcmp(str->mode, "read");
+		unwind_stream(q, n);
+
+		if ((errno == EACCES) || (!is_read && (errno == EROFS)))
 			return throw_error(q, p1, p1_ctx, "permission_error", "open,source_sink");
 		else
 			return throw_error(q, p1, p1_ctx, "existence_error", "source_sink");
 	}
 
-	if (!is_alias) {
-		cell tmp;
-		make_int(&tmp, n);
-		tmp.flags |= FLAG_INT_STREAM;
+	str->fp_out = str->fp;
+	cell tmp;
+	make_int(&tmp, n);
+	tmp.flags |= FLAG_INT_STREAM;
+	unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx);
+	return true;
+}
 
-		if (!unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx))
-			return false;
-	}
+static bool bif_pclose_1(query *q)
+{
+	GET_FIRST_ARG(pstr,stream);
+	int n = get_stream(q, pstr);
+	stream *str = &q->pl->streams[n];
 
+	if (!str->is_pipe || !str->is_popen)
+		return throw_error(q, pstr, pstr_ctx, "domain_error", "popen");
+
+	pclose(str->fp);
+	stream_close(q, n);
 	return true;
 }
 #endif
 
-extern char **g_envp;
+char **g_envp = NULL;		// set by the front end, if there is one
 
-#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__)
+#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__)
+
+// pipe(Stream, StreamOptions): only type(+Type) and encoding(+Encoding) are
+// recognised, the same subset SWI-Prolog documents for SICStus compatibility
+// (issue #1153). Trealla is UTF-8 throughout - stream_property/2 always
+// reports encoding('UTF-8') - so encoding(_) is accepted and otherwise
+// ignored here, exactly like open/4's own encoding option.
+
+// throw_error() can return true (a matching catch/3 was found) even though
+// it just threw, so `return throw_error(...)` from a plain helper leaks
+// that true up as if nothing had happened - the caller's `if (!helper())`
+// then never fires and execution carries on with a half-built pipe. Call
+// it as a statement and always return a fixed false instead, the same way
+// parse_read_params() (bif_streams.c) already does.
+
+static bool process_create_pipe_opts(query *q, cell *opts, pl_ctx opts_ctx, bool *binary)
+{
+	PROLOG_LIST_HANDLER(opts);
+
+	while (is_iso_list(opts)) {
+		cell *h = PROLOG_LIST_HEAD(opts);
+		cell *c = deref(q, h, opts_ctx);
+		pl_ctx c_ctx = q->latest_ctx;
+
+		if (is_var(c)) {
+			throw_error(q, c, c_ctx, "instantiation_error", "stream_option");
+			return false;
+		}
+
+		if (!is_compound(c) || (get_arity(c) != 1)) {
+			throw_error(q, c, c_ctx, "domain_error", "stream_option");
+			return false;
+		}
+
+		cell *name = deref(q, c+1, c_ctx);
+		pl_ctx name_ctx = q->latest_ctx;
+
+		if (is_var(name)) {
+			throw_error(q, name, name_ctx, "instantiation_error", "stream_option");
+			return false;
+		}
+
+		if (!is_atom(name)) {
+			throw_error(q, c, c_ctx, "domain_error", "stream_option");
+			return false;
+		}
+
+		if (!CMP_STRING_TO_CSTR(q, c, "type")) {
+			if (!CMP_STRING_TO_CSTR(q, name, "binary"))
+				*binary = true;
+			else if (!CMP_STRING_TO_CSTR(q, name, "text"))
+				*binary = false;
+			else {
+				throw_error(q, c, c_ctx, "domain_error", "stream_option");
+				return false;
+			}
+		} else if (!CMP_STRING_TO_CSTR(q, c, "encoding")) {
+			// accepted, see comment above
+		} else {
+			throw_error(q, c, c_ctx, "domain_error", "stream_option");
+			return false;
+		}
+
+		opts = PROLOG_LIST_TAIL(opts);
+		opts = deref(q, opts, opts_ctx);
+		opts_ctx = q->latest_ctx;
+	}
+
+	if (is_var(opts)) {
+		throw_error(q, opts, opts_ctx, "instantiation_error", "stream_option");
+		return false;
+	}
+
+	if (!is_nil(opts)) {
+		throw_error(q, opts, opts_ctx, "type_error", "list");
+		return false;
+	}
+
+	return true;
+}
+
+// Wires up one end of a stdin/stdout/stderr pipe(Stream[, StreamOptions])
+// onto child_target_fd (0, 1 or 2) and wraps this process's end in a new
+// stream. to_child true means this process writes and the child reads
+// (stdin); false means the reverse (stdout/stderr).
+//
+// Closes both raw fds in the child as well as dup2'ing the one it needs:
+// posix_spawn() otherwise inherits every non-CLOEXEC fd, so without this
+// the child would also get its own copy of the end that is supposed to
+// stay only on this side - a stdin child never seeing EOF even after this
+// process closed its own copy, because it was still holding the write end
+// open itself (#1153).
+//
+// *keep_open_fd receives the fd this process must still close once
+// posix_spawnp() returns (its raw copy of the end handed to the child);
+// *out_n receives the new stream number for the end this process keeps.
+
+static bool process_create_pipe(query *q, posix_spawn_file_actions_t *file_actions,
+	int child_target_fd, bool to_child, bool binary, int *keep_open_fd, int *out_n)
+{
+	int fds[2];
+
+	if (pipe(fds))
+		return false;
+
+	int child_fd = to_child ? fds[0] : fds[1];
+	int this_fd = to_child ? fds[1] : fds[0];
+	posix_spawn_file_actions_adddup2(file_actions, child_fd, child_target_fd);
+	posix_spawn_file_actions_addclose(file_actions, fds[0]);
+	posix_spawn_file_actions_addclose(file_actions, fds[1]);
+	*keep_open_fd = child_fd;
+
+	int n = new_stream(q->pl);
+
+	if (n < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "too_many_streams");
+		return false;
+	}
+
+	q->pl->streams[n].fp = fdopen(this_fd, to_child ? (binary?"wb":"w") : (binary?"rb":"r"));
+	q->pl->streams[n].fp_out = q->pl->streams[n].fp;
+	q->pl->streams[n].is_pipe = true;
+	q->pl->streams[n].binary = binary;
+	CHECKED(q->pl->streams[n].mode = TPL_strdup(to_child ? "write" : "read"));
+	*out_n = n;
+	return true;
+}
+
 static bool bif_process_create_3(query *q)
 {
 	GET_FIRST_ARG(p1,atom);
@@ -739,19 +1086,19 @@ static bool bif_process_create_3(query *q)
 		filename = src;
 	}
 
-    int args = 0, envs = 0;
-    char *arguments[MAX_ARGS] = {NULL};
-    char *environments[MAX_ARGS] = {NULL};
-	arguments[args++] = strdup(filename);
+	int args = 0, envs = 0;
+	char *arguments[MAX_ARGS] = {NULL};
+	char *environments[MAX_ARGS] = {NULL};
+	arguments[args++] = TPL_strdup(filename);
 
 	for (int i = 0; g_envp[i] != NULL; i++)
-		environments[envs++] = strdup(g_envp[i]);
+		environments[envs++] = TPL_strdup(g_envp[i]);
 
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_iso_list(p2)) {
 		assert(args < MAX_ARGS);
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		cell *c = deref(q, h, p2_ctx);
 		pl_ctx c_ctx = q->latest_ctx;
 
@@ -759,26 +1106,27 @@ static bool bif_process_create_3(query *q)
 			return throw_error(q, c, c_ctx, "domain_error", "args");
 
 		arguments[args++] = DUP_STRING(q, c);
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q, p2, p2_ctx);
 		p2_ctx = q->latest_ctx;
 	}
 
 	arguments[args] = NULL;
-    posix_spawn_file_actions_t file_actions;
-    posix_spawn_file_actions_init(&file_actions);
-    posix_spawnattr_t attrp;
-    posix_spawnattr_init(&attrp);
-    cell *ppid = NULL;
-    pl_ctx ppid_ctx = 0;
-	LIST_HANDLER(p3);
+	posix_spawn_file_actions_t file_actions;
+	posix_spawn_file_actions_init(&file_actions);
+	posix_spawnattr_t attrp;
+	posix_spawnattr_init(&attrp);
+	cell *ppid = NULL;
+	pl_ctx ppid_ctx = 0;
+	int child_stdin_fd = -1, child_stdout_fd = -1, child_stderr_fd = -1;
+	PROLOG_LIST_HANDLER(p3);
 
 	while (is_iso_list(p3)) {
-		cell *h = LIST_HEAD(p3);
+		cell *h = PROLOG_LIST_HEAD(p3);
 		cell *c = deref(q, h, p3_ctx);
 		pl_ctx c_ctx = q->latest_ctx;
 
-		if (is_compound(c) && (c->arity == 1)) {
+		if (is_compound(c) && (get_arity(c) == 1)) {
 			cell *name = c + 1;
 			name = deref(q, name, c_ctx);
 			pl_ctx name_ctx = q->latest_ctx;
@@ -788,27 +1136,59 @@ static bool bif_process_create_3(query *q)
 				ppid_ctx = name_ctx;
 			} else if (!CMP_STRING_TO_CSTR(q, c, "detached")) {
 #if (defined(__GLIBC__) && (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 26))) || !defined(POSIX_SPAWN_SETSID)
-				return throw_error(q, c, c_ctx, "not available", "posix_spawnattr_setflags");
+				return throw_error(q, c, c_ctx, "system_error", "posix_spawnattr_setflags");
 #else
 				posix_spawnattr_setflags(&attrp, POSIX_SPAWN_SETSID);
 #endif
 			} else if (!CMP_STRING_TO_CSTR(q, c, "cwd")) {
-#ifndef posix_spawn_file_actions_addchdir_np
-				return throw_error(q, c, c_ctx, "not available", "posix_spawn_file_actions_addchdir_np");
+				// 2.29, not the 2.26 the 'detached' case above wants:
+				// POSIX_SPAWN_SETSID arrived in glibc 2.26 but
+				// posix_spawn_file_actions_addchdir_np only in 2.29. Sharing
+				// the 2.26 test let 2.26-2.28 fall through to a call that is
+				// not declared and does not link - Raspberry Pi OS Buster
+				// (glibc 2.28) is one such.
+				//
+				// The unsupported cases exclude the CALL, not merely
+				// return before reaching it. An #if around the return
+				// leaves the call compiled, and while the compiler drops it
+				// as unreachable - at -O0 as well as -O3, so the link is
+				// fine either way - it parses it first, and warns on every
+				// build.
+				//
+				// Apple has both spellings, split at macOS 26: the
+				// unsuffixed one is __API_AVAILABLE(macos(26.0)) and _np is
+				// deprecated from the same release. Selecting on __x86_64__
+				// looked right only because Apple Silicon and macOS 26
+				// arrived together; the axis is the OS, not the
+				// architecture.
+				//
+				// The test is the DEPLOYMENT TARGET, not the SDK
+				// (__MAC_OS_X_VERSION_MAX_ALLOWED): a newer SDK declares the
+				// unsuffixed call for an older target too, but it weak-links
+				// and is null at runtime on the OS actually being targeted.
+#if (defined(__GLIBC__) && (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 29))) \
+	|| defined(__OpenBSD__)
+				return throw_error(q, c, c_ctx, "system_error", "posix_spawn_file_actions_addchdir");
 #else
-				cwd = C_STR(q, name);
+				const char *cwd = C_STR(q, name);
+#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__NetBSD__) \
+	&& !(defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) \
+		&& __MAC_OS_X_VERSION_MIN_REQUIRED >= 260000)
 				posix_spawn_file_actions_addchdir_np(&file_actions, cwd);
+#else
+				posix_spawn_file_actions_addchdir(&file_actions, cwd);
+#endif
 #endif
 			} else if (!CMP_STRING_TO_CSTR(q, c, "env") && is_list_or_nil(name)) {
-				LIST_HANDLER(name);
+				PROLOG_LIST_HANDLER(name);
 				memset(environments, 0, sizeof(environments));
 				envs = 0;
 
 				while (is_iso_list(name)) {
-					cell *h = LIST_HEAD(name);
+					cell *h = PROLOG_LIST_HEAD(name);
 					cell *c = deref(q, h, name_ctx);
 
-					if (is_compound(c) && (c->arity == 2) && (c->val_off == g_eq_s)) {
+					if (is_compound(c) && (get_arity(c) == 2) && (c->val_off == g_eq_s)) {
 						cell *p1 = c + 1, *p2 = c + 2;
 						SB(pr);
 
@@ -821,19 +1201,19 @@ static bool bif_process_create_3(query *q)
 						environments[envs++] = SB_cstr(pr);
 					}
 
-					name = LIST_TAIL(name);
+					name = PROLOG_LIST_TAIL(name);
 					name = deref(q, name, name_ctx);
 					name_ctx = q->latest_ctx;
 				}
 
 			} else if (!CMP_STRING_TO_CSTR(q, c, "environment") && is_list_or_nil(name)) {
-				LIST_HANDLER(name);
+				PROLOG_LIST_HANDLER(name);
 
 				while (is_iso_list(name)) {
-					cell *h = LIST_HEAD(name);
+					cell *h = PROLOG_LIST_HEAD(name);
 					cell *c = deref(q, h, name_ctx);
 
-					if (is_compound(c) && (c->arity == 2) && (c->val_off == g_eq_s)) {
+					if (is_compound(c) && (get_arity(c) == 2) && (c->val_off == g_eq_s)) {
 						cell *p1 = c + 1, *p2 = c + 2;
 						SB(pr);
 
@@ -846,89 +1226,121 @@ static bool bif_process_create_3(query *q)
 						environments[envs++] = SB_cstr(pr);
 					}
 
-					name = LIST_TAIL(name);
+					name = PROLOG_LIST_TAIL(name);
 					name = deref(q, name, name_ctx);
 					name_ctx = q->latest_ctx;
 				}
-
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdin") && !CMP_STRING_TO_CSTR(q, name, "std")) {
 				posix_spawn_file_actions_adddup2(&file_actions, q->pl->current_input, 0);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdin") && !CMP_STRING_TO_CSTR(q, name, "null")) {
 				posix_spawn_file_actions_addopen(&file_actions, 0, "/dev/null", O_RDONLY, 0);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdin") && !CMP_STRING_TO_CSTR(q, name, "pipe")
-				&& is_compound(name) && (name->arity == 1) && is_var(name+1)) {
+				&& is_compound(name) && (get_arity(name) == 1) && is_var(name+1)) {
 				cell *ns = deref(q, name+1, name_ctx);
 				pl_ctx ns_ctx = q->latest_ctx;
-				int n = new_stream(q->pl);
-				int fds[2];
-				if (pipe(fds)) return false;
-				posix_spawn_file_actions_adddup2(&file_actions, fds[0], 0);
-				q->pl->streams[n].fp = fdopen(fds[1], "w");
-				q->pl->streams[n].is_pipe = true;
-				CHECKED(q->pl->streams[n].mode = strdup("write"));
+				int n;
+				if (!process_create_pipe(q, &file_actions, 0, true, false, &child_stdin_fd, &n))
+					return false;
 				cell tmp;
 				make_int(&tmp, n);
 				tmp.flags |= FLAG_INT_STREAM;
 				unify(q, ns, ns_ctx, &tmp, q->st.cur_ctx);
-
+			} else if (!CMP_STRING_TO_CSTR(q, c, "stdin") && !CMP_STRING_TO_CSTR(q, name, "pipe")
+				&& is_compound(name) && (get_arity(name) == 2) && is_var(name+1)) {
+				cell *ns = deref(q, name+1, name_ctx);
+				pl_ctx ns_ctx = q->latest_ctx;
+				cell *opts = deref(q, name+2, name_ctx);
+				pl_ctx opts_ctx = q->latest_ctx;
+				bool binary = false;
+				if (!process_create_pipe_opts(q, opts, opts_ctx, &binary))
+					return false;
+				int n;
+				if (!process_create_pipe(q, &file_actions, 0, true, binary, &child_stdin_fd, &n))
+					return false;
+				cell tmp;
+				make_int(&tmp, n);
+				tmp.flags |= FLAG_INT_STREAM;
+				unify(q, ns, ns_ctx, &tmp, q->st.cur_ctx);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdin") && !CMP_STRING_TO_CSTR(q, name, "stream")) {
-				cell *ns = deref(q, name, name_ctx);
+				cell *ns = deref(q, name+1, name_ctx);
 				int n = get_stream(q, ns);
-				posix_spawn_file_actions_adddup2(&file_actions, fileno(q->pl->streams[n].fp), 0);
-
+				posix_spawn_file_actions_adddup2(&file_actions, fileno(q->pl->streams[n].fp_in), 0);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdout") && !CMP_STRING_TO_CSTR(q, name, "std")) {
 				posix_spawn_file_actions_adddup2(&file_actions, q->pl->current_output, 1);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdout") && !CMP_STRING_TO_CSTR(q, name, "null")) {
 				posix_spawn_file_actions_addopen(&file_actions, 1, "/dev/null", O_WRONLY, 0);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdout") && !CMP_STRING_TO_CSTR(q, name, "pipe")
-				&& is_compound(name) && (name->arity == 1) && is_var(name+1)) {
+				&& is_compound(name) && (get_arity(name) == 1) && is_var(name+1)) {
 				cell *ns = deref(q, name+1, name_ctx);
 				pl_ctx ns_ctx = q->latest_ctx;
-				int n = new_stream(q->pl);
-				int fds[2];
-				if (pipe(fds)) return false;
-				posix_spawn_file_actions_adddup2(&file_actions, fds[1], 1);
-				q->pl->streams[n].fp = fdopen(fds[0], "r");
-				q->pl->streams[n].is_pipe = true;
-				CHECKED(q->pl->streams[n].mode = strdup("read"));
+				int n;
+				if (!process_create_pipe(q, &file_actions, 1, false, false, &child_stdout_fd, &n))
+					return false;
 				cell tmp;
 				make_int(&tmp, n);
 				tmp.flags |= FLAG_INT_STREAM;
 				unify(q, ns, ns_ctx, &tmp, q->st.cur_ctx);
-
+			} else if (!CMP_STRING_TO_CSTR(q, c, "stdout") && !CMP_STRING_TO_CSTR(q, name, "pipe")
+				&& is_compound(name) && (get_arity(name) == 2) && is_var(name+1)) {
+				cell *ns = deref(q, name+1, name_ctx);
+				pl_ctx ns_ctx = q->latest_ctx;
+				cell *opts = deref(q, name+2, name_ctx);
+				pl_ctx opts_ctx = q->latest_ctx;
+				bool binary = false;
+				if (!process_create_pipe_opts(q, opts, opts_ctx, &binary))
+					return false;
+				int n;
+				if (!process_create_pipe(q, &file_actions, 1, false, binary, &child_stdout_fd, &n))
+					return false;
+				cell tmp;
+				make_int(&tmp, n);
+				tmp.flags |= FLAG_INT_STREAM;
+				unify(q, ns, ns_ctx, &tmp, q->st.cur_ctx);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stdout") && !CMP_STRING_TO_CSTR(q, name, "stream")) {
-				cell *ns = deref(q, name, name_ctx);
+				cell *ns = deref(q, name+1, name_ctx);
 				int n = get_stream(q, ns);
-				posix_spawn_file_actions_adddup2(&file_actions, fileno(q->pl->streams[n].fp), 1);
-
+				posix_spawn_file_actions_adddup2(&file_actions, fileno(q->pl->streams[n].fp_out), 1);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stderr") && !CMP_STRING_TO_CSTR(q, name, "std")) {
 				posix_spawn_file_actions_adddup2(&file_actions, q->pl->current_error, 2);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stderr") && !CMP_STRING_TO_CSTR(q, name, "null")) {
 				posix_spawn_file_actions_addopen(&file_actions, 2, "/dev/null", O_WRONLY, 0);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stderr") && !CMP_STRING_TO_CSTR(q, name, "pipe")
-				&& is_compound(name) && (name->arity == 1) && is_var(name+1)) {
+				&& is_compound(name) && (get_arity(name) == 1) && is_var(name+1)) {
 				cell *ns = deref(q, name+1, name_ctx);
 				pl_ctx ns_ctx = q->latest_ctx;
-				int n = new_stream(q->pl);
-				int fds[2];
-				if (pipe(fds)) return false;
-				posix_spawn_file_actions_adddup2(&file_actions, fds[1], 2);
-				q->pl->streams[n].fp = fdopen(fds[0], "r");
-				q->pl->streams[n].is_pipe = true;
-				CHECKED(q->pl->streams[n].mode = strdup("read"));
+				int n;
+				if (!process_create_pipe(q, &file_actions, 2, false, false, &child_stderr_fd, &n))
+					return false;
+				cell tmp;
+				make_int(&tmp, n);
+				tmp.flags |= FLAG_INT_STREAM;
+				unify(q, ns, ns_ctx, &tmp, q->st.cur_ctx);
+			} else if (!CMP_STRING_TO_CSTR(q, c, "stderr") && !CMP_STRING_TO_CSTR(q, name, "pipe")
+				&& is_compound(name) && (get_arity(name) == 2) && is_var(name+1)) {
+				cell *ns = deref(q, name+1, name_ctx);
+				pl_ctx ns_ctx = q->latest_ctx;
+				cell *opts = deref(q, name+2, name_ctx);
+				pl_ctx opts_ctx = q->latest_ctx;
+				bool binary = false;
+				if (!process_create_pipe_opts(q, opts, opts_ctx, &binary))
+					return false;
+				int n;
+				if (!process_create_pipe(q, &file_actions, 2, false, binary, &child_stderr_fd, &n))
+					return false;
 				cell tmp;
 				make_int(&tmp, n);
 				tmp.flags |= FLAG_INT_STREAM;
 				unify(q, ns, ns_ctx, &tmp, q->st.cur_ctx);
 			} else if (!CMP_STRING_TO_CSTR(q, c, "stderr") && !CMP_STRING_TO_CSTR(q, name, "stream")) {
-				cell *ns = deref(q, name, name_ctx);
+				cell *ns = deref(q, name+1, name_ctx);
 				int n = get_stream(q, ns);
-				posix_spawn_file_actions_adddup2(&file_actions, fileno(q->pl->streams[n].fp), 2);
-			}
+				posix_spawn_file_actions_adddup2(&file_actions, fileno(q->pl->streams[n].fp_out), 2);
+			} else
+				return throw_error(q, c, q->latest_ctx, "domain_error", "process_create_option");
 		} else
 			return throw_error(q, c, q->latest_ctx, "domain_error", "process_create_option");
 
-		p3 = LIST_TAIL(p3);
+		p3 = PROLOG_LIST_TAIL(p3);
 		p3 = deref(q, p3, p3_ctx);
 		p3_ctx = q->latest_ctx;
 	}
@@ -938,6 +1350,10 @@ static bool bif_process_create_3(query *q)
 	posix_spawn_file_actions_destroy(&file_actions);
 	posix_spawnattr_destroy(&attrp);
 	TPL_free(src);
+
+	if (child_stdin_fd  != -1) close(child_stdin_fd);
+	if (child_stdout_fd != -1) close(child_stdout_fd);
+	if (child_stderr_fd != -1) close(child_stderr_fd);
 
 	for (int i = 0; i < args; i++)
 		TPL_free(arguments[i]);
@@ -959,18 +1375,19 @@ static bool bif_process_create_3(query *q)
 	return true;
 }
 
-static bool bif_process_wait_2(query *q)
+static bool bif_process_wait_3(query *q)
 {
 	GET_FIRST_ARG(p1,integer);
-	GET_NEXT_ARG(p2,list_or_nil);
-	LIST_HANDLER(p2);
+	GET_NEXT_ARG(p2,any);
+	GET_NEXT_ARG(p3,list_or_nil);
+	PROLOG_LIST_HANDLER(p3);
 	int secs = -1;
 
-	while (is_iso_list(p2)) {
-		cell *h = LIST_HEAD(p2);
-		cell *c = deref(q, h, p2_ctx);
+	while (is_iso_list(p3)) {
+		cell *h = PROLOG_LIST_HEAD(p3);
+		cell *c = deref(q, h, p3_ctx);
 
-		if (is_compound(c) && (c->arity == 1) && !CMP_STRING_TO_CSTR(q, c, "timeout")) {
+		if (is_compound(c) && (get_arity(c) == 1) && !CMP_STRING_TO_CSTR(q, c, "timeout")) {
 			if (is_integer(FIRST_ARG(c)))
 				secs = get_smallint(FIRST_ARG(c));
 			else if (is_atom(FIRST_ARG(c)) && !CMP_STRING_TO_CSTR(q, FIRST_ARG(c), "infinite"))
@@ -978,22 +1395,30 @@ static bool bif_process_wait_2(query *q)
 		} else
 			return throw_error(q, c, q->latest_ctx, "domain_error", "process_wait_option");
 
-		p2 = LIST_TAIL(p2);
-		p2 = deref(q, p2, p2_ctx);
-		p2_ctx = q->latest_ctx;
+		p3 = PROLOG_LIST_TAIL(p3);
+		p3 = deref(q, p3, p3_ctx);
+		p3_ctx = q->latest_ctx;
 	}
 
 	int status = 0, pid = get_smalluint(p1);
-	int ok = waitpid(pid, &status, secs != -1 ? WNOHANG : 0);
-	return ok == pid;
-}
+	pid_t ok = waitpid(pid, &status, secs != -1 ? WNOHANG : 0);
 
-static bool bif_process_wait_1(query *q)
-{
-	GET_FIRST_ARG(p1,integer);
-	int pid = get_smalluint(p1);
-	waitpid(pid, NULL, 0);
-	return true;
+	if (ok != pid)
+		return false;
+
+	cell *tmp = alloc_heap(q, 2);
+
+	if ( WIFSIGNALED(status)) {
+		int sig = WTERMSIG(status);
+		make_struct(tmp+0, g_killed_s, 1, 1);
+		make_uint(tmp+1, sig);
+	} else {
+		int code = WEXITSTATUS(status);
+		make_struct(tmp+0, g_exit_s, 1, 1);
+		make_uint(tmp+1, code);
+	}
+
+	return unify(q, p2, p2_ctx, tmp, q->st.cur_ctx);
 }
 
 static bool bif_process_kill_2(query *q)
@@ -1034,19 +1459,23 @@ builtins g_os_bifs[] =
 	{"get_unbuffered_code", 1, bif_get_unbuffered_code_1, "?integer", false, false, BLAH},
 	{"get_unbuffered_char", 1, bif_get_unbuffered_char_1, "?character", false, false, BLAH},
 
-#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__)
+#if !defined(_WIN32) && !defined(__wasi__)
+	{"$tty_size", 2, bif_sys_tty_size_2, "-integer,-integer", false, false, BLAH},
+#endif
+
+#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__)
 	{"process_create", 3, bif_process_create_3, "+atom,+list,+list", false, false, BLAH},
-	{"process_wait", 2, bif_process_wait_2, "+integer,-integer", false, false, BLAH},
-	{"process_wait", 1, bif_process_wait_1, "+integer", false, false, BLAH},
+	{"$process_wait", 3, bif_process_wait_3, "+integer,-term,+list", false, false, BLAH},
 	{"process_kill", 2, bif_process_kill_2, "+integer,+integer", false, false, BLAH},
 	{"process_kill", 1, bif_process_kill_1, "+integer", false, false, BLAH},
 #endif
 
 #if !defined(_WIN32) && !defined(__wasi__)
 	{"popen", 4, bif_popen_4, "+source_sink,+atom,--stream,+list", false, false, BLAH},
+	{"pclose", 1, bif_pclose_1, "+stream", false, false, BLAH},
 #endif
 
-	{"$alarm", 1, bif_sys_alarm_1, "+integer", false, false, BLAH},
+	{"$alarm", 2, bif_sys_alarm_2, "+integer,-integer", false, false, BLAH},
 	{"$timer", 0, bif_sys_timer_0, NULL, false, false, BLAH},
 	{"$elapsed", 0, bif_sys_elapsed_0, NULL, false, false, BLAH},
 

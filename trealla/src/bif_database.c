@@ -7,23 +7,75 @@
 #include "module.h"
 #include "query.h"
 
-static bool module_context(query *q, cell **p1, pl_ctx p1_ctx)
+// Strip M: from *p1, setting *mp to M, or to NULL when unqualified. False
+// means stop and return *status: a throw that found a catcher returns true.
+// A module that doesn't exist has no clauses, so as in SWI and Scryer the
+// call just gives if_missing.
+
+static void abolish_predicate(query *q, predicate *pr, bool hard);
+
+static bool module_context(query *q, cell **p1, pl_ctx *p1_ctx, module **mp, bool *status, bool if_missing)
 {
+	*mp = NULL;
+
 	if (!is_var(*p1)) {
-		if ((*p1)->val_off == g_colon_s) {
-			*p1 = *p1 + 1;
-			cell *cm = deref(q, *p1, p1_ctx);
+		if (((*p1)->val_off == g_colon_s) && (get_arity(*p1) == 2)) {
+			cell *cm = deref(q, *p1 + 1, *p1_ctx);
+
+			if (is_var(cm)) {
+				*status = throw_error(q, cm, q->latest_ctx, "instantiation_error", "module");
+				return false;
+			}
+
+			if (!is_atom(cm)) {
+				*status = throw_error(q, cm, q->latest_ctx, "type_error", "module");
+				return false;
+			}
+
 			module *m = find_module(q->pl, C_STR(q, cm));
 
 			if (!m) {
-				return throw_error(q, cm, p1_ctx, "existence_error", "module");
+				*status = if_missing;
+				return false;
 			}
 
-			*p1 += (*p1)->num_cells;
+			cell *h = *p1 + 1;
+			h += h->num_cells;
+			*p1 = deref(q, h, *p1_ctx);
+			*p1_ctx = q->latest_ctx;
+			*mp = m;
 		}
 	}
 
 	return true;
+}
+
+// A clause reference is that clause's creation generation, printed as an opaque hex handle:
+// dbgen is a global atomic counter bumped once per assert, so the stamp is unique and monotonic.
+// Anything that is not one of these handles parses as 0, which matches no clause.
+
+static char *clause_ref_to_buf(uint64_t ref, char *buf, size_t buflen)
+{
+	snprintf(buf, buflen, "%016"PRIx64"", ref);
+	return buf;
+}
+
+static uint64_t clause_ref_from_buf(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+
+	uint64_t ref = 0;
+
+	for (; *s; s++) {
+		if (!isxdigit((unsigned char)*s))
+			return 0;
+
+		int d = isdigit((unsigned char)*s) ? *s - '0' : (tolower((unsigned char)*s) - 'a') + 10;
+		ref = (ref * 16) + (uint64_t)d;
+	}
+
+	return ref;
 }
 
 static bool bif_clause_3(query *q)
@@ -32,8 +84,11 @@ static bool bif_clause_3(query *q)
 	GET_NEXT_ARG(p2,callable_or_var);
 	GET_NEXT_ARG(p3,atom_or_var);
 
-	if (!module_context(q, &p1, p1_ctx))
-		return false;
+	module *m;
+	bool status;
+
+	if (!module_context(q, &p1, &p1_ctx, &m, &status, false))
+		return status;
 
 	if (is_var(p1) && is_var(p2) && is_var(p3))
 		return throw_error(q, p3, p3_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
@@ -44,11 +99,9 @@ static bool bif_clause_3(query *q)
 		clause *cl;
 
 		if (!is_var(p3)) {
-			uuid u;
-			uuid_from_buf(C_STR(q, p3), &u);
-			rule *r = find_in_db(q->st.m, &u);
+			rule *r = find_in_db(m ? m : q->st.m, clause_ref_from_buf(C_STR(q, p3)));
 
-			if (!r || (!u.u1 && !u.u2))
+			if (!r)
 				break;
 
 			CHECKED(push_choice(q));
@@ -62,11 +115,11 @@ static bool bif_clause_3(query *q)
 				break;
 			}
 		} else {
-			if (match_clause(q, p1, p1_ctx, NULL, DO_CLAUSE) != true)
+			if (match_clause(q, m, p1, p1_ctx, NULL, DO_CLAUSE) != true)
 				break;
 
 			char tmpbuf[128];
-			uuid_to_buf(&q->st.dbe->u, tmpbuf, sizeof(tmpbuf));
+			clause_ref_to_buf(q->st.dbe->dbgen_created, tmpbuf, sizeof(tmpbuf));
 			cell tmp;
 			make_cstring(&tmp, tmpbuf);
 			unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx);
@@ -96,15 +149,16 @@ static bool bif_clause_3(query *q)
 			}
 
 			if (last_match) {
-				leave_predicate(q, q->st.pr, true);
-				drop_choice(q);
+				leave_predicate_and_drop(q, q->st.pr, true);
 			}
 
 			return true;
 		}
 
-		if (!is_var(p3))
+		if (!is_var(p3)) {
+			drop_choice(q);
 			break;
+		}
 
 		q->retry = QUERY_RETRY;
 		q->total_backtracks++;
@@ -114,50 +168,20 @@ static bool bif_clause_3(query *q)
 	return false;
 }
 
-static void db_log(query *q, rule *r, enum log_type l)
-{
-	FILE *fp = q->pl->logfp;
-
-	if (!fp)
-		return;
-
-	char tmpbuf[256];
-	char *dst;
-	q->quoted = 2;
-
-	switch(l) {
-	case LOG_ASSERTA:
-		dst = print_term_to_strbuf(q, r->cl.cells, q->st.cur_ctx, 1);
-		uuid_to_buf(&r->u, tmpbuf, sizeof(tmpbuf));
-		fprintf(fp, "%s:'$a_'((%s),'%s').\n", q->st.m->name, dst, tmpbuf);
-		TPL_free(dst);
-		break;
-	case LOG_ASSERTZ:
-		dst = print_term_to_strbuf(q, r->cl.cells, q->st.cur_ctx, 1);
-		uuid_to_buf(&r->u, tmpbuf, sizeof(tmpbuf));
-		fprintf(fp, "%s:'$z_'((%s),'%s').\n", q->st.m->name, dst, tmpbuf);
-		TPL_free(dst);
-		break;
-	case LOG_ERASE:
-		uuid_to_buf(&r->u, tmpbuf, sizeof(tmpbuf));
-		fprintf(fp, "%s:'$e_'('%s').\n", q->st.m->name, tmpbuf);
-		break;
-	}
-
-	q->quoted = 0;
-}
-
-static bool bif_iso_clause_2(query *q)
+static bool do_clause_2(query *q, enum clause_type type)
 {
 	GET_FIRST_ARG(p1,callable);
 	GET_NEXT_ARG(p2,callable_or_var);
 
-	if (!module_context(q, &p1, p1_ctx))
-		return false;
+	module *m;
+	bool status;
+
+	if (!module_context(q, &p1, &p1_ctx, &m, &status, false))
+		return status;
 
 	cell *body;
 
-	while (match_clause(q, p1, p1_ctx, &body, DO_CLAUSE)) {
+	while (match_clause(q, m, p1, p1_ctx, &body, type)) {
 		if (q->did_throw) return true;
 		bool ok;
 
@@ -173,8 +197,7 @@ static bool bif_iso_clause_2(query *q)
 			bool last_match = !has_next_key(q);
 
 			if (last_match) {
-				leave_predicate(q, q->st.pr, true);
-				drop_choice(q);
+				leave_predicate_and_drop(q, q->st.pr, true);
 			}
 
 			return true;
@@ -188,10 +211,31 @@ static bool bif_iso_clause_2(query *q)
 	return false;
 }
 
+static bool bif_iso_clause_2(query *q)
+{
+	return do_clause_2(q, DO_CLAUSE);
+}
+
+// '$clause'(:Head, ?Body): clause/2 that reads static predicates too, for
+// code analysis such as library(sandbox) does.
+
+static bool bif_sys_clause_2(query *q)
+{
+	return do_clause_2(q, DO_CLAUSE_STATIC);
+}
+
 static void predicate_purge_dirty_list(predicate *pr)
 {
 	unsigned cnt = 0;
 	rule *r;
+
+	// Already out of the chain, so only freed.
+
+	while ((r = list_pop_front(&pr->delinked)) != NULL) {
+		clear_clause(&r->cl);
+		TPL_free(r);
+		cnt++;
+	}
 
 	while ((r = list_pop_front(&pr->dirty)) != NULL) {
 		predicate_delink(pr, r);
@@ -200,13 +244,16 @@ static void predicate_purge_dirty_list(predicate *pr)
 		cnt++;
 	}
 
+	if (cnt && (pr->is_var_in_head || pr->is_var_in_first_arg || pr->is_var_in_idx2_arg))
+		recheck_var_in_indexed_args(pr);
+
 #if 0
 	if (cnt)
 		printf("*** predicate_purge_dirty_list %u\n", cnt);
 #endif
 }
 
-bool do_retract(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
+bool do_retract(query *q, module *m, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 {
 	if (!q->retry) {
 		cell *head = deref(q, get_head(p1), p1_ctx);
@@ -221,40 +268,276 @@ bool do_retract(query *q, cell *p1, pl_ctx p1_ctx, enum clause_type is_retract)
 	bool match;
 
 	if (is_a_rule(p1) && get_logical_body(p1)) {
-		match = match_rule(q, p1, p1_ctx, is_retract);
+		match = match_rule(q, m, p1, p1_ctx, is_retract);
 	} else {
 		cell *head = get_head(p1);
-		match = match_clause(q, head, p1_ctx, NULL, is_retract);
+		match = match_clause(q, m, head, p1_ctx, NULL, is_retract);
 	}
 
 	if (!match || q->did_throw)
 		return match;
 
 	rule *r = q->st.dbe;
-	db_log(q, r, LOG_ERASE);
 	retract_from_db(r->owner->m, r);
 	bool last_match = (is_retract == DO_RETRACT) && !has_next_key(q);
 
-	if (last_match) {
-		q->in_retract = true;
-		leave_predicate(q, q->st.pr, true);
-		q->in_retract = false;
-		drop_choice(q);
-	}
+	if (last_match)
+		leave_predicate_and_drop(q, q->st.pr, true);
 
 	return true;
+}
+
+// For retract((M:H :- B)): rebuild it as (H :- B), setting *mp to M.
+
+static bool rule_head_context(query *q, cell **p1, pl_ctx *p1_ctx, module **mp, bool *status)
+{
+	if (*mp || ((*p1)->val_off != g_neck_s) || (get_arity(*p1) != 2))
+		return true;
+
+	cell *h = deref(q, *p1 + 1, *p1_ctx);
+	pl_ctx h_ctx = q->latest_ctx;
+
+	if ((h->val_off != g_colon_s) || (get_arity(h) != 2))
+		return true;
+
+	cell *cm = deref(q, h + 1, h_ctx);
+
+	if (is_var(cm)) {
+		*status = throw_error(q, cm, q->latest_ctx, "instantiation_error", "module");
+		return false;
+	}
+
+	if (!is_atom(cm)) {
+		*status = throw_error(q, cm, q->latest_ctx, "type_error", "module");
+		return false;
+	}
+
+	if (!(*mp = find_module(q->pl, C_STR(q, cm)))) {
+		*status = false;
+		return false;
+	}
+
+	cell *hh = h + 1;
+	hh += hh->num_cells;
+	hh = deref(q, hh, h_ctx);
+	pl_ctx hh_ctx = q->latest_ctx;
+	cell *b = *p1 + 1;
+	b += b->num_cells;
+	pl_idx n = 1 + hh->num_cells + b->num_cells;
+	cell *tmp = alloc_heap(q, n);
+
+	if (!tmp) {
+		*status = throw_error(q, *p1, *p1_ctx, "resource_error", "memory");
+		return false;
+	}
+
+	make_instr(tmp, g_neck_s, NULL, 2, n-1);
+	SET_OP(tmp, OP_XFX);
+	dup_cells_by_ref(tmp+1, hh, hh_ctx, hh->num_cells);
+	dup_cells_by_ref(tmp+1+hh->num_cells, b, *p1_ctx, b->num_cells);
+	*p1 = tmp;
+	*p1_ctx = q->st.cur_ctx;
+	return true;
+}
+
+// '$destroy_module'(+Name): emptied rather than freed. Code can hold a
+// cached pointer to one of its predicates, so their headers stay till
+// exit, abolished (see module_bury_predicates()). Its clauses, indexes,
+// operators, blackboard and imports go, and so does its name, for a new
+// module to take, and the module itself goes on pl->dead_modules, for
+// module_create() to take again.
+
+static bool bif_sys_destroy_module_1(query *q)
+{
+	GET_FIRST_ARG(p1,atom);
+	module *m = find_module(q->pl, C_STR(q, p1));
+
+	if (!m)
+		return true;
+
+	if ((m == q->pl->user_m) || (m == q->pl->system_m) || m->prebuilt || m->orig || m->from_file)
+		return throw_error(q, p1, p1_ctx, "permission_error", "destroy,module");
+
+	prolog_lock_mod(q->pl, m);
+
+	for (predicate *pr = list_front(&m->predicates); pr; pr = list_next(pr)) {
+		if (pr->head || pr->cnt)
+			abolish_predicate(q, pr, true);
+		else {
+			pr->is_abolished = true;
+			q->pl->pred_gen++;
+		}
+	}
+
+	module_clear_tables(m);
+	m->idx_used = 0;
+	prolog_unlock_mod(q->pl, m);
+
+	prolog_lock(q->pl);
+
+	for (module *tmp = list_front(&q->pl->modules); tmp; tmp = list_next(tmp)) {
+		unsigned j = 0;
+
+		for (unsigned i = 0; i < tmp->idx_used; i++) {
+			if (tmp->used[i] != m)
+				tmp->used[j++] = tmp->used[i];
+		}
+
+		tmp->idx_used = j;
+	}
+
+	list_remove(&q->pl->modules, m);
+	m->hdr.prev = m->hdr.next = NULL;
+	module_bury_predicates(m);
+	m->dead_next = q->pl->dead_modules;
+	q->pl->dead_modules = m;
+	prolog_unlock(q->pl);
+	return true;
+}
+
+// '$create_module'(+Name): an empty module, for in_temporary_module/3,
+// which destroys it after. One that exists already is only taken if it
+// is still empty, as a call to M:G makes one: no predicates, not even
+// declared ones, and no imports.
+
+static bool bif_sys_create_module_1(query *q)
+{
+	GET_FIRST_ARG(p1,atom);
+	module *m = find_module(q->pl, C_STR(q, p1));
+
+	if (m) {
+		bool in_use = (m == q->pl->user_m) || (m == q->pl->system_m)
+			|| m->prebuilt || m->orig || m->from_file || m->idx_used;
+
+		for (predicate *pr = list_front(&m->predicates); pr && !in_use; pr = list_next(pr)) {
+			if (!pr->is_abolished && strcmp(C_STR(q, &pr->key), "$predicate_property"))
+				in_use = true;
+		}
+
+		if (in_use)
+			return throw_error(q, p1, p1_ctx, "permission_error", "create,module");
+
+		return true;
+	}
+
+	CHECKED(module_create(q->pl, C_STR(q, p1)));
+	return true;
+}
+
+// thread_local(+Spec), the directive and the predicate: Name/Arity, a list
+// or conjunction of them, or M:Spec. Each becomes dynamic, with the clauses
+// each thread asserts kept to itself (see thread_local_shadow()).
+
+static bool do_thread_local(query *q, cell *c, pl_ctx c_ctx, module *m)
+{
+	c = deref(q, c, c_ctx);
+	c_ctx = q->latest_ctx;
+
+	if (is_var(c))
+		return throw_error(q, c, c_ctx, "instantiation_error", "predicate_indicator");
+
+	if (is_iso_list(c)) {
+		cell *h = c + 1, *t = h + h->num_cells;
+		return do_thread_local(q, h, c_ctx, m) && do_thread_local(q, t, c_ctx, m);
+	}
+
+	if (is_nil(c))
+		return true;
+
+	if (is_interned(c) && (get_arity(c) == 2) && (c->val_off == g_conjunction_s)) {
+		cell *h = c + 1, *t = h + h->num_cells;
+		return do_thread_local(q, h, c_ctx, m) && do_thread_local(q, t, c_ctx, m);
+	}
+
+	if (is_interned(c) && (get_arity(c) == 2) && (c->val_off == g_colon_s)) {
+		cell *cm = deref(q, c + 1, c_ctx);
+
+		if (!is_atom(cm))
+			return throw_error(q, cm, q->latest_ctx, "type_error", "module");
+
+		module *m2 = find_module(q->pl, C_STR(q, cm));
+
+		if (!m2 && !(m2 = module_create(q->pl, C_STR(q, cm))))
+			return throw_error(q, cm, q->latest_ctx, "resource_error", "memory");
+
+		cell *spec = c + 1;
+		spec += spec->num_cells;
+		return do_thread_local(q, spec, c_ctx, m2);
+	}
+
+	if (!is_interned(c) || (get_arity(c) != 2) || CMP_STRING_TO_CSTR(q, c, "/"))
+		return throw_error(q, c, c_ctx, "type_error", "predicate_indicator");
+
+	cell *name = deref(q, c + 1, c_ctx);
+	pl_ctx name_ctx = q->latest_ctx;
+	cell *arity = c + 1;
+	arity += arity->num_cells;
+	arity = deref(q, arity, c_ctx);
+	pl_ctx arity_ctx = q->latest_ctx;
+
+	if (is_var(name) || is_var(arity))
+		return throw_error(q, c, c_ctx, "instantiation_error", "predicate_indicator");
+
+	if (!is_atom(name))
+		return throw_error(q, name, name_ctx, "type_error", "atom");
+
+	if (!is_smallint(arity))
+		return throw_error(q, arity, arity_ctx, "type_error", "integer");
+
+	if (get_smallint(arity) < 0)
+		return throw_error(q, arity, arity_ctx, "domain_error", "not_less_than_zero");
+
+	const char *src = C_STR(q, name);
+	unsigned n = (unsigned)get_smallint(arity);
+	cell key = (cell){0};
+	key.tag = TAG_INTERNED;
+	key.val_off = new_atom(q->pl, src);
+	set_arity(&key, n);
+	prolog_lock_mod(q->pl, m);
+	predicate *pr = find_predicate(m, &key);
+
+	if (pr && !pr->is_dynamic && pr->head) {
+		prolog_unlock_mod(q->pl, m);
+		cell pi[3];										// Name/Arity, as abolish/1 reports it
+		make_instr(pi, g_slash_s, NULL, 2, 2);
+		make_atom(pi+1, key.val_off);
+		make_int(pi+2, n);
+		return throw_error(q, pi, q->st.cur_ctx, "permission_error", "modify,static_procedure");
+	}
+
+	set_dynamic_in_db(m, src, n);
+	pr = find_predicate(m, &key);
+
+	if (pr && !pr->is_thread_local) {
+		pr->is_thread_local = true;
+		push_property(m, src, n, "thread_local");
+	}
+
+	prolog_unlock_mod(q->pl, m);
+	return pr ? true : throw_error(q, c, c_ctx, "resource_error", "memory");
+}
+
+static bool bif_thread_local_1(query *q)
+{
+	GET_FIRST_ARG(p1,any);
+	return do_thread_local(q, p1, p1_ctx, q->st.m);
 }
 
 static bool bif_iso_retract_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 
-	if (!module_context(q, &p1, p1_ctx))
-		return false;
+	module *m;
+	bool status;
 
-	prolog_lock(q->pl);
-	bool ok = do_retract(q, p1, p1_ctx, DO_RETRACT);
-	prolog_unlock(q->pl);
+	if (!module_context(q, &p1, &p1_ctx, &m, &status, false)
+		|| !rule_head_context(q, &p1, &p1_ctx, &m, &status))
+		return status;
+
+	module *lm = m ? m : q->st.m;
+	prolog_lock_mod(q->pl, lm);
+	bool ok = do_retract(q, m, p1, p1_ctx, DO_RETRACT);
+	prolog_unlock_mod(q->pl, lm);
 	return ok;
 }
 
@@ -262,16 +545,23 @@ static bool bif_iso_retractall_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 
-	if (!module_context(q, &p1, p1_ctx))
-		return false;
+	module *m;
+	bool status;
 
+	if (!module_context(q, &p1, &p1_ctx, &m, &status, true))
+		return status;
+
+	module *lm = m ? m : q->st.m;
 	cell *head = deref(q, get_head(p1), p1_ctx);
-	predicate *pr = search_predicate(q->st.m, head);
+	predicate *pr = m ? find_predicate(m, head) : search_predicate(lm, head);	// see find_db_predicate()
+
+	if (pr && pr->is_thread_local)
+		pr = thread_local_shadow(pr);
 
 	if (!pr) {
 		bool found = false;
 
-		if (get_builtin_term(q->st.m, head, &found, NULL), found)
+		if (get_builtin_term(lm, head, &found, NULL), found)
 			return throw_error(q, head, q->latest_ctx, "permission_error", "modify,static_procedure");
 
 		return true;
@@ -280,13 +570,11 @@ static bool bif_iso_retractall_1(query *q)
 	if (!pr->cnt)
 		return true;
 
-	prolog_lock(q->pl);
-	q->in_retract = true;
+	prolog_lock_mod(q->pl, lm);
 
-	while (do_retract(q, p1, p1_ctx, DO_RETRACTALL)) {
+	while (do_retract(q, m, p1, p1_ctx, DO_RETRACTALL)) {
 		if (q->did_throw) {
-			q->in_retract = false;
-			prolog_unlock(q->pl);
+			prolog_unlock_mod(q->pl, lm);
 			return true;
 		}
 
@@ -295,10 +583,48 @@ static bool bif_iso_retractall_1(query *q)
 		retry_choice(q);
 	}
 
-	q->in_retract = false;
 	pr->is_processed = false;
-	prolog_unlock(q->pl);
+	prolog_unlock_mod(q->pl, lm);
 	return true;
+}
+
+// Every clause of pr retracted and reclaimed, its index freed, and with
+// hard, pr marked abolished, which a stale cached pointer to it can see.
+
+static void abolish_predicate(query *q, predicate *pr, bool hard)
+{
+	for (rule *r = pr->head; r; r = r->next)
+		retract_from_db(r->owner->m, r);
+
+	if (!pr->refcnt) {
+		predicate_purge_dirty_list(pr);
+	} else {
+		rule *r;
+
+		while ((r = list_pop_front(&pr->delinked)) != NULL)
+			list_push_back(&q->dirty, r);
+
+		while ((r = list_pop_front(&pr->dirty)) != NULL)
+			list_push_back(&q->dirty, r);
+	}
+
+	index_free(pr);
+	pr->needs_index = false;
+	pr->no_idx3 = false;
+	pr->is_var_in_head = false;
+	pr->is_var_in_first_arg = false;
+	pr->is_open_first_arg = false;
+	pr->is_var_in_idx2_arg = false;
+	pr->idx2_arg = 0;
+	pr->is_processed = false;
+	pr->head = pr->tail = NULL;
+	pr->cnt = 0;
+
+	if (hard) {
+		pr->is_abolished = true;
+		q->pl->pred_gen++;
+	}
+
 }
 
 bool do_abolish(query *q, cell *c_orig, cell *c_pi, bool hard)
@@ -309,28 +635,7 @@ bool do_abolish(query *q, cell *c_orig, cell *c_pi, bool hard)
 	if (!pr->is_dynamic)
 		return throw_error(q, c_orig, q->st.cur_ctx, "permission_error", "modify,static_procedure");
 
-	for (rule *r = pr->head; r; r = r->next)
-		retract_from_db(r->owner->m, r);
-
-	if (!pr->refcnt) {
-		predicate_purge_dirty_list(pr);
-	} else {
-		rule *r;
-
-		while ((r = list_pop_front(&pr->dirty)) != NULL)
-			list_push_back(&q->dirty, r);
-	}
-
-	sl_destroy(pr->idx2);
-	sl_destroy(pr->idx1);
-	pr->idx1 = pr->idx2 = NULL;
-	pr->is_processed = false;
-	pr->head = pr->tail = NULL;
-	pr->cnt = 0;
-
-	if (hard)
-		pr->is_abolished = true;
-
+	abolish_predicate(q, pr, hard);
 	return true;
 }
 
@@ -345,7 +650,7 @@ static bool bif_iso_abolish_1(query *q)
 		}
 	}
 
-	if (p1->arity != 2)
+	if (get_arity(p1) != 2)
 		return throw_error(q, p1, p1_ctx, "type_error", "predicate_indicator");
 
 	if (CMP_STRING_TO_CSTR(q, p1, "/") && CMP_STRING_TO_CSTR(q, p1, "//"))
@@ -369,23 +674,46 @@ static bool bif_iso_abolish_1(query *q)
 	if (is_negative(p1_arity))
 		return throw_error(q, p1_arity, p1_ctx, "domain_error", "not_less_than_zero");
 
-	if (get_smallint(p1_arity) > MAX_ARITY)
-		return throw_error(q, p1_arity, p1_ctx, "representation_error", "max_arity");
+	// No procedure can have such an arity, so there's nothing to abolish
+
+	if (!is_smallint(p1_arity) || (get_smallint(p1_arity) > MAX_PROCEDURE_ARITY))
+		return true;
 
 	bool found = false;
 
-	if (get_builtin(q->pl, C_STR(q, p1_name), C_STRLEN(q, p1_name), get_smallint(p1_arity), &found, NULL), found) {
+	if (get_builtin_by_atom(q->pl, p1_name->val_off, get_smallint(p1_arity), &found, NULL), found) {
 		return throw_error(q, p1, p1_ctx, "permission_error", "modify,static_procedure");
 	}
 
 	cell tmp;
 	tmp = *p1_name;
-	tmp.arity = get_smallint(p1_arity);
 	CLR_OP(&tmp);
-	prolog_lock(q->pl);
+	set_arity(&tmp, get_smallint(p1_arity));
+	prolog_lock_mod(q->pl, q->st.m);
 	bool ok = do_abolish(q, p1, &tmp, true);
-	prolog_unlock(q->pl);
+	prolog_unlock_mod(q->pl, q->st.m);
 	return ok;
+}
+
+// The module of a qualified head when it isn't an atom, else NULL.
+
+static cell *bad_db_module(query *q, cell *head, pl_ctx head_ctx)
+{
+	if (!is_interned(head) || (head->val_off != g_colon_s) || (get_arity(head) != 2))
+		return NULL;
+
+	cell *cm = deref(q, FIRST_ARG(head), head_ctx);
+	return is_atom(cm) ? NULL : cm;
+}
+
+static cell *get_db_head(cell *head)
+{
+	if (is_interned(head) && (head->val_off == g_colon_s) && (get_arity(head) == 2)) {
+		cell *module_name = FIRST_ARG(head);
+		return NEXT_ARG(module_name);
+	}
+
+	return head;
 }
 
 static bool bif_iso_asserta_1(query *q)
@@ -394,6 +722,7 @@ static bool bif_iso_asserta_1(query *q)
 	CHECKED(init_tmp_heap(q));
 	cell *tmp = copy_term_to_tmp(q, p1, p1_ctx, false);
 	CHECKED(tmp);
+
 	cell *head = get_head(tmp);
 
 	if (is_var(head))
@@ -401,6 +730,16 @@ static bool bif_iso_asserta_1(query *q)
 
 	if (!is_interned(head) && !is_cstring(head))
 		return throw_error(q, head, q->st.cur_ctx, "type_error", "callable");
+
+	cell *bad_m = bad_db_module(q, head, q->st.cur_ctx);
+
+	if (bad_m)
+		return throw_error(q, bad_m, q->st.cur_ctx, is_var(bad_m) ? "instantiation_error" : "type_error", "module");
+
+	cell *db_head = get_db_head(head);
+
+	if (is_callable(db_head) && (get_arity(db_head) > MAX_PROCEDURE_ARITY))
+		return throw_error(q, db_head, q->st.cur_ctx, "representation_error", "max_procedure_arity");
 
 	bool found = false;
 
@@ -417,41 +756,59 @@ static bool bif_iso_asserta_1(query *q)
 	}
 
 	pl_idx num_cells = tmp->num_cells;
-	parser *p = parser_create(q->st.m);
-
-	if (num_cells > p->cl->num_allocated_cells) {
-		p->cl = TPL_realloc(p->cl, sizeof(clause)+(sizeof(cell)*(num_cells+1)));
-		CHECKED(p->cl);
-		p->cl->num_allocated_cells = num_cells;
-	}
+	parser *p = parser_create_sized(q->st.m, num_cells);
+	CHECKED(p);
 
 	p->cl->cidx = dup_cells(p->cl->cells, tmp, num_cells);
+
+	// The clause outlives the mapping any slice in it points into.
+	// Unsliced here, not in the tmp heap: this copy owns the reference the
+	// new string carries, and a slice had none for dup_cells() to share.
+
+	if (!unslice_cells(p->cl->cells, num_cells)) {
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", "memory");
+	}
+
 	assign_vars(p, 0, true);
+
+	if (p->error) {
+		const bool too_many = p->vartab.num_vars >= MAX_VARS;
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", too_many ? "max_vars" : "memory");
+	}
+
 	term_to_body(p);
 	cell *h = get_head(p->cl->cells);
 
-	prolog_lock(q->pl);
+	prolog_lock_mod(q->pl, q->st.m);
 	rule *r = asserta_to_db(q->st.m, p->cl->num_vars, p->cl->cells, false);
-	prolog_unlock(q->pl);
+	prolog_unlock_mod(q->pl, q->st.m);
 
 	p->cl->cidx = 0;
-	parser_destroy(p);
 
 	if (!r) {
+		// h points into p->cl, so copy it out BEFORE parser_destroy()
+		// frees that. Only the static-procedure error path reads h,
+		// which is why this stayed latent.
+
 		h = copy_term_to_heap(q, h, q->st.cur_ctx, false);
+		parser_destroy(p);
+		CHECKED(h);
 		return throw_error(q, h, q->st.cur_ctx, "permission_error", "modify,static_procedure");
 	}
 
-	db_log(q, r, LOG_ASSERTA);
+	parser_destroy(p);
 	return true;
 }
 
-static bool do_assertz_1(query *q, bool consulting)
+static bool do_assertz_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 	CHECKED(init_tmp_heap(q));
 	cell *tmp = copy_term_to_tmp(q, p1, p1_ctx, false);
 	CHECKED(tmp);
+
 	cell *head = get_head(tmp);
 
 	if (is_var(head))
@@ -459,6 +816,16 @@ static bool do_assertz_1(query *q, bool consulting)
 
 	if (!is_interned(head) && !is_cstring(head))
 		return throw_error(q, head, q->st.cur_ctx, "type_error", "callable");
+
+	cell *bad_m = bad_db_module(q, head, q->st.cur_ctx);
+
+	if (bad_m)
+		return throw_error(q, bad_m, q->st.cur_ctx, is_var(bad_m) ? "instantiation_error" : "type_error", "module");
+
+	cell *db_head = get_db_head(head);
+
+	if (is_callable(db_head) && (get_arity(db_head) > MAX_PROCEDURE_ARITY))
+		return throw_error(q, db_head, q->st.cur_ctx, "representation_error", "max_procedure_arity");
 
 	bool found = false, evaluable = false;
 
@@ -475,43 +842,55 @@ static bool do_assertz_1(query *q, bool consulting)
 	}
 
 	pl_idx num_cells = tmp->num_cells;
-	parser *p = parser_create(q->st.m);
-
-	if (num_cells > p->cl->num_allocated_cells) {
-		p->cl = TPL_realloc(p->cl, sizeof(clause)+(sizeof(cell)*(num_cells+1)));
-		CHECKED(p->cl);
-		p->cl->num_allocated_cells = num_cells;
-	}
+	parser *p = parser_create_sized(q->st.m, num_cells);
+	CHECKED(p);
 
 	p->cl->cidx = dup_cells(p->cl->cells, tmp, num_cells);
+
+	// The clause outlives the mapping any slice in it points into.
+	// Unsliced here, not in the tmp heap: this copy owns the reference the
+	// new string carries, and a slice had none for dup_cells() to share.
+
+	if (!unslice_cells(p->cl->cells, num_cells)) {
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", "memory");
+	}
+
 	assign_vars(p, 0, true);
+
+	if (p->error) {
+		const bool too_many = p->vartab.num_vars >= MAX_VARS;
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", too_many ? "max_vars" : "memory");
+	}
+
 	term_to_body(p);
 	cell *h = get_head(p->cl->cells);
 
-	prolog_lock(q->pl);
-	rule *r = assertz_to_db(q->st.m, p->cl->num_vars, p->cl->cells, consulting);
-	prolog_unlock(q->pl);
+	prolog_lock_mod(q->pl, q->st.m);
+	rule *r = assertz_to_db(q->st.m, p->cl->num_vars, p->cl->cells, false);
+	prolog_unlock_mod(q->pl, q->st.m);
 
 	p->cl->cidx = 0;
-	parser_destroy(p);
 
 	if (!r) {
+		// h points into p->cl, so copy it out BEFORE parser_destroy()
+		// frees that. Only the static-procedure error path reads h,
+		// which is why this stayed latent.
+
 		h = copy_term_to_heap(q, h, q->st.cur_ctx, false);
+		parser_destroy(p);
+		CHECKED(h);
 		return throw_error(q, h, q->st.cur_ctx, "permission_error", "modify,static_procedure");
 	}
 
-	db_log(q, r, LOG_ASSERTZ);
+	parser_destroy(p);
 	return true;
 }
 
 static bool bif_iso_assertz_1(query *q)
 {
-	return do_assertz_1(q, false);
-}
-
-static bool bif_sys_assertz_static_1(query *q)
-{
-	return do_assertz_1(q, true);
+	return do_assertz_1(q);
 }
 
 static bool do_asserta_2(query *q)
@@ -521,6 +900,16 @@ static bool do_asserta_2(query *q)
 
 	if (is_var(head))
 		return throw_error(q, head, q->latest_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
+
+	cell *bad_m = bad_db_module(q, head, q->latest_ctx);
+
+	if (bad_m)
+		return throw_error(q, bad_m, q->latest_ctx, is_var(bad_m) ? "instantiation_error" : "type_error", "module");
+
+	cell *db_head = get_db_head(head);
+
+	if (is_callable(db_head) && (get_arity(db_head) > MAX_PROCEDURE_ARITY))
+		return throw_error(q, db_head, q->latest_ctx, "representation_error", "max_procedure_arity");
 
 	bool found = false;
 
@@ -551,60 +940,63 @@ static bool do_asserta_2(query *q)
 	CHECKED(tmp);
 
 	pl_idx num_cells = tmp->num_cells;
-	parser *p = parser_create(q->st.m);
-
-	if (num_cells > p->cl->num_allocated_cells) {
-		p->cl = TPL_realloc(p->cl, sizeof(clause)+(sizeof(cell)*(num_cells+1)));
-		CHECKED(p->cl);
-		p->cl->num_allocated_cells = num_cells;
-	}
+	parser *p = parser_create_sized(q->st.m, num_cells);
+	CHECKED(p);
 
 	p->cl->cidx = dup_cells(p->cl->cells, tmp, num_cells);
+
+	// The clause outlives the mapping any slice in it points into.
+	// Unsliced here, not in the tmp heap: this copy owns the reference the
+	// new string carries, and a slice had none for dup_cells() to share.
+
+	if (!unslice_cells(p->cl->cells, num_cells)) {
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", "memory");
+	}
+
 	assign_vars(p, 0, true);
+
+	if (p->error) {
+		const bool too_many = p->vartab.num_vars >= MAX_VARS;
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", too_many ? "max_vars" : "memory");
+	}
+
 	term_to_body(p);
 	cell *h = get_head(p->cl->cells);
 
-	prolog_lock(q->pl);
+	prolog_lock_mod(q->pl, q->st.m);
 	rule *r = asserta_to_db(q->st.m, p->cl->num_vars, p->cl->cells, false);
-	prolog_unlock(q->pl);
+	prolog_unlock_mod(q->pl, q->st.m);
 
 	p->cl->cidx = 0;
-	parser_destroy(p);
 
 	if (!r) {
+		// h points into p->cl, so copy it out BEFORE parser_destroy()
+		// frees that. Only the static-procedure error path reads h,
+		// which is why this stayed latent.
+
 		h = copy_term_to_heap(q, h, q->st.cur_ctx, false);
+		parser_destroy(p);
+		CHECKED(h);
 		return throw_error(q, h, q->st.cur_ctx, "permission_error", "modify,static_procedure");
 	}
 
-	if (!is_var(p2)) {
-		uuid u;
-		uuid_from_buf(C_STR(q, p2), &u);
-		r->u = u;
-	} else {
-		uuid_gen(q->pl, &r->u);
-		char tmpbuf[128];
-		uuid_to_buf(&r->u, tmpbuf, sizeof(tmpbuf));
-		cell tmp2;
-		make_cstring(&tmp2, tmpbuf);
-		unify(q, p2, p2_ctx, &tmp2, q->st.cur_ctx);
-		unshare_cell(&tmp2);
-	}
+	parser_destroy(p);
 
-	db_log(q, r, LOG_ASSERTA);
-	return true;
+	char tmpbuf[128];
+	clause_ref_to_buf(r->dbgen_created, tmpbuf, sizeof(tmpbuf));
+	cell ref;
+	make_cstring(&ref, tmpbuf);
+	bool ok = unify(q, p2, p2_ctx, &ref, q->st.cur_ctx);
+	unshare_cell(&ref);
+	return ok;
 }
 
 static bool bif_asserta_2(query *q)
 {
 	GET_FIRST_ARG(p1,nonvar);
 	GET_NEXT_ARG(p2,var);
-	return do_asserta_2(q);
-}
-
-static bool bif_sys_asserta_2(query *q)
-{
-	GET_FIRST_ARG(p1,nonvar);
-	GET_NEXT_ARG(p2,atom);
 	return do_asserta_2(q);
 }
 
@@ -616,6 +1008,16 @@ static bool do_assertz_2(query *q)
 	if (is_var(head))
 		return throw_error(q, head, q->latest_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 
+	cell *bad_m = bad_db_module(q, head, q->latest_ctx);
+
+	if (bad_m)
+		return throw_error(q, bad_m, q->latest_ctx, is_var(bad_m) ? "instantiation_error" : "type_error", "module");
+
+	cell *db_head = get_db_head(head);
+
+	if (is_callable(db_head) && (get_arity(db_head) > MAX_PROCEDURE_ARITY))
+		return throw_error(q, db_head, q->latest_ctx, "representation_error", "max_procedure_arity");
+
 	bool found = false;
 
 	if (get_builtin_term(q->st.m, head, &found, NULL), found) {
@@ -645,47 +1047,57 @@ static bool do_assertz_2(query *q)
 	CHECKED(tmp);
 
 	pl_idx num_cells = tmp->num_cells;
-	parser *p = parser_create(q->st.m);
-
-	if (num_cells > p->cl->num_allocated_cells) {
-		p->cl = TPL_realloc(p->cl, sizeof(clause)+(sizeof(cell)*(num_cells+1)));
-		CHECKED(p->cl);
-		p->cl->num_allocated_cells = num_cells;
-	}
+	parser *p = parser_create_sized(q->st.m, num_cells);
+	CHECKED(p);
 
 	p->cl->cidx = dup_cells(p->cl->cells, tmp, num_cells);
+
+	// The clause outlives the mapping any slice in it points into.
+	// Unsliced here, not in the tmp heap: this copy owns the reference the
+	// new string carries, and a slice had none for dup_cells() to share.
+
+	if (!unslice_cells(p->cl->cells, num_cells)) {
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", "memory");
+	}
+
 	assign_vars(p, 0, true);
+
+	if (p->error) {
+		const bool too_many = p->vartab.num_vars >= MAX_VARS;
+		parser_destroy(p);
+		return throw_error(q, tmp, q->st.cur_ctx, "resource_error", too_many ? "max_vars" : "memory");
+	}
+
 	term_to_body(p);
 	cell *h = get_head(p->cl->cells);
 
-	prolog_lock(q->pl);
+	prolog_lock_mod(q->pl, q->st.m);
 	rule *r = assertz_to_db(q->st.m, p->cl->num_vars, p->cl->cells, false);
-	prolog_unlock(q->pl);
+	prolog_unlock_mod(q->pl, q->st.m);
 
 	p->cl->cidx = 0;
-	parser_destroy(p);
 
 	if (!r) {
+		// h points into p->cl, so copy it out BEFORE parser_destroy()
+		// frees that. Only the static-procedure error path reads h,
+		// which is why this stayed latent.
+
 		h = copy_term_to_heap(q, h, q->st.cur_ctx, false);
+		parser_destroy(p);
+		CHECKED(h);
 		return throw_error(q, h, q->st.cur_ctx, "permission_error", "modify,static_procedure");
 	}
 
-	if (!is_var(p2)) {
-		uuid u;
-		uuid_from_buf(C_STR(q, p2), &u);
-		r->u = u;
-	} else {
-		uuid_gen(q->pl, &r->u);
-		char tmpbuf[128];
-		uuid_to_buf(&r->u, tmpbuf, sizeof(tmpbuf));
-		cell tmp2;
-		make_cstring(&tmp2, tmpbuf);
-		unify(q, p2, p2_ctx, &tmp2, q->st.cur_ctx);
-		unshare_cell(&tmp2);
-	}
+	parser_destroy(p);
 
-	db_log(q, r, LOG_ASSERTZ);
-	return true;
+	char tmpbuf[128];
+	clause_ref_to_buf(r->dbgen_created, tmpbuf, sizeof(tmpbuf));
+	cell ref;
+	make_cstring(&ref, tmpbuf);
+	bool ok = unify(q, p2, p2_ctx, &ref, q->st.cur_ctx);
+	unshare_cell(&ref);
+	return ok;
 }
 
 static bool bif_assertz_2(query *q)
@@ -695,14 +1107,7 @@ static bool bif_assertz_2(query *q)
 	return do_assertz_2(q);
 }
 
-static bool bif_sys_assertz_2(query *q)
-{
-	GET_FIRST_ARG(p1,nonvar);
-	GET_NEXT_ARG(p2,atom);
-	return do_assertz_2(q);
-}
-
-void save_db(FILE *fp, query *q, int logging)
+void save_db(FILE *fp, query *q)
 {
 	q->listing = true;
 	q->double_quotes = true;
@@ -721,17 +1126,8 @@ void save_db(FILE *fp, query *q, int logging)
 			if (r->dbgen_retracted)
 				continue;
 
-			if (logging)
-				fprintf(fp, "'$z_'(");
-
 			clear_write_options(q);
 			print_term(q, fp, r->cl.cells, 0, 0);
-
-			if (logging) {
-				char tmpbuf[256];
-				uuid_to_buf(&r->u, tmpbuf, sizeof(tmpbuf));
-				fprintf(fp, ",'%s')", tmpbuf);
-			}
 
 			if (q->last_thing == WAS_SYMBOL)
 				fprintf(fp, " ");
@@ -756,7 +1152,7 @@ static bool bif_abolish_2(query *q)
 		}
 	}
 
-	if (p1->arity != 2)
+	if (get_arity(p1) != 2)
 		return throw_error(q, p1, p1_ctx, "type_error", "predicate_indicator");
 
 	if (CMP_STRING_TO_CSTR(q, p1, "/") && CMP_STRING_TO_CSTR(q, p1, "//"))
@@ -780,20 +1176,17 @@ static bool bif_abolish_2(query *q)
 	if (is_negative(p1_arity))
 		return throw_error(q, p1_arity, p1_ctx, "domain_error", "not_less_than_zero");
 
-	if (get_smallint(p1_arity) > MAX_ARITY)
-		return throw_error(q, p1_arity, p1_ctx, "representation_error", "max_arity");
-
 	bool force = false, tree = false;
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_list(p2)) {
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		cell *c = deref(q, h, p2_ctx);
 
 		if (is_var(c))
 			return throw_error(q, c, q->latest_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 
-		if (is_compound(c) && (c->arity == 1)) {
+		if (is_compound(c) && (get_arity(c) == 1)) {
 			cell *name = c + 1;
 			name = deref(q, name, q->latest_ctx);
 
@@ -814,7 +1207,7 @@ static bool bif_abolish_2(query *q)
 		} else
 			return throw_error(q, c, q->latest_ctx, "domain_error", "stream_option");
 
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q, p2, p2_ctx);
 		p2_ctx = q->latest_ctx;
 
@@ -822,18 +1215,23 @@ static bool bif_abolish_2(query *q)
 			return throw_error(q, p2, p2_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 	}
 
+	// No procedure can have such an arity, so there's nothing to abolish
+
+	if (!is_smallint(p1_arity) || (get_smallint(p1_arity) > MAX_PROCEDURE_ARITY))
+		return true;
+
 	if (!force) {
 		bool found = false;
 
-		if (get_builtin(q->pl, C_STR(q, p1_name), C_STRLEN(q, p1_name), get_smallint(p1_arity), &found, NULL), found) {
+		if (get_builtin_by_atom(q->pl, p1_name->val_off, get_smallint(p1_arity), &found, NULL), found) {
 			return throw_error(q, p1, p1_ctx, "permission_error", "modify,static_procedure");
 		}
 	}
 
 	cell tmp;
 	tmp = *p1_name;
-	tmp.arity = get_smallint(p1_arity);
 	CLR_OP(&tmp);
+	set_arity(&tmp, get_smallint(p1_arity));
 
 	bool ok = do_abolish(q, p1, &tmp, true);
 	return ok;
@@ -841,9 +1239,7 @@ static bool bif_abolish_2(query *q)
 
 bool do_erase(module* m, const char *str)
 {
-	uuid u;
-	uuid_from_buf(str, &u);
-	erase_from_db(m, &u);
+	erase_from_db(m, clause_ref_from_buf(str));
 	return true;
 }
 
@@ -857,27 +1253,9 @@ static bool bif_instance_2(query *q)
 {
 	GET_FIRST_ARG(p1,atom);
 	GET_NEXT_ARG(p2,any);
-	uuid u;
-	uuid_from_buf(C_STR(q, p1), &u);
-	rule *r = find_in_db(q->st.m, &u);
+	rule *r = find_in_db(q->st.m, clause_ref_from_buf(C_STR(q, p1)));
 	CHECKED(r);
 	return unify(q, p2, p2_ctx, r->cl.cells, q->st.cur_ctx);
-}
-
-static bool bif_sys_clause_2(query *q)
-{
-	q->access_private = true;
-	bool ok = bif_iso_clause_2(q);
-	q->access_private = false;
-	return ok;
-}
-
-static bool bif_sys_clause_3(query *q)
-{
-	q->access_private = true;
-	bool ok = bif_clause_3(q);
-	q->access_private = false;
-	return ok;
 }
 
 static bool do_dump_term(query *q, cell *p1x, pl_ctx p1x_ctx, cell *p1, pl_ctx p1_ctx, bool deref, int depth)
@@ -909,12 +1287,12 @@ static bool do_dump_term(query *q, cell *p1x, pl_ctx p1x_ctx, cell *p1, pl_ctx p
 				tmp->tag == TAG_BLOB ? "blob" :
 				"other"
 			),
-			tmp->num_cells, tmp->arity);
+			tmp->num_cells, get_arity(tmp));
 
 		if ((tmp->tag == TAG_INT) && !is_managed(tmp))
 			printf(", %lld", (long long)tmp->val_int);
 
-		if (tmp->arity && (tmp->tag == TAG_INTERNED))
+		if (get_arity(tmp) && (tmp->tag == TAG_INTERNED))
 			printf(", ground=%u", is_ground(tmp)?1:0);
 
 		if (tmp->tag == TAG_INTERNED)
@@ -953,26 +1331,29 @@ static bool bif_listing_0(query *q)
 {
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-	save_db(str->fp, q, 0);
+	save_db(str->fp, q);
 	return true;
 }
 
-static bool save_name(FILE *fp, query *q, pl_idx name, unsigned pr_arity, bool alt, bool dump)
+// List from m, as given by M:PI, else the module the call is running in.
+
+static bool save_name(FILE *fp, query *q, module *m, pl_idx name, pl_int arity, bool alt, bool dump)
 {
-	module *m = q->st.dbe ? q->st.dbe->owner->m : q->st.m;
+	if (!m)
+		m = q->st.dbe ? q->st.dbe->owner->m : q->st.m;
+
 	q->listing = true;
 	bool any = false;
-	int arity = pr_arity;
 
 	for (predicate *pr = list_front(&m->predicates);
 		pr; pr = list_next(pr)) {
-		if (pr->is_builtin && (arity == -1))
+		if (pr->is_builtin && (arity < 0))
 			continue;
 
 		if (name != pr->key.val_off)
 			continue;
 
-		if ((arity != pr->key.arity) && (arity != -1))
+		if ((arity >= 0) && ((uint32_t)arity != get_arity(&pr->key)))
 			continue;
 
 		any = true;
@@ -1015,20 +1396,29 @@ static bool bif_listing_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 	pl_idx name = p1->val_off;
-	int arity = -1;
+	pl_int arity = -1;
+
+	module *m = NULL;
 
 	if (p1->val_off == g_colon_s) {
 		p1 = p1 + 1;
 		cell *cm = deref(q, p1, p1_ctx);
-		module *m = find_module(q->pl, C_STR(q, cm));
+
+		if (!is_atom(cm))
+			return throw_error(q, cm, p1_ctx, is_var(cm) ? "instantiation_error" : "type_error", "module");
+
+		m = find_module(q->pl, C_STR(q, cm));
 
 		if (!m)
 			return throw_error(q, cm, p1_ctx, "existence_error", "module");
 
 		p1 += p1->num_cells;
+		p1 = deref(q, p1, p1_ctx);
+		p1_ctx = q->latest_ctx;
+		name = p1->val_off;
 	}
 
-	if (p1->arity) {
+	if (get_arity(p1)) {
 		if (CMP_STRING_TO_CSTR(q, p1, "/") && CMP_STRING_TO_CSTR(q, p1, "//"))
 			return throw_error(q, p1, p1_ctx, "type_error", "predicate_indicator");
 
@@ -1049,37 +1439,48 @@ static bool bif_listing_1(query *q)
 			arity += 2;
 	}
 
-	cell tmp;
-	make_atom(&tmp, name);
-	tmp.arity = arity;
-	bool found;
+	if (arity >= 0) {
+		cell tmp;
+		make_atom(&tmp, name);
+		set_arity(&tmp, arity);
+		bool found;
 
-	if (get_builtin_term(q->st.m, &tmp, &found, NULL), found)
-		return throw_error(q, &tmp, p1_ctx, "permission_error", "access,private_procedure");
+		if (get_builtin_term(q->st.m, &tmp, &found, NULL), found)
+			return throw_error(q, &tmp, p1_ctx, "permission_error", "access,private_procedure");
+	}
 
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-	return save_name(str->fp, q, name, arity, false, false);
+	return save_name(str->fp, q, m, name, arity, false, false);
 }
 
 static bool bif_sys_xlisting_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 	pl_idx name = p1->val_off;
-	int arity = -1;
+	pl_int arity = -1;
+
+	module *m = NULL;
 
 	if (p1->val_off == g_colon_s) {
 		p1 = p1 + 1;
 		cell *cm = deref(q, p1, p1_ctx);
-		module *m = find_module(q->pl, C_STR(q, cm));
+
+		if (!is_atom(cm))
+			return throw_error(q, cm, p1_ctx, is_var(cm) ? "instantiation_error" : "type_error", "module");
+
+		m = find_module(q->pl, C_STR(q, cm));
 
 		if (!m)
 			return throw_error(q, cm, p1_ctx, "existence_error", "module");
 
 		p1 += p1->num_cells;
+		p1 = deref(q, p1, p1_ctx);
+		p1_ctx = q->latest_ctx;
+		name = p1->val_off;
 	}
 
-	if (p1->arity) {
+	if (get_arity(p1)) {
 		if (CMP_STRING_TO_CSTR(q, p1, "/") && CMP_STRING_TO_CSTR(q, p1, "//"))
 			return throw_error(q, p1, p1_ctx, "type_error", "predicate_indicator");
 
@@ -1100,17 +1501,19 @@ static bool bif_sys_xlisting_1(query *q)
 			arity += 2;
 	}
 
-	cell tmp;
-	make_atom(&tmp, name);
-	tmp.arity = arity;
-	bool found;
+	if (arity >= 0) {
+		cell tmp;
+		make_atom(&tmp, name);
+		set_arity(&tmp, arity);
+		bool found;
 
-	if (get_builtin_term(q->st.m, &tmp, &found, NULL), found)
-		return throw_error(q, &tmp, p1_ctx, "permission_error", "access,private_procedure");
+		if (get_builtin_term(q->st.m, &tmp, &found, NULL), found)
+			return throw_error(q, &tmp, p1_ctx, "permission_error", "access,private_procedure");
+	}
 
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-	save_name(str->fp, q, name, arity, true, false);
+	save_name(str->fp, q, m, name, arity, true, false);
 	fprintf(str->fp, "\n");
 	return true;
 }
@@ -1129,20 +1532,29 @@ static bool bif_sys_dlisting_1(query *q)
 {
 	GET_FIRST_ARG(p1,callable);
 	pl_idx name = p1->val_off;
-	int arity = -1;
+	pl_int arity = -1;
+
+	module *m = NULL;
 
 	if (p1->val_off == g_colon_s) {
 		p1 = p1 + 1;
 		cell *cm = deref(q, p1, p1_ctx);
-		module *m = find_module(q->pl, C_STR(q, cm));
+
+		if (!is_atom(cm))
+			return throw_error(q, cm, p1_ctx, is_var(cm) ? "instantiation_error" : "type_error", "module");
+
+		m = find_module(q->pl, C_STR(q, cm));
 
 		if (!m)
 			return throw_error(q, cm, p1_ctx, "existence_error", "module");
 
 		p1 += p1->num_cells;
+		p1 = deref(q, p1, p1_ctx);
+		p1_ctx = q->latest_ctx;
+		name = p1->val_off;
 	}
 
-	if (p1->arity) {
+	if (get_arity(p1)) {
 		if (CMP_STRING_TO_CSTR(q, p1, "/") && CMP_STRING_TO_CSTR(q, p1, "//"))
 			return throw_error(q, p1, p1_ctx, "type_error", "predicate_indicator");
 
@@ -1163,17 +1575,19 @@ static bool bif_sys_dlisting_1(query *q)
 			arity += 2;
 	}
 
-	cell tmp;
-	make_atom(&tmp, name);
-	tmp.arity = arity;
-	bool found;
+	if (arity >= 0) {
+		cell tmp;
+		make_atom(&tmp, name);
+		set_arity(&tmp, arity);
+		bool found;
 
-	if (get_builtin_term(q->st.m, &tmp, &found, NULL), found)
-		return throw_error(q, &tmp, p1_ctx, "permission_error", "access,private_procedure");
+		if (get_builtin_term(q->st.m, &tmp, &found, NULL), found)
+			return throw_error(q, &tmp, p1_ctx, "permission_error", "access,private_procedure");
+	}
 
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-	save_name(str->fp, q, name, arity, false, true);
+	save_name(str->fp, q, m, name, arity, false, true);
 	fprintf(str->fp, "\n");
 	return true;
 }
@@ -1181,11 +1595,15 @@ static bool bif_sys_dlisting_1(query *q)
 builtins g_database_bifs[] =
 {
 	{"abolish", 1, bif_iso_abolish_1, "+predicate_indicator", true, false, BLAH},
+	{"thread_local", 1, bif_thread_local_1, "+term", false, false, BLAH},
+	{"$destroy_module", 1, bif_sys_destroy_module_1, "+atom", false, false, BLAH},
+	{"$create_module", 1, bif_sys_create_module_1, "+atom", false, false, BLAH},
 	{"asserta", 1, bif_iso_asserta_1, "+term", true, false, BLAH},
 	{"assertz", 1, bif_iso_assertz_1, "+term", true, false, BLAH},
 	{"retract", 1, bif_iso_retract_1, "+term", true, false, BLAH},
 	{"retractall", 1, bif_iso_retractall_1, "+term", true, false, BLAH},
 	{"clause", 2, bif_iso_clause_2, "+term,?term", true, false, BLAH},
+	{"$clause", 2, bif_sys_clause_2, "+term,?term", false, false, BLAH},
 
 	{"asserta", 2, bif_asserta_2, "+term,-string", false, false, BLAH},
 	{"assertz", 2, bif_assertz_2, "+term,-string", false, false, BLAH},
@@ -1200,14 +1618,6 @@ builtins g_database_bifs[] =
 	{"$xlisting", 1, bif_sys_xlisting_1, "+predicate_indicator", false, false, BLAH},
 	{"$dlisting", 1, bif_sys_dlisting_1, "+predicate_indicator", false, false, BLAH},
 	{"$dump_term", 2, bif_sys_dump_term_2, "+term,+bool", false, false, BLAH},
-	{"$clause", 2, bif_sys_clause_2, "?term,?term", false, false, BLAH},
-	{"$clause", 3, bif_sys_clause_3, "?term,?term,-string", false, false, BLAH},
-	{"$assertz_static", 1, bif_sys_assertz_static_1, "+term", true, false, BLAH},
-
-	{"$a_", 2, bif_sys_asserta_2, "+term,+atom", true, false, BLAH},
-	{"$z_", 2, bif_sys_assertz_2, "+term,+atom", true, false, BLAH},
-	{"$e_", 1, bif_erase_1, "+atom", true, false, BLAH},
 
 	{0}
 };
-

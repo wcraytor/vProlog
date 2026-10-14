@@ -11,6 +11,8 @@
 #include "module.h"
 #include "query.h"
 
+#define MAX_FFI_STRUCT_FIELDS UINT8_MAX
+
 #define MAX_FFI 1000
 
 // These are pseudo tags just used here...
@@ -42,6 +44,20 @@ enum {
 
 #define MARK_OUT(t) (((unsigned)(t) << 2) | 1)
 
+// Two byte budgets, deliberately separate from MAX_FFI_ARGS. That one is
+// a count of arguments; these are sizes in bytes, and the two have
+// nothing to do with each other. They used to share it: the struct
+// arguments of a call were packed end to end into a uint8_t
+// bytes[MAX_FFI_ARGS], so all of them together had to fit in 64 bytes,
+// and the packing loop had no bounds check - going over wrote past the
+// array rather than failing. 64 bytes is less than one raylib Model (136)
+// or Mesh (120), so the whole 3D model API was unreachable.
+//
+// Both buffers are stack-allocated per call, and both are now checked.
+
+#define MAX_FFI_STRUCT_BYTES 4096	// all struct args of one call, together
+#define MAX_FFI_RET_BYTES 4096		// one returned struct
+
 typedef union result_ {
 	float val_ffi_float;
 	double val_ffi_double;
@@ -60,14 +76,23 @@ typedef union result_ {
 	unsigned long val_ffi_ulong;
 	signed long val_ffi_slong;
 	void *val_ffi_pointer;
-	char bytes[256];
 } result;
+
+// Where ffi_call() writes the return value. Separate from result so that
+// the per-argument cells[] array stays one word per entry: only the
+// single return needs room for a whole struct. Union alignment comes
+// from result's members (8), which covers every struct we can describe.
+
+typedef union ffi_ret_ {
+	result val;
+	uint8_t bytes[MAX_FFI_RET_BYTES];
+} ffi_ret;
 
 typedef struct foreign_struct_ {
 	const char *name;
 	unsigned arity;
-	uint8_t types[MAX_ARITY];
-	const char *names[MAX_ARITY];
+	uint8_t types[MAX_FFI_STRUCT_FIELDS];
+	const char *names[MAX_FFI_STRUCT_FIELDS];
 } foreign_struct;
 
 static foreign_struct g_ffi_structs[MAX_FFI] = {{0}};
@@ -79,37 +104,82 @@ typedef struct nested_elements {
 #endif
 
 #if USE_FFI
-void *do_dlopen(const char *filename, int flag)
-{
-#if __APPLE__
-	const char *ptr = strstr(filename, ".so");
-	char *filename2;
+// Prolog code names a shared library the Unix way - 'libfoo.so' - and
+// every library/*.pl that uses the FFI is written that way. Two of the
+// three platforms we build for want a different suffix, so map it here
+// rather than making each of those files carry a platform switch.
+//
+// Windows was missing until now: dlopen there comes from the dlfcn-win32
+// shim the CI installs, and it resolves through LoadLibrary, which will
+// not find a .so under any circumstances. So library(gsl), library(curl),
+// library(sqlite3) and library(raylib) could not load on Windows at all.
 
-	if (ptr) {
-		filename2 = TPL_malloc((strlen(filename)-2)+5+1);
-		const char *src = filename;
-		char *dst = filename2;
-
-		while (src != ptr)
-			*dst++ = *src++;
-
-		strcpy(dst, ".dylib");
-		dst += strlen(".dylib");
-		src += strlen(".so");
-
-		while (*src)
-			*dst++ = *src++;
-
-		*dst = '\0';
-	} else
-		filename2 = strdup(filename);
-#else
-	char *filename2 = strdup(filename);
+#if defined(__APPLE__)
+#define SO_SUFFIX ".dylib"
+#elif defined(_WIN32)
+#define SO_SUFFIX ".dll"
 #endif
 
-	void *handle = dlopen(filename2, !flag ? RTLD_LAZY | RTLD_GLOBAL : flag);
-	TPL_free(filename2);
-	return handle;
+#ifdef SO_SUFFIX
+// The ".so" that starts the *extension*, not merely the first one in the
+// string: a path like /opt/my.software/plugin.so has an earlier match,
+// and rewriting that one produced a nonsense filename. Accepts a version
+// suffix too, so libfoo.so.1 is still recognised.
+
+static const char *find_so_ext(const char *filename)
+{
+	const char *found = NULL;
+
+	for (const char *p = filename; (p = strstr(p, ".so")); p += 3) {
+		const char *after = p + 3;
+
+		if (!*after || (*after == '.'))
+			found = p;
+	}
+
+	return found;
+}
+
+static char *swap_so_suffix(const char *filename, const char *ptr)
+{
+	size_t head = ptr - filename;
+	char *out = TPL_malloc(strlen(filename) - strlen(".so") + strlen(SO_SUFFIX) + 1);
+
+	if (!out)
+		return NULL;
+
+	memcpy(out, filename, head);
+	strcpy(out + head, SO_SUFFIX);
+	strcat(out + head, ptr + strlen(".so"));
+	return out;
+}
+#endif
+
+void *do_dlopen(const char *filename, int flag)
+{
+	int mode = !flag ? RTLD_LAZY | RTLD_GLOBAL : flag;
+
+#ifdef SO_SUFFIX
+	const char *ptr = find_so_ext(filename);
+
+	if (ptr) {
+		char *filename2 = swap_so_suffix(filename, ptr);
+
+		if (filename2) {
+			void *handle = dlopen(filename2, mode);
+			TPL_free(filename2);
+
+			// Fall through to the name as written if that missed: a
+			// platform may genuinely carry a .so, and reporting the
+			// error against the name the user gave is friendlier.
+
+			if (handle)
+				return handle;
+		}
+	}
+#endif
+
+	return dlopen(filename, mode);
 }
 
 static bool bif_sys_dlopen_3(query *q)
@@ -160,7 +230,7 @@ static bool bif_sys_dlclose_1(query *q)
 	return do_dlclose((void*)handle) ? false : true;
 }
 
-static int max_struct_idx = 0, max_ffi_idx = 8;
+static int max_struct_idx = 0, max_ffi_idx = 9;
 
 static void register_struct(prolog *pl, const char *name, unsigned arity, void *fn, uint8_t *types, const char **names)
 {
@@ -176,8 +246,154 @@ static void register_struct(prolog *pl, const char *name, unsigned arity, void *
 	sl_app(pl->fortab, ptr->name, ptr);
 }
 
-// TODO: pre-compile the type definitions so it doesn't have
-// to be done on each registered FFI function call.
+// An out-param tag is MARK_OUT(t) = 4t+1, which is always larger than
+// the largest plain tag, so this test is exact rather than a bit trick.
+
+#define IS_OUT(t) ((t) > FFI_TAG_STRUCT)
+
+// One row per FFI type. Everything the rest of this file needs to know
+// about a type lives here: the name it is written as in a signature,
+// its libffi type, and the culprit reported by a type_error. Aliases
+// (uchar/bool for uint8, schar for sint8) are extra rows sharing a tag;
+// the first row for a tag is its canonical one.
+//
+// This replaces twelve hand-written if-else chains over the same 22
+// values. Two of those chains had drifted: sint64 arguments were being
+// described to libffi as sint32, and a -sint8 out-param was read back
+// through a 32-bit union member. Both were single wrong tokens in the
+// middle of forty near-identical lines.
+
+typedef struct {
+	const char *name;
+	uint8_t tag;
+	ffi_type *type;
+	const char *err;
+} ffi_typeinfo;
+
+static const ffi_typeinfo g_ffi_typeinfo[] = {
+	{"void",   FFI_TAG_VOID,   &ffi_type_void,    "void"},
+	{"uint8",  FFI_TAG_UINT8,  &ffi_type_uint8,   "integer"},
+	{"uchar",  FFI_TAG_UINT8,  &ffi_type_uint8,   "integer"},
+	{"bool",   FFI_TAG_UINT8,  &ffi_type_uint8,   "integer"},
+	{"uint16", FFI_TAG_UINT16, &ffi_type_uint16,  "integer"},
+	{"uint32", FFI_TAG_UINT32, &ffi_type_uint32,  "integer"},
+	{"uint64", FFI_TAG_UINT64, &ffi_type_uint64,  "integer"},
+	{"uint",   FFI_TAG_UINT,   &ffi_type_uint,    "integer"},
+	{"ushort", FFI_TAG_USHORT, &ffi_type_ushort,  "integer"},
+	{"ulong",  FFI_TAG_ULONG,  &ffi_type_ulong,   "integer"},
+	{"sint8",  FFI_TAG_SINT8,  &ffi_type_sint8,   "integer"},
+	{"schar",  FFI_TAG_SINT8,  &ffi_type_sint8,   "integer"},
+	{"sint16", FFI_TAG_SINT16, &ffi_type_sint16,  "integer"},
+	{"sint32", FFI_TAG_SINT32, &ffi_type_sint32,  "integer"},
+	{"sint64", FFI_TAG_SINT64, &ffi_type_sint64,  "integer"},
+	{"sint",   FFI_TAG_SINT,   &ffi_type_sint,    "integer"},
+	{"sshort", FFI_TAG_SHORT,  &ffi_type_sshort,  "integer"},
+	{"slong",  FFI_TAG_LONG,   &ffi_type_slong,   "integer"},
+	{"float",  FFI_TAG_FP32,   &ffi_type_float,   "float"},
+	{"double", FFI_TAG_FP64,   &ffi_type_double,  "float"},
+	{"ptr",    FFI_TAG_PTR,    &ffi_type_pointer, "stream"},
+	{"cstr",   FFI_TAG_C_STR,  &ffi_type_pointer, "atom"},
+	{"ccstr",  FFI_TAG_C_CSTR, &ffi_type_pointer, "atom"},
+	{NULL,     0,              NULL,              NULL}
+};
+
+// The canonical row for a tag, or NULL for a tag with no fixed libffi
+// type (struct) or no C type at all (var).
+
+static const ffi_typeinfo *ffi_info(uint8_t tag)
+{
+	for (const ffi_typeinfo *p = g_ffi_typeinfo; p->name; p++) {
+		if (p->tag == tag)
+			return p;
+	}
+
+	return NULL;
+}
+
+// Name as written in a signature -> tag. False if it isn't a known
+// type name, which the callers treat as naming a struct.
+
+static bool parse_ffi_type(const char *name, uint8_t *tag)
+{
+	for (const ffi_typeinfo *p = g_ffi_typeinfo; p->name; p++) {
+		if (!strcmp(p->name, name)) {
+			*tag = p->tag;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// The type_error culprit for a tag.
+
+static const char *ffi_err_of(uint8_t tag)
+{
+	const ffi_typeinfo *p = ffi_info(IS_OUT(tag) ? (uint8_t)(tag >> 2) : tag);
+	return p ? p->err : (tag == FFI_TAG_VAR ? "var" : "invalid");
+}
+
+// The libffi type for a tag. NULL for anything whose ffi_type can only
+// be built at call time - that is, structs - and for tags that aren't
+// real C types.
+
+static ffi_type *ffi_type_of(uint8_t tag)
+{
+	if (IS_OUT(tag))
+		return &ffi_type_pointer;	// out-params are passed by pointer
+
+	const ffi_typeinfo *p = ffi_info(tag);
+	return p ? p->type : NULL;
+}
+
+// Storage for the pre-compiled cifs. Registration is one-way and lasts
+// for the life of the process (there is no dlclose path that retires a
+// builtin), so these are static rather than malloc'd: no teardown to
+// get wrong and nothing for leak checkers to find. A signature that
+// doesn't fit simply isn't cached.
+
+static ffi_cif g_ffi_cifs[MAX_FFI];
+static ffi_type *g_ffi_cif_args[MAX_FFI * 4];
+static unsigned g_ffi_cifs_used = 0, g_ffi_cif_args_used = 0;
+
+// Build the cif once, at registration. Everything it needs - the arg
+// types and the return type - is fixed by the signature, so the only
+// reason to defer it is a struct return, whose ffi_type is assembled
+// per call from the foreign_struct table.
+
+static void precompile_cif(builtins *ptr)
+{
+	unsigned nargs = (ptr->ret_type == FFI_TAG_VOID) ? ptr->arity : ptr->arity - 1;
+	ffi_type *ret = ffi_type_of(ptr->ret_type);
+
+	if (!ret || (nargs > MAX_FFI_ARGS))
+		return;
+
+	if ((g_ffi_cifs_used >= MAX_FFI)
+		|| ((g_ffi_cif_args_used + nargs) > (MAX_FFI * 4)))
+		return;
+
+	ffi_type **at = &g_ffi_cif_args[g_ffi_cif_args_used];
+
+	for (unsigned i = 0; i < nargs; i++) {
+		ffi_type *t = ffi_type_of(ptr->types[i]);
+
+		if (!t)
+			return;				// a struct arg: leave it per-call
+
+		at[i] = t;
+	}
+
+	ffi_cif *cif = &g_ffi_cifs[g_ffi_cifs_used];
+
+	if (ffi_prep_cif(cif, FFI_DEFAULT_ABI, nargs, ret, at) != FFI_OK)
+		return;
+
+	g_ffi_cif_args_used += nargs;
+	g_ffi_cifs_used++;
+	ptr->cif = cif;
+}
+
 
 static void register_ffi(prolog *pl, const char *name, unsigned arity, void *fn, uint8_t *types, uint8_t ret_type, const char *ret_name, bool evaluable)
 {
@@ -197,7 +413,9 @@ static void register_ffi(prolog *pl, const char *name, unsigned arity, void *fn,
 
 	ptr->ret_type = ret_type;
 	ptr->ret_name = ret_name;
-	sl_app(pl->biftab, ptr->name, ptr);
+	ptr->cif = NULL;
+	precompile_cif(ptr);
+	sl_app(pl->biftab, (void*)(size_t)new_atom(pl, ptr->name), ptr);
 }
 
  bool bif_sys_register_function_4(query *q)
@@ -216,103 +434,35 @@ static void register_ffi(prolog *pl, const char *name, unsigned arity, void *fn,
 	if (!func) return false;
 
 	uint8_t arg_types[MAX_FFI_ARGS], ret_type = 0;
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 	cell *l = p3;
 	pl_ctx l_ctx = p3_ctx;
 	int idx = 0;
 
 	while (is_iso_list(l) && (idx < MAX_FFI_ARGS)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = deref(q, h, l_ctx);
 
 		if (is_interned(h)) {
 			const char *src = C_STR(q, h);
 
-			if (!strcmp(src, "uchar"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "schar"))
-				arg_types[idx++] = FFI_TAG_SINT8;
-			else if (!strcmp(src, "uint8"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "uint16"))
-				arg_types[idx++] = FFI_TAG_UINT16;
-			else if (!strcmp(src, "uint32"))
-				arg_types[idx++] = FFI_TAG_UINT32;
-			else if (!strcmp(src, "uint64"))
-				arg_types[idx++] = FFI_TAG_UINT64;
-			else if (!strcmp(src, "uint"))
-				arg_types[idx++] = FFI_TAG_UINT;
-			else if (!strcmp(src, "sint8"))
-				arg_types[idx++] = FFI_TAG_SINT8;
-			else if (!strcmp(src, "sint16"))
-				arg_types[idx++] = FFI_TAG_SINT16;
-			else if (!strcmp(src, "sint32"))
-				arg_types[idx++] = FFI_TAG_SINT32;
-			else if (!strcmp(src, "sint64"))
-				arg_types[idx++] = FFI_TAG_SINT64;
-			else if (!strcmp(src, "sint"))
-				arg_types[idx++] = FFI_TAG_SINT;
-			else if (!strcmp(src, "ushort"))
-				arg_types[idx++] = FFI_TAG_USHORT;
-			else if (!strcmp(src, "sshort"))
-				arg_types[idx++] = FFI_TAG_SHORT;
-			else if (!strcmp(src, "ulong"))
-				arg_types[idx++] = FFI_TAG_ULONG;
-			else if (!strcmp(src, "slong"))
-				arg_types[idx++] = FFI_TAG_LONG;
-			else if (!strcmp(src, "float"))
-				arg_types[idx++] = FFI_TAG_FP32;
-			else if (!strcmp(src, "double"))
-				arg_types[idx++] = FFI_TAG_FP64;
-			else if (!strcmp(src, "ptr"))
-				arg_types[idx++] = FFI_TAG_PTR;
-			else if (!strcmp(src, "cstr"))
-				arg_types[idx++] = FFI_TAG_C_STR;
-			else if (!strcmp(src, "ccstr"))
-				arg_types[idx++] = FFI_TAG_C_CSTR;
+			uint8_t t;
+
+			if (parse_ffi_type(src, &t))
+				arg_types[idx++] = t;
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = deref(q, l, l_ctx);
 		l_ctx = q->latest_ctx;
 	}
 
 	const char *src = C_STR(q, p4);
 
-	if (!strcmp(src, "uchar"))
-		ret_type = FFI_TAG_UINT8;
-	else if (!strcmp(src, "schar"))
-		ret_type = FFI_TAG_SINT8;
-	else if (!strcmp(src, "uint8"))
-		ret_type = FFI_TAG_UINT8;
-	else if (!strcmp(src, "uint16"))
-		ret_type = FFI_TAG_UINT16;
-	else if (!strcmp(src, "uint32"))
-		ret_type = FFI_TAG_UINT32;
-	else if (!strcmp(src, "uint64"))
-		ret_type = FFI_TAG_UINT64;
-	else if (!strcmp(src, "uint"))
-		ret_type = FFI_TAG_UINT;
-	else if (!strcmp(src, "sint8"))
-		ret_type = FFI_TAG_SINT8;
-	else if (!strcmp(src, "sint16"))
-		ret_type = FFI_TAG_SINT16;
-	else if (!strcmp(src, "sint32"))
-		ret_type = FFI_TAG_SINT32;
-	else if (!strcmp(src, "sint64"))
-		ret_type = FFI_TAG_SINT64;
-	else if (!strcmp(src, "sint"))
-		ret_type = FFI_TAG_SINT;
-	else if (!strcmp(src, "float"))
-		ret_type = FFI_TAG_FP32;
-	else if (!strcmp(src, "double"))
-		ret_type = FFI_TAG_FP64;
-	else if (!strcmp(src, "ptr"))
-		ret_type = FFI_TAG_PTR;
-	else if (!strcmp(src, "cstr"))
-		ret_type = FFI_TAG_C_STR;
-	else if (!strcmp(src, "ccstr"))
-		ret_type = FFI_TAG_C_CSTR;
+	uint8_t t;
+
+	if (parse_ffi_type(src, &t))
+		ret_type = t;
 	else
 		printf("invalid ret_type: %s\n", src);
 
@@ -320,118 +470,47 @@ static void register_ffi(prolog *pl, const char *name, unsigned arity, void *fn,
 	return true;
 }
 
+// A struct's field count has nothing to do with MAX_FFI_ARGS either. The
+// storage in foreign_struct is 8-bit limited, but this loop used to stop
+// at MAX_FFI_ARGS (64) and silently drop every field past it - so an
+// over-long foreign_struct produced a quietly wrong layout rather than an
+// error. Structs get big when they are declared flattened, which is the
+// only way to declare a nested one at all.
+
 bool do_register_struct(module *m, query *q, void *handle, const char *symbol, cell *l, pl_ctx l_ctx, const char *ret)
 {
-	uint8_t arg_types[MAX_FFI_ARGS];
-	const char *arg_names[MAX_FFI_ARGS];
-	LIST_HANDLER(l);
+	uint8_t arg_types[MAX_FFI_STRUCT_FIELDS];
+	const char *arg_names[MAX_FFI_STRUCT_FIELDS];
+	PROLOG_LIST_HANDLER(l);
 	int idx = 0;
 
-	while (is_iso_list(l) && (idx < MAX_FFI_ARGS)) {
-		cell *h = LIST_HEAD(l);
+	while (is_iso_list(l)) {
+		if (idx >= MAX_FFI_STRUCT_FIELDS) {
+			printf("Error: foreign_struct %s: over %u fields\n", symbol, (unsigned)MAX_FFI_STRUCT_FIELDS);
+			return false;
+		}
+
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = q ? deref(q, h, l_ctx) : h;
 
 		if (is_interned(h)) {
 			const char *src = C_STR(m, h);
 			arg_names[idx] = src;
 
-			if (!strcmp(src, "uchar"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uchar"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-			else if (!strcmp(src, "schar"))
-				arg_types[idx++] = FFI_TAG_SINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "schar"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT8);
-			else if (!strcmp(src, "uint8"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint8"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-			else if (!strcmp(src, "uint16"))
-				arg_types[idx++] = FFI_TAG_UINT16;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint16"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT16);
-			else if (!strcmp(src, "uint32"))
-				arg_types[idx++] = FFI_TAG_UINT32;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint32"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT32);
-			else if (!strcmp(src, "uint64"))
-				arg_types[idx++] = FFI_TAG_UINT64;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint64"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT64);
-			else if (!strcmp(src, "uint"))
-				arg_types[idx++] = FFI_TAG_UINT;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT);
-			else if (!strcmp(src, "ushort"))
-				arg_types[idx++] = FFI_TAG_USHORT;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ushort"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_USHORT);
-			else if (!strcmp(src, "ulong"))
-				arg_types[idx++] = FFI_TAG_ULONG;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ulong"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_ULONG);
-			else if (!strcmp(src, "sint8"))
-				arg_types[idx++] = FFI_TAG_SINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint8"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT8);
-			else if (!strcmp(src, "sint16"))
-				arg_types[idx++] = FFI_TAG_SINT16;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint16"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT16);
-			else if (!strcmp(src, "sint32"))
-				arg_types[idx++] = FFI_TAG_SINT32;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint32"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT32);
-			else if (!strcmp(src, "sint64"))
-				arg_types[idx++] = FFI_TAG_SINT64;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint64"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT64);
-			else if (!strcmp(src, "sint"))
-				arg_types[idx++] = FFI_TAG_SINT;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT);
-			else if (!strcmp(src, "sshort"))
-				arg_types[idx++] = FFI_TAG_SINT16;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sshort"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT16);
-			else if (!strcmp(src, "slong"))
-				arg_types[idx++] = FFI_TAG_LONG;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "slong"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_LONG);
-			else if (!strcmp(src, "float"))
-				arg_types[idx++] = FFI_TAG_FP32;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "float"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_FP32);
-			else if (!strcmp(src, "double"))
-				arg_types[idx++] = FFI_TAG_FP64;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "double"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_FP64);
-			else if (!strcmp(src, "ptr"))
-				arg_types[idx++] = FFI_TAG_PTR;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ptr"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_PTR);
-			else if (!strcmp(src, "cstr"))
-				arg_types[idx++] = FFI_TAG_C_STR;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "cstr"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_C_STR);
-			else if (!strcmp(src, "ccstr"))
-				arg_types[idx++] = FFI_TAG_C_CSTR;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ccstr"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_C_CSTR);
-			else if (!strcmp(src, "bool"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "bool"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-			else {
+			uint8_t t;
+
+			if (!strcmp(src, "-") && parse_ffi_type(C_STR(m, h+1), &t))
+				arg_types[idx++] = MARK_OUT(t);
+			else if (parse_ffi_type(src, &t))
+				arg_types[idx++] = t;
+			else
 				arg_types[idx++] = FFI_TAG_STRUCT;
-			}
 		} else {
 			printf("Warning: register struct\n");
 			return false;
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = q ? deref(q, l, l_ctx) : l;
 		l_ctx = q ? q->latest_ctx : 0;
 	}
@@ -446,188 +525,42 @@ bool do_register_predicate(module *m, query *q, void *handle, const char *symbol
 	if (!func) return false;
 
 	uint8_t arg_types[MAX_FFI_ARGS], ret_type = 0;
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 	int idx = 0;
 
 	while (is_iso_list(l) && (idx < MAX_FFI_ARGS)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = q ? deref(q, h, l_ctx) : h;
 
 		if (is_interned(h)) {
 			const char *src = C_STR(m, h);
 
-			if (!strcmp(src, "uchar"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uchar"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-			else if (!strcmp(src, "schar"))
-				arg_types[idx++] = FFI_TAG_SINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "schar"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT8);
-			else if (!strcmp(src, "uint8"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint8"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-			else if (!strcmp(src, "uint16"))
-				arg_types[idx++] = FFI_TAG_UINT16;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint16"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT16);
-			else if (!strcmp(src, "uint32"))
-				arg_types[idx++] = FFI_TAG_UINT32;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint32"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT32);
-			else if (!strcmp(src, "uint64"))
-				arg_types[idx++] = FFI_TAG_UINT64;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint64"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT64);
-			else if (!strcmp(src, "uint"))
-				arg_types[idx++] = FFI_TAG_UINT;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "uint"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT);
-			else if (!strcmp(src, "ushort"))
-				arg_types[idx++] = FFI_TAG_USHORT;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ushort"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_USHORT);
-			else if (!strcmp(src, "ulong"))
-				arg_types[idx++] = FFI_TAG_ULONG;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ulong"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_ULONG);
-			else if (!strcmp(src, "sint8"))
-				arg_types[idx++] = FFI_TAG_SINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint8"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT8);
-			else if (!strcmp(src, "sint16"))
-				arg_types[idx++] = FFI_TAG_SINT16;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint16"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT16);
-			else if (!strcmp(src, "sint32"))
-				arg_types[idx++] = FFI_TAG_SINT32;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint32"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT32);
-			else if (!strcmp(src, "sint64"))
-				arg_types[idx++] = FFI_TAG_SINT64;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint64"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT64);
-			else if (!strcmp(src, "sint"))
-				arg_types[idx++] = FFI_TAG_SINT;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sint"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SINT);
-			else if (!strcmp(src, "sshort"))
-				arg_types[idx++] = FFI_TAG_SHORT;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "sshort"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_SHORT);
-			else if (!strcmp(src, "slong"))
-				arg_types[idx++] = FFI_TAG_LONG;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "slong"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_LONG);
-			else if (!strcmp(src, "float"))
-				arg_types[idx++] = FFI_TAG_FP32;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "float"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_FP32);
-			else if (!strcmp(src, "double"))
-				arg_types[idx++] = FFI_TAG_FP64;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "double"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_FP64);
-			else if (!strcmp(src, "ptr"))
-				arg_types[idx++] = FFI_TAG_PTR;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ptr"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_PTR);
-			else if (!strcmp(src, "cstr"))
-				arg_types[idx++] = FFI_TAG_C_STR;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "cstr"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_C_STR);
-			else if (!strcmp(src, "ccstr"))
-				arg_types[idx++] = FFI_TAG_C_CSTR;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "ccstr"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_C_CSTR);
-			else if (!strcmp(src, "bool"))
-				arg_types[idx++] = FFI_TAG_UINT8;
-			else if (!strcmp(src, "-") && !strcmp(C_STR(m, h+1), "bool"))
-				arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
+			uint8_t t;
+
+			if (!strcmp(src, "-") && parse_ffi_type(C_STR(m, h+1), &t))
+				arg_types[idx++] = MARK_OUT(t);
+			else if (parse_ffi_type(src, &t))
+				arg_types[idx++] = t;
 			else
 				arg_types[idx++] = FFI_TAG_STRUCT;
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = q ? deref(q, l, l_ctx) : l;
 		l_ctx = q ? q->latest_ctx : 0;
 	}
 
 	const char *src = ret;
 
-	if (!strcmp(src, "uchar")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-		ret_type = FFI_TAG_UINT8;
-	} else if (!strcmp(src, "schar")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_SINT8);
-		ret_type = FFI_TAG_SINT8;
-	} else if (!strcmp(src, "uint8")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-		ret_type = FFI_TAG_UINT8;
-	} else if (!strcmp(src, "uint16")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_UINT16);
-		ret_type = FFI_TAG_UINT16;
-	} else if (!strcmp(src, "uint32")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_UINT32);
-		ret_type = FFI_TAG_UINT32;
-	} else if (!strcmp(src, "uint64")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_UINT64);
-		ret_type = FFI_TAG_UINT64;
-	} else if (!strcmp(src, "uint")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_UINT);
-		ret_type = FFI_TAG_UINT;
-	} else if (!strcmp(src, "ushort")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_USHORT);
-		ret_type = FFI_TAG_USHORT;
-	} else if (!strcmp(src, "ulong")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_ULONG);
-		ret_type = FFI_TAG_ULONG;
-	} else if (!strcmp(src, "sint8")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_SINT8);
-		ret_type = FFI_TAG_SINT8;
-	} else if (!strcmp(src, "sint16")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_SINT16);
-		ret_type = FFI_TAG_SINT16;
-	} else if (!strcmp(src, "sint32")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_SINT32);
-		ret_type = FFI_TAG_SINT32;
-	} else if (!strcmp(src, "sint64")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_SINT64);
-		ret_type = FFI_TAG_SINT64;
-	} else if (!strcmp(src, "sint")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_SINT);
-		ret_type = FFI_TAG_SINT;
-	} else if (!strcmp(src, "sshort")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_SHORT);
-		ret_type = FFI_TAG_SHORT;
-	} else if (!strcmp(src, "slong")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_LONG);
-		ret_type = FFI_TAG_LONG;
-	} else if (!strcmp(src, "float")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_FP32);
-		ret_type = FFI_TAG_FP32;
-	} else if (!strcmp(src, "double")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_FP64);
-		ret_type = FFI_TAG_FP64;
-	} else if (!strcmp(src, "ptr")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_PTR);
-		ret_type = FFI_TAG_PTR;
-	} else if (!strcmp(src, "cstr")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_C_STR);
-		ret_type = FFI_TAG_C_STR;
-	} else if (!strcmp(src, "ccstr")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_C_CSTR);
-		ret_type = FFI_TAG_C_CSTR;
-	} else if (!strcmp(src, "bool")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_UINT8);
-		ret_type = FFI_TAG_UINT8;
-	} else if (!strcmp(src, "void")) {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_VOID);
-		ret_type = FFI_TAG_VOID;
-	} else {
-		arg_types[idx++] = MARK_OUT(FFI_TAG_STRUCT);
-		ret_type = FFI_TAG_STRUCT;
-	}
+	// An unrecognised name is the name of a registered struct.
+
+	uint8_t t;
+
+	if (!parse_ffi_type(src, &t))
+		t = FFI_TAG_STRUCT;
+
+	arg_types[idx++] = MARK_OUT(t);
+	ret_type = t;
 
 	register_ffi(m->pl, symbol, idx, (void*)func, arg_types, ret_type, src, false);
 	return true;
@@ -637,7 +570,13 @@ bool bif_sys_register_predicate_4(query *q)
 {
 	GET_FIRST_ARG(p1,integer);
 	GET_NEXT_ARG(p2,atom);
-	GET_NEXT_ARG(p3,iso_list);
+
+	// [] is an atom, not an iso_list, so demanding iso_list here made a
+	// zero-argument function impossible to register - Py_Finalize and
+	// Py_GetVersion among them. use_foreign_module/2 has always accepted
+	// it; see the 'CloseWindow'([], void) entries in library/raylib.pl.
+
+	GET_NEXT_ARG(p3,iso_list_or_nil);
 	GET_NEXT_ARG(p4,atom);
 
 	if (!(p1->flags & FLAG_INT_HANDLE) && !(p1->flags & FLAG_HANDLE_DLL))
@@ -700,106 +639,10 @@ bool wrap_ffi_function(query *q, builtins *ptr)
 		else if ((ptr->types[i] == FFI_TAG_C_CSTR) && is_atom(c))
 			;
 		else if ((ptr->types[i] != c->tag) && !is_var(c))
-			return throw_error(q, c, c_ctx, "type_error",
-			ptr->types[i] == FFI_TAG_UINT8 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT16 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT32 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT64 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT ? "integer" :
-			ptr->types[i] == FFI_TAG_USHORT ? "integer" :
-			ptr->types[i] == FFI_TAG_ULONG ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT8 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT16 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT32 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT64 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT ? "integer" :
-			ptr->types[i] == FFI_TAG_SHORT ? "integer" :
-			ptr->types[i] == FFI_TAG_LONG ? "integer" :
-			ptr->types[i] == FFI_TAG_FP32 ? "float" :
-			ptr->types[i] == FFI_TAG_FP64 ? "float" :
-			ptr->types[i] == FFI_TAG_C_STR ? "atom" :
-			ptr->types[i] == FFI_TAG_C_CSTR ? "atom" :
-			ptr->types[i] == FFI_TAG_PTR ? "stream" :
-			ptr->types[i] == FFI_TAG_VAR ? "var" :
-			"invalid"
-			);
+			return throw_error(q, c, c_ctx, "type_error", ffi_err_of(ptr->types[i]));
 
-		if (ptr->types[i] == FFI_TAG_UINT8)
-			arg_types[i] = &ffi_type_uint8;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT8))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT16)
-			arg_types[i] = &ffi_type_uint16;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT16))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT32)
-			arg_types[i] = &ffi_type_uint32;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT32))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT64)
-			arg_types[i] = &ffi_type_uint64;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT64))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT)
-			arg_types[i] = &ffi_type_uint;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_USHORT)
-			arg_types[i] = &ffi_type_ushort;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_USHORT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_ULONG)
-			arg_types[i] = &ffi_type_ulong;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_ULONG))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT8)
-			arg_types[i] = &ffi_type_sint8;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT8))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT16)
-			arg_types[i] = &ffi_type_sint16;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT16))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT32)
-			arg_types[i] = &ffi_type_sint32;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT32))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT64)
-			arg_types[i] = &ffi_type_sint64;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT64))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT)
-			arg_types[i] = &ffi_type_sint;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SHORT)
-			arg_types[i] = &ffi_type_sshort;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SHORT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_LONG)
-			arg_types[i] = &ffi_type_slong;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_LONG))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_FP32)
-			arg_types[i] = &ffi_type_float;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_FP32))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_FP64)
-			arg_types[i] = &ffi_type_double;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_FP64))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_PTR)
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_PTR))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_C_STR)
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_C_STR))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_C_CSTR)
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_C_CSTR))
-			arg_types[i] = &ffi_type_pointer;
+		if (ptr->types[i] != FFI_TAG_STRUCT)
+			arg_types[i] = ffi_type_of(ptr->types[i]);
 
 		if (ptr->types[i] == FFI_TAG_UINT8) {
 			cells[i].val_ffi_uint8 = c->val_uint;
@@ -932,49 +775,49 @@ bool wrap_ffi_function(query *q, builtins *ptr)
 		return false;
 	}
 
-	result r;
+	ffi_ret r;
 	ffi_call(&cif, FFI_FN(ptr->fn), &r, arg_values);
 
 	cell tmp;
 
 	if (ptr->ret_type == FFI_TAG_UINT8)
-		make_int(&tmp, r.val_ffi_uint8);
+		make_int(&tmp, r.val.val_ffi_uint8);
 	else if (ptr->ret_type == FFI_TAG_UINT16)
-		make_int(&tmp, r.val_ffi_uint16);
+		make_int(&tmp, r.val.val_ffi_uint16);
 	else if (ptr->ret_type == FFI_TAG_UINT32)
-		make_int(&tmp, r.val_ffi_uint32);
+		make_int(&tmp, r.val.val_ffi_uint32);
 	else if (ptr->ret_type == FFI_TAG_UINT64)
-		make_int(&tmp, r.val_ffi_uint64);
+		make_int(&tmp, r.val.val_ffi_uint64);
 	else if (ptr->ret_type == FFI_TAG_UINT)
-		make_int(&tmp, r.val_ffi_uint);
+		make_int(&tmp, r.val.val_ffi_uint);
 	else if (ptr->ret_type == FFI_TAG_USHORT)
-		make_int(&tmp, r.val_ffi_ushort);
+		make_int(&tmp, r.val.val_ffi_ushort);
 	else if (ptr->ret_type == FFI_TAG_ULONG)
-		make_int(&tmp, r.val_ffi_ulong);
+		make_int(&tmp, r.val.val_ffi_ulong);
 	else if (ptr->ret_type == FFI_TAG_SINT8)
-		make_int(&tmp, r.val_ffi_sint8);
+		make_int(&tmp, r.val.val_ffi_sint8);
 	else if (ptr->ret_type == FFI_TAG_SINT16)
-		make_int(&tmp, r.val_ffi_sint16);
+		make_int(&tmp, r.val.val_ffi_sint16);
 	else if (ptr->ret_type == FFI_TAG_SINT32)
-		make_int(&tmp, r.val_ffi_sint32);
+		make_int(&tmp, r.val.val_ffi_sint32);
 	else if (ptr->ret_type == FFI_TAG_SINT64)
-		make_int(&tmp, r.val_ffi_sint64);
+		make_int(&tmp, r.val.val_ffi_sint64);
 	else if (ptr->ret_type == FFI_TAG_SINT)
-		make_int(&tmp, r.val_ffi_sint);
+		make_int(&tmp, r.val.val_ffi_sint);
 	else if (ptr->ret_type == FFI_TAG_SHORT)
-		make_int(&tmp, r.val_ffi_sshort);
+		make_int(&tmp, r.val.val_ffi_sshort);
 	else if (ptr->ret_type == FFI_TAG_LONG)
-		make_int(&tmp, r.val_ffi_slong);
+		make_int(&tmp, r.val.val_ffi_slong);
 	else if (ptr->ret_type == FFI_TAG_FP32)
-		make_float(&tmp, r.val_ffi_float);
+		make_float(&tmp, r.val.val_ffi_float);
 	else if (ptr->ret_type == FFI_TAG_FP64)
-		make_float(&tmp, r.val_ffi_double);
+		make_float(&tmp, r.val.val_ffi_double);
 	else if (ptr->ret_type == FFI_TAG_PTR)
-		make_cstring(&tmp, r.val_ffi_pointer);
+		make_cstring(&tmp, r.val.val_ffi_pointer);
 	else if (ptr->ret_type == FFI_TAG_C_STR)
-		make_cstring(&tmp, r.val_ffi_pointer);
+		make_cstring(&tmp, r.val.val_ffi_pointer);
 	else if (ptr->ret_type == FFI_TAG_C_CSTR)
-		make_cstring(&tmp, r.val_ffi_pointer);
+		make_cstring(&tmp, r.val.val_ffi_pointer);
 	else
 		return false;
 
@@ -1054,11 +897,21 @@ static bool handle_struct1(query *q, foreign_struct *sptr, nested_elements *nest
 	return true;
 }
 
-static void handle_struct2(query *q, nested_elements *nested, unsigned *pdepth, unsigned cnt, uint8_t *bytes, size_t *boff, cell *h, pl_ctx h_ctx, void **arg_values, unsigned *p_pos)
+// Packs one scalar of a struct argument into bytes[], or recurses for a
+// nested struct. Returns false if the value would not fit; the caller
+// turns that into a resource_error rather than letting the write happen.
+
+static bool handle_struct2(query *q, nested_elements *nested, unsigned *pdepth, unsigned cnt, uint8_t *bytes, size_t *boff, cell *h, pl_ctx h_ctx, void **arg_values, unsigned *p_pos)
 {
 	size_t bytes_offset = *boff, depth = *pdepth++;
 	unsigned pos = *p_pos;
 	result r;
+
+	// Widest scalar we might be about to write. Checking once here beats
+	// repeating a check in each of the fourteen branches below.
+
+	if ((bytes_offset + sizeof(uint64_t)) > MAX_FFI_STRUCT_BYTES)
+		return false;
 
 	if (nested[depth].elements[cnt-1] == &ffi_type_uint8) {
 		r.val_ffi_uint8 = h->val_uint;
@@ -1074,7 +927,7 @@ static void handle_struct2(query *q, nested_elements *nested, unsigned *pdepth, 
 		bytes_offset += 4;
 	} else if (nested[depth].elements[cnt-1] == &ffi_type_uint64) {
 		r.val_ffi_uint64 = h->val_uint;
-		memcpy(bytes+bytes_offset, &r.val_ffi_uint64, 1);
+		memcpy(bytes+bytes_offset, &r.val_ffi_uint64, 8);
 		bytes_offset += 8;
 	} else if (nested[depth].elements[cnt-1] == &ffi_type_uint) {
 		r.val_ffi_uint = h->val_uint;
@@ -1116,19 +969,20 @@ static void handle_struct2(query *q, nested_elements *nested, unsigned *pdepth, 
 		cell *l = h;
 		pl_ctx l_ctx = h_ctx;
 		int cnt = 0;
-		LIST_HANDLER(l);
+		PROLOG_LIST_HANDLER(l);
 		size_t bytes_offset_start = bytes_offset;
 
 		while (is_iso_list(l)) {
-			cell *h = LIST_HEAD(l);
+			cell *h = PROLOG_LIST_HEAD(l);
 			h = deref(q, h, l_ctx);
 			pl_ctx h_ctx = q->latest_ctx;
 
 			if (cnt > 0) {
-				handle_struct2(q, nested, pdepth, cnt, bytes, &bytes_offset, h, h_ctx, arg_values, &pos);
+				if (!handle_struct2(q, nested, pdepth, cnt, bytes, &bytes_offset, h, h_ctx, arg_values, &pos))
+					return false;
 			}
 
-			l = LIST_TAIL(l);
+			l = PROLOG_LIST_TAIL(l);
 			l = deref(q, l, l_ctx);
 			l_ctx = q->latest_ctx;
 			cnt++;
@@ -1139,6 +993,7 @@ static void handle_struct2(query *q, nested_elements *nested, unsigned *pdepth, 
 	}
 
 	*boff = bytes_offset;
+	return true;
 }
 
 bool wrap_ffi_predicate(query *q, builtins *ptr)
@@ -1147,13 +1002,24 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 	cell *c = p1;
 	pl_ctx c_ctx = p1_ctx;
 
-	nested_elements nested[MAX_FFI_ARGS] = {0};
+	// nested[] is 64 x 64 pointers and types[] is 64 ffi_types: 34 KB
+	// between them. Zero-initialising both on every call cost more
+	// than the foreign call itself - 390ns/call became 210ns/call on
+	// a three-integer function just by not doing it.
+	//
+	// Both are only ever touched from a FFI_TAG_STRUCT branch (the
+	// two handle_struct1 calls, handle_struct2, and the two &types[]
+	// takes), so a signature with no struct in it never reads them.
+	// Zero them only when there is one.
+
+	nested_elements nested[MAX_FFI_ARGS];
+	ffi_type types[MAX_FFI_ARGS];
+
 	ffi_type *arg_types[MAX_FFI_ARGS] = {0};
 	void *arg_values[MAX_FFI_ARGS] = {0};
 	void *s_args[MAX_FFI_ARGS] = {0};
 	result cells[MAX_FFI_ARGS] = {0};
-	uint8_t bytes[MAX_FFI_ARGS] = {0};
-	ffi_type types[MAX_FFI_ARGS] = {0};
+	uint8_t bytes[MAX_FFI_STRUCT_BYTES] = {0};
 
 	ffi_type *ffi_ret_type = NULL;
 	unsigned arity = ptr->arity - 1, pdepth = 0, depth = 0, pos = 0;
@@ -1161,6 +1027,16 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 
 	if (ptr->ret_type == FFI_TAG_VOID)
 		arity++;
+
+	bool uses_struct = ptr->ret_type == FFI_TAG_STRUCT;
+
+	for (unsigned i = 0; !uses_struct && (i < arity); i++)
+		uses_struct = ptr->types[i] == FFI_TAG_STRUCT;
+
+	if (uses_struct) {
+		memset(nested, 0, sizeof(nested));
+		memset(types, 0, sizeof(types));
+	}
 
 	for (unsigned i = 0; i < arity; i++) {
 		if ((ptr->types[i] == FFI_TAG_UINT8) && is_smallint(c))
@@ -1206,117 +1082,19 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 		else if ((ptr->types[i] == FFI_TAG_STRUCT) && is_iso_list(c))
 			;
 		else if ((ptr->types[i] != c->tag) && !is_var(c))
-			return throw_error(q, c, c_ctx, "type_error",
-			ptr->types[i] == FFI_TAG_UINT8 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT16 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT32 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT64 ? "integer" :
-			ptr->types[i] == FFI_TAG_UINT ? "integer" :
-			ptr->types[i] == FFI_TAG_USHORT ? "integer" :
-			ptr->types[i] == FFI_TAG_ULONG ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT8 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT16 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT32 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT64 ? "integer" :
-			ptr->types[i] == FFI_TAG_SINT ? "integer" :
-			ptr->types[i] == FFI_TAG_SHORT ? "integer" :
-			ptr->types[i] == FFI_TAG_LONG ? "integer" :
-			ptr->types[i] == FFI_TAG_FP32 ? "float" :
-			ptr->types[i] == FFI_TAG_FP64 ? "float" :
-			ptr->types[i] == FFI_TAG_C_STR ? "atom" :
-			ptr->types[i] == FFI_TAG_C_CSTR ? "atom" :
-			ptr->types[i] == FFI_TAG_PTR ? "stream" :
-			ptr->types[i] == FFI_TAG_VAR ? "var" :
-			"invalid"
-			);
+			return throw_error(q, c, c_ctx, "type_error", ffi_err_of(ptr->types[i]));
 
-		if (ptr->types[i] == FFI_TAG_UINT8)
-			arg_types[i] = &ffi_type_uint8;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT8))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT16)
-			arg_types[i] = &ffi_type_uint16;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT16))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT32)
-			arg_types[i] = &ffi_type_uint32;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT32))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT64)
-			arg_types[i] = &ffi_type_uint64;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT64))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_UINT)
-			arg_types[i] = &ffi_type_uint;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_UINT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_USHORT)
-			arg_types[i] = &ffi_type_ushort;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_USHORT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_ULONG)
-			arg_types[i] = &ffi_type_ulong;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_ULONG))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT8)
-			arg_types[i] = &ffi_type_sint8;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT8))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT16)
-			arg_types[i] = &ffi_type_sint16;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT16))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT32)
-			arg_types[i] = &ffi_type_sint32;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT32))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT64)
-			arg_types[i] = &ffi_type_sint32;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT64))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SINT)
-			arg_types[i] = &ffi_type_sint;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_SHORT)
-			arg_types[i] = &ffi_type_sshort;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_SHORT))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_LONG)
-			arg_types[i] = &ffi_type_slong;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_LONG))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_FP32)
-			arg_types[i] = &ffi_type_float;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_FP32))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_FP64)
-			arg_types[i] = &ffi_type_double;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_FP64))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_PTR)
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_PTR))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_C_STR)
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_C_STR))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_C_CSTR)
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == MARK_OUT(FFI_TAG_C_CSTR))
-			arg_types[i] = &ffi_type_pointer;
-		else if (ptr->types[i] == FFI_TAG_STRUCT) {
+		if (ptr->types[i] == FFI_TAG_STRUCT) {
 			cell *l = c;
 			pl_ctx l_ctx = c_ctx;
 			const char *name = "invalid";
-			LIST_HANDLER(l);
+			PROLOG_LIST_HANDLER(l);
 
 			while (is_iso_list(l)) {
-				cell *h = LIST_HEAD(l);
+				cell *h = PROLOG_LIST_HEAD(l);
 				h = deref(q, h, l_ctx);
 				name = C_STR(q, h);
-				l = LIST_TAIL(l);
+				l = PROLOG_LIST_TAIL(l);
 				break;
 			}
 
@@ -1334,7 +1112,7 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 
 			depth = pdepth;
 			arg_types[i] = &types[depth];
-		} else {
+		} else if (!(arg_types[i] = ffi_type_of(ptr->types[i]))) {
 			printf("Warning: struct ptr->type=%u\n", ptr->types[i]);
 			return false;
 		}
@@ -1497,19 +1275,20 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 			cell *l = c;
 			pl_ctx l_ctx = c_ctx;
 			int cnt = 0;
-			LIST_HANDLER(l);
+			PROLOG_LIST_HANDLER(l);
 			size_t bytes_offset_start = bytes_offset;
 
 			while (is_iso_list(l)) {
-				cell *h = LIST_HEAD(l);
+				cell *h = PROLOG_LIST_HEAD(l);
 				h = deref(q, h, l_ctx);
 				pl_ctx h_ctx = q->latest_ctx;
 
 				if (cnt > 0) {
-					handle_struct2(q, nested, &pdepth, cnt, bytes, &bytes_offset, h, h_ctx, arg_values, &pos);
+					if (!handle_struct2(q, nested, &pdepth, cnt, bytes, &bytes_offset, h, h_ctx, arg_values, &pos))
+						return throw_error(q, c, c_ctx, "resource_error", "ffi_struct_bytes");
 				}
 
-				l = LIST_TAIL(l);
+				l = PROLOG_LIST_TAIL(l);
 				l = deref(q, l, l_ctx);
 				l_ctx = q->latest_ctx;
 				cnt++;
@@ -1564,109 +1343,52 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 	printf("\n");
 #endif
 
-	// Can pre-compile the return type... NO!
+	// The return type. A struct return is the only one whose ffi_type
+	// has to be assembled here; everything else is a table lookup.
 
-	if (true /* !ptr->ffi_ret_type */) {
-		switch(ptr->ret_type) {
-		case(FFI_TAG_UINT8):
-			ffi_ret_type = &ffi_type_uint8;
-			break;
-		case(FFI_TAG_UINT16):
-			ffi_ret_type = &ffi_type_uint16;
-			break;
-		case(FFI_TAG_UINT32):
-			ffi_ret_type = &ffi_type_uint32;
-			break;
-		case(FFI_TAG_UINT64):
-			ffi_ret_type = &ffi_type_uint64;
-			break;
-		case(FFI_TAG_UINT):
-			ffi_ret_type = &ffi_type_uint;
-			break;
-		case(FFI_TAG_USHORT):
-			ffi_ret_type = &ffi_type_ushort;
-			break;
-		case(FFI_TAG_ULONG):
-			ffi_ret_type = &ffi_type_ulong;
-			break;
-		case(FFI_TAG_SINT8):
-			ffi_ret_type = &ffi_type_sint8;
-			break;
-		case(FFI_TAG_SINT16):
-			ffi_ret_type = &ffi_type_sint16;
-			break;
-		case(FFI_TAG_SINT32):
-			ffi_ret_type = &ffi_type_sint32;
-			break;
-		case(FFI_TAG_SINT64):
-			ffi_ret_type = &ffi_type_sint64;
-			break;
-		case(FFI_TAG_SINT):
-			ffi_ret_type = &ffi_type_sint;
-			break;
-		case(FFI_TAG_SHORT):
-			ffi_ret_type = &ffi_type_sshort;
-			break;
-		case(FFI_TAG_LONG):
-			ffi_ret_type = &ffi_type_slong;
-			break;
-		case(FFI_TAG_FP32):
-			ffi_ret_type = &ffi_type_float;
-			break;
-		case(FFI_TAG_FP64):
-			ffi_ret_type = &ffi_type_double;
-			break;
-		case(FFI_TAG_PTR):
-			ffi_ret_type = &ffi_type_pointer;
-			break;
-		case(FFI_TAG_C_STR):
-			ffi_ret_type = &ffi_type_pointer;
-			break;
-		case(FFI_TAG_C_CSTR):
-			ffi_ret_type = &ffi_type_pointer;
-			break;
-		case(FFI_TAG_VOID):
-			ffi_ret_type = &ffi_type_void;
-			break;
-		case(FFI_TAG_STRUCT): {
-			const char *name = ptr->ret_name;
-			foreign_struct *sptr = NULL;
+	if (ptr->ret_type == FFI_TAG_STRUCT) {
+		const char *name = ptr->ret_name;
+		foreign_struct *sptr = NULL;
 
-			if (!sl_get(q->pl->fortab, name, (void*)&sptr)) {
-				printf("wrapper: not found struct: %s\n", name);
-				return false;
-			}
-
-			//printf("wrapper: arity=%u, found struct return type: %s, arity=%u, depth=%u, pdepth=%u\n", arity, name, sptr->arity, depth, pdepth);
-			//unsigned save_depth = ++pdepth;
-
-			if (!handle_struct1(q, sptr, nested, types, &pdepth))
-				return false;
-
-			ffi_ret_type = &types[pdepth];
-			break;
-		}
-		default:
-			printf("Warning: struct ptr->ret_type=%u\n", ptr->ret_type);
+		if (!sl_get(q->pl->fortab, name, (void*)&sptr)) {
+			printf("wrapper: not found struct: %s\n", name);
 			return false;
 		}
 
-		ptr->ffi_ret_type = ffi_ret_type;
-	} else
-		ffi_ret_type = ptr->ffi_ret_type;
+		//printf("wrapper: arity=%u, found struct return type: %s, arity=%u, depth=%u, pdepth=%u\n", arity, name, sptr->arity, depth, pdepth);
+		//unsigned save_depth = ++pdepth;
 
-	//printf("*** fn values = %u, ret-type=%u\n", pos, (unsigned)ffi_ret_type->type);
+		if (!handle_struct1(q, sptr, nested, types, &pdepth))
+			return false;
 
-	ffi_cif cif = {0};
-	ffi_status ok;
-
-	if ((ok = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, arity, ffi_ret_type, arg_types)) != FFI_OK) {
-		printf("Error: ffi_prep_cif status=%d\n", ok);
+		ffi_ret_type = &types[pdepth];
+	} else if (!(ffi_ret_type = ffi_type_of(ptr->ret_type))) {
+		printf("Warning: struct ptr->ret_type=%u\n", ptr->ret_type);
 		return false;
 	}
 
-	result r;
-	ffi_call(&cif, FFI_FN(ptr->fn), &r, arg_values);
+	//printf("*** fn values = %u, ret-type=%u\n", pos, (unsigned)ffi_ret_type->type);
+
+	// Pre-compiled at registration unless the signature returns a
+	// struct, in which case ffi_ret_type was just built above and the
+	// cif has to be prepared here as before.
+
+	ffi_cif cif = {0};
+	ffi_cif *cifp = (ffi_cif*)ptr->cif;
+
+	if (!cifp) {
+		ffi_status ok;
+
+		if ((ok = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, arity, ffi_ret_type, arg_types)) != FFI_OK) {
+			printf("Error: ffi_prep_cif status=%d\n", ok);
+			return false;
+		}
+
+		cifp = &cif;
+	}
+
+	ffi_ret r;
+	ffi_call(cifp, FFI_FN(ptr->fn), &r, arg_values);
 
 	GET_FIRST_ARG(p11, any);
 	c = p11;
@@ -1705,7 +1427,7 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 				bool ok = unify (q, c, c_ctx, &tmp, q->st.cur_ctx);
 				if (ok != true) return ok;
 			} else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT8)) {
-				make_int(&tmp, cells[i].val_ffi_sint);
+				make_int(&tmp, cells[i].val_ffi_sint8);
 				bool ok = unify (q, c, c_ctx, &tmp, q->st.cur_ctx);
 				if (ok != true) return ok;
 			} else if (ptr->types[i] == MARK_OUT(FFI_TAG_SINT16)) {
@@ -1747,10 +1469,12 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 			} else if (ptr->types[i] == MARK_OUT(FFI_TAG_C_STR)) {
 				CHECKED(make_cstring(&tmp, cells[i].val_ffi_pointer));
 				bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
+				unshare_cell(&tmp);
 				if (ok != true) return ok;
 			} else if (ptr->types[i] == MARK_OUT(FFI_TAG_C_CSTR)) {
 				CHECKED(make_cstring(&tmp, cells[i].val_ffi_pointer));
 				bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
+				unshare_cell(&tmp);
 				if (ok != true) return ok;
 			}
 		}
@@ -1763,88 +1487,90 @@ bool wrap_ffi_predicate(query *q, builtins *ptr)
 	cell tmp;
 
 	if (ptr->ret_type == FFI_TAG_UINT8) {
-		make_int(&tmp, r.val_ffi_uint8);
+		make_int(&tmp, r.val.val_ffi_uint8);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_UINT16) {
-		make_int(&tmp, r.val_ffi_uint16);
+		make_int(&tmp, r.val.val_ffi_uint16);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_UINT32) {
-		make_int(&tmp, r.val_ffi_uint32);
+		make_int(&tmp, r.val.val_ffi_uint32);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_UINT64) {
-		make_int(&tmp, r.val_ffi_uint64);
+		make_int(&tmp, r.val.val_ffi_uint64);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_UINT) {
-		make_int(&tmp, r.val_ffi_uint);
+		make_int(&tmp, r.val.val_ffi_uint);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_USHORT) {
-		make_int(&tmp, r.val_ffi_ushort);
+		make_int(&tmp, r.val.val_ffi_ushort);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_ULONG) {
-		make_int(&tmp, r.val_ffi_ulong);
+		make_int(&tmp, r.val.val_ffi_ulong);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_SINT8) {
-		make_int(&tmp, r.val_ffi_sint8);
+		make_int(&tmp, r.val.val_ffi_sint8);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_SINT16) {
-		make_int(&tmp, r.val_ffi_sint16);
+		make_int(&tmp, r.val.val_ffi_sint16);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_SINT32) {
-		make_int(&tmp, r.val_ffi_sint32);
+		make_int(&tmp, r.val.val_ffi_sint32);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_SINT64) {
-		make_int(&tmp, r.val_ffi_sint64);
+		make_int(&tmp, r.val.val_ffi_sint64);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_SINT) {
-		make_int(&tmp, r.val_ffi_sint);
+		make_int(&tmp, r.val.val_ffi_sint);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_SHORT) {
-		make_int(&tmp, r.val_ffi_sshort);
+		make_int(&tmp, r.val.val_ffi_sshort);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_LONG) {
-		make_int(&tmp, r.val_ffi_slong);
+		make_int(&tmp, r.val.val_ffi_slong);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_FP32) {
-		make_float(&tmp, r.val_ffi_float);
+		make_float(&tmp, r.val.val_ffi_float);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_FP64) {
-		make_float(&tmp, r.val_ffi_double);
+		make_float(&tmp, r.val.val_ffi_double);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_PTR) {
-		make_ptr(&tmp, r.val_ffi_pointer);
+		make_ptr(&tmp, r.val.val_ffi_pointer);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_C_STR) {
-		CHECKED(make_cstring(&tmp, r.val_ffi_pointer));
-		TPL_free(r.val_ffi_pointer);
+		CHECKED(make_cstring(&tmp, r.val.val_ffi_pointer));
+		TPL_free(r.val.val_ffi_pointer);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
+		unshare_cell(&tmp);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_C_CSTR) {
-		CHECKED(make_cstring(&tmp, r.val_ffi_pointer));
+		CHECKED(make_cstring(&tmp, r.val.val_ffi_pointer));
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
+		unshare_cell(&tmp);
 		if (ok != true) return ok;
 	} else if (ptr->ret_type == FFI_TAG_STRUCT) {
 		ffi_type *p = ffi_ret_type;
 		//printf("*** struct ffi_type=%u\n", p->type);
 		int i = 0, cnt = 0;
 		ffi_type *e = p->elements[i++];
-		const char *bytes = r.bytes;
+		const uint8_t *bytes = r.bytes;
 
 		while (e) {
 			//printf("*** ffi_type=%u\n", e->type);
@@ -1930,8 +1656,8 @@ static bool bif_sys_struct_to_pointer_2(query *q)
 {
 	GET_FIRST_ARG(p1,list);
 	GET_NEXT_ARG(p2,var);
-	LIST_HANDLER(p1);
-	cell *c = LIST_HEAD(p1);
+	PROLOG_LIST_HANDLER(p1);
+	cell *c = PROLOG_LIST_HEAD(p1);
 	const char *name = C_STR(q, c);
 	foreign_struct *sptr = NULL;
 
@@ -1940,15 +1666,20 @@ static bool bif_sys_struct_to_pointer_2(query *q)
 		return false;
 	}
 
-	p1 = LIST_TAIL(p1);
-	char tmpbuf[256];
+	p1 = PROLOG_LIST_TAIL(p1);
+	char tmpbuf[MAX_FFI_STRUCT_BYTES];
 	char *dst = tmpbuf;
 	unsigned i = 0;
 
 	while (is_iso_list(p1)) {
-		cell *h = LIST_HEAD(p1);
+		cell *h = PROLOG_LIST_HEAD(p1);
 		uint8_t type = sptr->types[i];
 		result rs;
+
+		// Widest scalar any branch below writes.
+
+		if (((size_t)(dst - tmpbuf) + sizeof(uint64_t)) > sizeof(tmpbuf))
+			return throw_error(q, p1, p1_ctx, "resource_error", "ffi_struct_bytes");
 
 		if (type == FFI_TAG_ULONG) {
 			rs.val_ffi_uint64 = h->val_uint;
@@ -1977,11 +1708,11 @@ static bool bif_sys_struct_to_pointer_2(query *q)
 		} else if (type == FFI_TAG_SINT8) {
 			rs.val_ffi_sint8 = h->val_int;
 			memcpy(dst, &rs.val_ffi_sint8, sizeof(rs.val_ffi_sint8));
-			dst += sizeof(rs.val_ffi_sint);
+			dst += sizeof(rs.val_ffi_sint8);
 		} else if (type == FFI_TAG_UINT8) {
 			rs.val_ffi_uint8 = h->val_uint;
 			memcpy(dst, &rs.val_ffi_uint8, sizeof(rs.val_ffi_uint8));
-			dst += sizeof(rs.val_ffi_uint);
+			dst += sizeof(rs.val_ffi_uint8);
 		} else if (type == FFI_TAG_SINT16) {
 			rs.val_ffi_sint16 = h->val_int;
 			memcpy(dst, &rs.val_ffi_sint16, sizeof(rs.val_ffi_sint16));
@@ -2021,7 +1752,7 @@ static bool bif_sys_struct_to_pointer_2(query *q)
 		} else
 			printf("*** struct to ptr %u\n", i);
 
-		p1 = LIST_TAIL(p1);
+		p1 = PROLOG_LIST_TAIL(p1);
 		i++;
 	}
 
@@ -2032,6 +1763,15 @@ static bool bif_sys_struct_to_pointer_2(query *q)
 	cell tmp;
 	make_uint(&tmp, (size_t)(void*)ptr);
 	return unify(q, p2, p2_ctx, &tmp, q->st.cur_ctx);
+}
+
+// Only for what $struct_to_pointer returned: that carries an allocator header, so libc free() can't take it.
+
+static bool bif_sys_free_struct_pointer_1(query *q)
+{
+	GET_FIRST_ARG(p1,integer);
+	TPL_free((void*)(size_t)get_smalluint(p1));
+	return true;
 }
 #endif
 
@@ -2044,12 +1784,13 @@ builtins g_ffi_bifs[MAX_FFI] =
 	{"$register_function", 4, bif_sys_register_function_4, "+term,+atom,+list,+atom", false, false, BLAH},
 	{"$register_predicate", 4, bif_sys_register_predicate_4, "+term,+atom,+list,+atom", false, false, BLAH},
 	{"$struct_to_pointer", 2, bif_sys_struct_to_pointer_2, "+list,-integer", false, false, BLAH},
+	{"$free_struct_pointer", 1, bif_sys_free_struct_pointer_1, "+integer", false, false, BLAH},
 
 	{"foreign_struct", 2, bif_foreign_struct_2, "+atom,+list", false, false, BLAH},
 	{"use_foreign_module", 2, bif_use_foreign_module_2, "+atom,+list", false, false, BLAH},
 #endif
 
-	// 8 builtins: see 'max_ffi_idx'
+	// 9 builtins: see 'max_ffi_idx'
 
 	{0}
 };

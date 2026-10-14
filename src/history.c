@@ -17,10 +17,14 @@
 #endif
 
 #if defined(USE_EDITLINE) && !defined(__wasi__)
+#if !defined(_WIN32)
 #include <histedit.h>
+#endif
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+#include <readline/readline.h>
+#include <readline/history.h>
+#else
 #include <editline/readline.h>
-#if defined __NetBSD__
-#include <editline/history.h>
 #endif
 #endif
 
@@ -37,24 +41,27 @@
 #include "history.h"
 #include "prolog.h"
 
+// Turning off line buffering and echo only applies to a terminal. When
+// input is a pipe or a file there is nothing to turn off, so read it as
+// it comes rather than failing: bailing out here handed the caller a -1
+// it could not tell apart from end of input, and it had consumed nothing.
+
 int history_getch_fd(int fd)
 {
 #if !defined(_WIN32) && !defined(__wasi__)
 	struct termios oldattr, newattr;
+	bool is_tty = !tcgetattr(fd, &oldattr);
 
-	if (tcgetattr(fd, &oldattr) != 0)
-		return -1;
-
-	newattr = oldattr;
-	newattr.c_lflag &= ~(ICANON | ECHO);
-
-	if (tcsetattr(fd, TCSANOW, &newattr) != 0)
-		return -1;
+	if (is_tty) {
+		newattr = oldattr;
+		newattr.c_lflag &= ~(ICANON | ECHO);
+		is_tty = !tcsetattr(fd, TCSANOW, &newattr);
+	}
 #endif
 	int ch = fgetc_utf8(stdin);
 #if !defined(_WIN32) && !defined(__wasi__)
-	if (tcsetattr(fd, TCSANOW, &oldattr) != 0)
-		return -1;
+	if (is_tty)
+		tcsetattr(fd, TCSANOW, &oldattr);
 #endif
 	return ch;
 }
@@ -80,11 +87,11 @@ LOOP:
 
 	if (cmd) {
 		size_t n = strlen(cmd) + strlen(line);
-		cmd = realloc(cmd, n+1);
+		cmd = TPL_realloc(cmd, n+1);
 		ENSURE(cmd);
 		strcat(cmd, line);
 	} else {
-		cmd = strdup(line);
+		cmd = TPL_strdup(line);
 	}
 
 	free(line);
@@ -101,7 +108,7 @@ LOOP:
 			end_ptr--;
 		}
 
-		while (isspace(*end_ptr)) {
+		while (isspace((unsigned char)*end_ptr)) {
 			*end_ptr = '\0';
 			end_ptr--;
 		}
@@ -114,7 +121,7 @@ LOOP:
 		}
 
 		if (ch == 0) {
-			cmd = realloc(cmd, strlen(cmd)+1+1);
+			cmd = TPL_realloc(cmd, strlen(cmd)+1+1);
 			ENSURE(cmd);
 			strcat(cmd, "\n");
 			prompt = "";
@@ -140,7 +147,7 @@ static char *functor_name_generator(const char *text, int state)
 	static int s_os_list_index, s_os_len;
 	static int s_other_list_index, s_other_len;
 	static int s_posix_list_index, s_posix_len;
-	static int s_maps_list_index, s_maps_len;
+	static int s_misc_list_index, s_misc_len;
 	static int s_sort_list_index, s_sort_len;
 	static int s_streams_list_index, s_streams_len;
 	static int s_sregex_list_index, s_sregex_len;
@@ -165,7 +172,7 @@ static char *functor_name_generator(const char *text, int state)
 		s_other_list_index = 0; s_other_len = strlen(text);
 		s_os_list_index = 0; s_os_len = strlen(text);
 		s_posix_list_index = 0; s_posix_len = strlen(text);
-		s_maps_list_index = 0; s_maps_len = strlen(text);
+		s_misc_list_index = 0; s_misc_len = strlen(text);
 		s_sort_list_index = 0; s_sort_len = strlen(text);
 		s_streams_list_index = 0; s_streams_len = strlen(text);
 		s_sregex_list_index = 0; s_sregex_len = strlen(text);
@@ -229,10 +236,10 @@ static char *functor_name_generator(const char *text, int state)
 			return strdup(name);
 	}
 
-	while ((name = g_maps_bifs[s_maps_list_index].name)) {
-		s_maps_list_index++;
+	while ((name = g_misc_bifs[s_misc_list_index].name)) {
+		s_misc_list_index++;
 
-		if (strncmp(name, text, s_maps_len) == 0)
+		if (strncmp(name, text, s_misc_len) == 0)
 			return strdup(name);
 	}
 
@@ -338,11 +345,11 @@ LOOP:
 
 	if (cmd) {
 		size_t n = strlen(cmd) + strlen(line);
-		cmd = realloc(cmd, n+1);
+		cmd = TPL_realloc(cmd, n+1);
 		ENSURE(cmd);
 		strcat(cmd, line);
 	} else {
-		cmd = strdup(line);
+		cmd = TPL_strdup(line);
 	}
 
 	free(line);
@@ -352,7 +359,7 @@ LOOP:
 		int ch = get_char_utf8(&s);
 		const char *end_ptr = cmd + strlen(cmd) - (strlen(cmd) ? 1 : 0);
 
-		while (isspace(*end_ptr) && (end_ptr != cmd))
+		while (isspace((unsigned char)*end_ptr) && (end_ptr != cmd))
 			end_ptr--;
 
 		if ((ch == 0) && (*end_ptr == eol)) {
@@ -363,7 +370,7 @@ LOOP:
 		}
 
 		if (ch == 0) {
-			cmd = realloc(cmd, strlen(cmd)+1+1);
+			cmd = TPL_realloc(cmd, strlen(cmd)+1+1);
 			ENSURE(cmd);
 			strcat(cmd, "\n");
 			prompt = "";

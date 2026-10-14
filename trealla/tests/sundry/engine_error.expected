@@ -1,0 +1,8 @@
+evaluable ok
+type ok
+no_data ok
+explicit ok
+fresh_vars ok
+nested ok
+after_yield ok
+caught_inside ok

@@ -14,6 +14,7 @@
 #include "history.h"
 #include "library.h"
 #include "module.h"
+#include "network.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -36,12 +37,6 @@
 }
 #endif
 
-void sigfn(int s)
-{
-	g_tpl_interrupt = s;
-	//if (s == SIGALRM) printf("*** SIGALRM\n");
-}
-
 #ifndef __wasi__
 static int daemonize(int argc, char *argv[])
 {
@@ -63,6 +58,7 @@ static int daemonize(int argc, char *argv[])
 
 #ifdef _WIN32
 	char cmd[1024], args[1024 * 8];
+	size_t args_len = 0;
 	args[0] = 0;
 	snprintf(cmd, sizeof(cmd), "%s.exe", argv[0]);
 
@@ -71,11 +67,9 @@ static int daemonize(int argc, char *argv[])
 			continue;
 
 		if (!args[0])
-			strcat(args, " ");
+			args_len += snprintf(args + args_len, sizeof(args) - args_len, " ");
 
-		strcat(args, "\"");
-		strcat(args, argv[i]);
-		strcat(args, "\"");
+		args_len += snprintf(args + args_len, sizeof(args) - args_len, "\"%s\"", argv[i]);
 	}
 
 	STARTUPINFO startInfo = {0};
@@ -145,7 +139,26 @@ static int daemonize(int argc, char *argv[])
 }
 #endif
 
-char **g_envp = NULL;
+extern char **g_envp;
+
+extern int g_index_check;
+extern int g_no_jit_index;
+extern unsigned long g_index_check_lookups, g_index_check_bad;
+
+static void index_check_report(void)
+{
+	// Nothing verified and nothing wrong: stay silent. A sweep runs
+	// thousands of short processes that never touch an index, and some
+	// tests fold stderr into their golden output.
+
+	if (!g_index_check || (!g_index_check_lookups && !g_index_check_bad))
+		return;
+
+	fflush(stdout);
+	fprintf(stderr, "index-check: %lu indexed lookup%s verified, %lu mismatch%s\n",
+		g_index_check_lookups, g_index_check_lookups == 1 ? "" : "s",
+		g_index_check_bad, g_index_check_bad == 1 ? "" : "es");
+}
 
 #ifdef __wasi__
 int main(int ac, char *av[])
@@ -171,15 +184,14 @@ int main(int ac, char *av[], char * envp[])
 	char histfile[1024];
 	snprintf(histfile, sizeof(histfile), "%s/%s", homedir, ".tpl_history");
 	//bool did_load = false;
-	int i, do_goal = 0, do_lib = 0, do_log = 0, do_restore = 0;
+	int i, do_goal = 0, do_lib = 0;
 	int version = 0, daemon = 0;
 	bool no_res = false, quiet = false;
-	const char *restore_file = NULL;
 
 	for (i = 1; i < ac; i++) {
 		if (!strcmp(av[i], "--library")) {
 			if (++i < ac) {
-				g_tpl_lib = strdup(av[i]);
+				g_tpl_lib = TPL_strdup(av[i]);
 			}
 		}
 	}
@@ -206,6 +218,11 @@ int main(int ac, char *av[], char * envp[])
 		} else if (!strcmp(av[i], "-q") || !strcmp(av[i], "--quiet")) {
 			quiet = true;
 			set_quiet(pl);
+		} else if (!strcmp(av[i], "--index-check")) {
+			g_index_check = 1;
+			atexit(index_check_report);
+		} else if (!strcmp(av[i], "--nojitindex")) {
+			g_no_jit_index = 1;
 		} else if (!strcmp(av[i], "--nolimit")) {
 			set_limit(pl, 0);
 		} else if (!strcmp(av[i], "-O0") || !strcmp(av[i], "--noopt")) {
@@ -230,12 +247,12 @@ int main(int ac, char *av[], char * envp[])
 	} else {
 #ifndef _WIN32
 		struct sigaction sa;
-		sa.sa_handler = &sigfn;
+		sa.sa_handler = &g_sigfn;
 		sigemptyset(&sa.sa_mask);
 		sa.sa_flags = 0;
 		sigaction(SIGINT, &sa, NULL);
 #else
-		signal(SIGINT, &sigfn);
+		signal(SIGINT, &g_sigfn);
 #endif
 	}
 #endif
@@ -266,7 +283,18 @@ int main(int ac, char *av[], char * envp[])
 	if (!no_res && !version)
 		pl_consult(pl, "~/.tplrc");
 
-	const char *goal = NULL;
+	// Every -g/-e/--goal used to overwrite the last one, so only the
+	// FINAL flag on the command line ever ran - documented ("only used
+	// once") rather than fixed. Accumulate instead, and run each in
+	// the order given, in the same position (after every file on the
+	// command line has been consulted) that the single goal ran in
+	// before. 16 is far more than any real invocation needs; past that
+	// an extra -g is more likely a mistake than a real request, so it
+	// is reported rather than silently dropped.
+
+#define MAX_GOALS 16
+	const char *goals[MAX_GOALS];
+	int n_goals = 0;
 
 	for (i = 1; i < ac; i++) {
 		if (!strcmp(av[i], "--"))
@@ -274,6 +302,7 @@ int main(int ac, char *av[], char * envp[])
 
 #if 0
 		if ((av[i][0] == '-') && did_load) {
+			fflush(stdout);
 			fprintf(stderr, "Error: options entered after files\n");
 			pl_destroy(pl);
 			return 0;
@@ -292,10 +321,6 @@ int main(int ac, char *av[], char * envp[])
 		} else if (!strcmp(av[i], "--library")) {
 			do_goal = 0;
 			do_lib = 1;
-		} else if (!strcmp(av[i], "--restore")) {
-			do_restore = 1;
-		} else if (!strcmp(av[i], "--log")) {
-			do_log = 1;
 		} else if (!strcmp(av[i], "-f") || !strcmp(av[i], "-l") || !strcmp(av[i], "--file") || !strcmp(av[i], "--consult-file")) {
 			if (!strcmp(av[i], "-f"))
 				no_res = true;
@@ -307,23 +332,22 @@ int main(int ac, char *av[], char * envp[])
 		} else if (av[i][0] == '-') {
 			continue;
 		} else if (do_lib) {
-			g_tpl_lib = strdup(av[i]);
+			g_tpl_lib = TPL_strdup(av[i]);
 			do_lib = 0;
 		} else if (do_goal) {
 			do_goal = 0;
-			goal = av[i];
-		} else if (do_restore) {
-			restore_file = av[i];
-			do_restore = 0;
-		} else if (do_log) {
-			if (!pl_logging(pl, av[i])) {
-				fprintf(stderr, "Error: error(existence_error(source_sink,'%s'),log_save)\n", av[i]);
+
+			if (n_goals >= MAX_GOALS) {
+				fflush(stdout);
+				fprintf(stderr, "Error: too many -g goals (max %d)\n", MAX_GOALS);
 				pl_destroy(pl);
 				return 1;
 			}
-			do_log = 0;
+
+			goals[n_goals++] = av[i];
 		} else {
 			if (!pl_consult(pl, av[i])) {
+				fflush(stdout);
 				fprintf(stderr, "Error: error(existence_error(source_sink,'%s'),consult/1)\n", av[i]);
 				pl_destroy(pl);
 				return 1;
@@ -331,16 +355,8 @@ int main(int ac, char *av[], char * envp[])
 		}
 	}
 
-	if (restore_file) {
-		if (!pl_restore(pl, restore_file)) {
-			fprintf(stderr, "Error: error(existence_error(source_sink,'%s'),restore_file)\n", restore_file);
-			pl_destroy(pl);
-			return 1;
-		}
-	}
-
-	if (goal) {
-		if (!pl_eval(pl, goal, false)) {
+	for (i = 0; i < n_goals; i++) {
+		if (!pl_eval(pl, goals[i], false)) {
 			int halt_code = get_halt_code(pl);
 			pl_destroy(pl);
 			return halt_code;
@@ -363,7 +379,7 @@ int main(int ac, char *av[], char * envp[])
 		fprintf(stdout, "  -f\t\t\t- ~/.tplrc not loaded\n");
 		fprintf(stdout, "  -l file\t\t- load file\n");
 		fprintf(stdout, "  file\t\t\t- load file\n");
-		fprintf(stdout, "  -g goal\t\t- query goal (only used once)\n");
+		fprintf(stdout, "  -g goal\t\t- query goal (may be repeated, up to %d, run in order)\n", MAX_GOALS);
 		fprintf(stdout, "  --library path\t- alt to TPL_LIBRARY_PATH env variable\n");
 		fprintf(stdout, "  -v, --version\t\t- print version info and exit\n");
 		fprintf(stdout, "  -h, --help\t\t- print help info and exit\n");
@@ -374,9 +390,9 @@ int main(int ac, char *av[], char * envp[])
 		fprintf(stdout, "  -w, --watchdog\t- create watchdog\n");
 		fprintf(stdout, "  --autofail\t\t- autofail queries\n");
 		fprintf(stdout, "  --consult\t\t- consult from STDIN\n");
-		fprintf(stdout, "  --log file\t\t- enable log file\n");
 		fprintf(stdout, "  --nolimit\t\t- no memory limit\n");
-		//fprintf(stdout, "  --restore file\t\t- reload log file\n");
+		fprintf(stdout, "  --nojitindex\t\t- build clause indexes on assert, not on first lookup\n");
+		fprintf(stdout, "  --index-check\t\t- verify indexed lookups against a linear scan (debug, slow)\n");
 	}
 
 	if (version) {
@@ -396,8 +412,8 @@ int main(int ac, char *av[], char * envp[])
 		} else {
 			size_t n = 0;
 
-			if (getline(&line, &n, pl_stdin(pl)) < 0) {
-				free(line);
+			if (tpl_getline_fp(&line, &n, pl_stdin(pl)) < 0) {
+				TPL_free(line);
 				break;
 			}
 
@@ -407,6 +423,11 @@ int main(int ac, char *av[], char * envp[])
 				len--;
 
 			if (len && (line[len-1] != '.')) {
+				// stdout is block-buffered when it is not a tty and stderr
+				// is not buffered at all, so this would otherwise appear
+				// above the output it comes after.
+
+				fflush(stdout);
 				fprintf(stderr, "Error: error(syntax_error(unterminated),read_term/3)\n");
 				pl_destroy(pl);
 				return 1;
@@ -419,7 +440,7 @@ int main(int ac, char *av[], char * envp[])
 			src++;
 
 		if (!*src || (*src == '\n')) {
-			free(line);
+			TPL_free(line);
 			continue;
 		}
 
@@ -435,7 +456,7 @@ int main(int ac, char *av[], char * envp[])
 		} while (pl_redo(subq));
 #endif
 
-		free(line);
+		TPL_free(line);
 
 		if (get_halt(pl))
 			break;

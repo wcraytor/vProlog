@@ -1,12 +1,14 @@
 #include <ctype.h>
 #include <fenv.h>
 #include <float.h>
+#include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
 #include "module.h"
+#include "network.h"
 #include "parser.h"
 #include "prolog.h"
 #include "query.h"
@@ -49,17 +51,23 @@ cell *list_head(cell *l, cell *tmp)
 	const char *src = is_slice(l) ? l->val_str : is_strbuf(l) ? (char*)l->val_strb->cstr + l->strb_off : (char*)l->val_chr + l->val_off;
 	tmp->num_cells = 1;
 	tmp->flags = 0;
-	tmp->arity = 0;
+
+	// A byte string is not UTF-8, so each byte is its own code point.
 
 	if (is_codes(l)) {
 		tmp->tag = TAG_INT;
-		tmp->val_int = peek_char_utf8(src);
+		tmp->val_int = is_bytes(l) ? (unsigned char)*src : peek_char_utf8(src);
 	} else {
-		size_t char_len = len_char_utf8(src);
+		size_t char_len = is_bytes(l)
+			? put_char_utf8(tmp->val_chr, (unsigned char)*src)
+			: len_char_utf8(src);
 
 		if (char_len <= MAX_SMALL_STRING) {
 			tmp->tag = TAG_CSTR;
-			memcpy(tmp->val_chr, src, char_len);
+
+			if (!is_bytes(l))
+				memcpy(tmp->val_chr, src, char_len);
+
 			tmp->val_chr[char_len] = '\0';
 			tmp->chr_len = char_len;
 		} else {
@@ -67,6 +75,8 @@ cell *list_head(cell *l, cell *tmp)
 			tmp->val_off = g_nil_s;
 		}
 	}
+
+	set_arity(tmp, 0);
 
 	return tmp;
 }
@@ -79,14 +89,14 @@ cell *list_tail(cell *l, cell *tmp)
 	}
 
 	const char *src = is_slice(l) ? l->val_str : is_strbuf(l) ? (char*)l->val_strb->cstr + l->strb_off : (char*)l->val_chr;
-	size_t char_len = len_char_utf8(src);
+	size_t char_len = is_bytes(l) ? 1 : len_char_utf8(src);
 	size_t str_len = is_slice(l) ? (size_t)l->str_len : is_strbuf(l) ? (size_t)l->val_strb->len - l->strb_off : (unsigned)l->chr_len;
 
 	if (str_len == char_len) {
 		tmp->tag = TAG_INTERNED;
 		tmp->num_cells = 1;
-		tmp->arity = 0;
 		tmp->flags = 0;
+		set_arity(tmp, 0);
 		tmp->val_off = g_nil_s;
 		return tmp;
 	}
@@ -121,7 +131,7 @@ cell *get_logical_body(cell *c)
 
 	// A body of just 'true' is equivalent to no body at all,
 
-	if (!body->arity && is_interned(body) && (body->val_off == g_true_s))
+	if (!get_arity(body) && is_interned(body) && (body->val_off == g_true_s))
 		return NULL;
 
 	return body;
@@ -156,6 +166,16 @@ static void *make_string_internal(cell *c, const char *s, size_t n, size_t off)
 	return strb;
 }
 
+bool make_cstring(cell *d, const char *s)
+{
+	return make_cstringn(d, s, strlen(s));
+}
+
+bool make_string(cell *d, const char *s)
+{
+	return make_stringn(d, s, strlen(s));
+}
+
 bool make_cstringn(cell *d, const char *s, size_t n)
 {
 	if (!n) {
@@ -186,7 +206,7 @@ bool make_stringn(cell *d, const char *s, size_t n)
 	d->tag = TAG_CSTR;
 	d->flags = FLAG_CSTR_STRING;
 	d->num_cells = 1;
-	d->arity = 2;
+	set_arity(d, 2);
 	make_string_internal(d, s, n, 0);
 	return true;
 }
@@ -205,6 +225,7 @@ cell *make_nil(void)
 		.tag = TAG_INTERNED,
 		.num_cells = 1,
 		.flags = 0,
+		.small_arity = 0,
 		.arity = 0,
 		.val_off = 0
 	};
@@ -323,7 +344,15 @@ static bool make_room(parser *p, unsigned num)
 		pl_idx num_cells = (p->cl->num_allocated_cells + num) * 3 / 2;
 
 		clause *cl = TPL_realloc(p->cl, sizeof(clause)+(sizeof(cell)*num_cells));
-		ENSURE(cl);
+
+		// Sticky, so a caller that cannot report the failure itself still
+		// stops the parse rather than writing past the clause.
+
+		if (!cl) {
+			p->error = true;
+			return false;
+		}
+
 		p->cl = cl;
 		p->cl->num_allocated_cells = num_cells;
 	}
@@ -333,7 +362,9 @@ static bool make_room(parser *p, unsigned num)
 
 static cell *make_a_cell(parser *p)
 {
-	make_room(p, 1);
+	if (!make_room(p, 1))
+		return NULL;
+
 	cell *ret = p->cl->cells + p->cl->cidx++;
 	*ret = (cell){0};
 	return ret;
@@ -347,7 +378,7 @@ void parser_reset(parser *p)
 	p->is_command = p->is_comment = p->is_consulting = p->is_symbol = false;
 	p->is_string = p->is_quoted = p->is_var = p->is_op = p->skip = p->last_close = false;
 	p->last_neg = p->no_fp = p->reuse= p->in_body = false;
-	p->is_number_chars = false;
+	p->is_number_chars = p->expand_dcg = false;
 
 	SB_free(p->token);
 	p->nesting_parens = p->nesting_brackets = p->nesting_braces = 0;
@@ -355,9 +386,12 @@ void parser_reset(parser *p)
 	p->start_term = true;
 	p->error = false;
 	p->error_desc = NULL;
+	p->error_type = NULL;
 	p->cl->cidx = 0;
 	p->flags = p->m->flags;
 }
+
+static void vartab_free(parser *p);
 
 void parser_destroy(parser *p)
 {
@@ -372,18 +406,39 @@ void parser_destroy(parser *p)
 
 	p->save_line = NULL;
 	p->cl = NULL;
+	vartab_free(p);
 	TPL_free(p);
 }
 
+// Returns NULL when out of memory rather than aborting. Exception
+// delivery reparses the ball through parse_to_heap(), which needs a
+// parser, so aborting here turned a catchable resource_error(memory)
+// into a crash -- the tail of issue #801. Every caller checks.
+
 parser *parser_create(module *m)
 {
+	return parser_create_sized(m, INITIAL_NBR_CELLS);
+}
+
+// Room for a term of num_cells and the end assign_vars() adds, which make_room() wants a spare cell past.
+
+parser *parser_create_sized(module *m, pl_idx num_cells)
+{
 	parser *p = TPL_calloc(1, sizeof(parser));
-	ENSURE(p);
+
+	if (!p)
+		return NULL;
+
 	p->pl = m->pl;
 	p->m = m;
-	pl_idx num_cells = INITIAL_NBR_CELLS;
+	num_cells += 2;
 	p->cl = TPL_calloc(1, sizeof(clause)+(sizeof(cell)*num_cells));
-	ENSURE(p->cl, TPL_free(p));
+
+	if (!p->cl) {
+		TPL_free(p);
+		return NULL;
+	}
+
 	p->cl->num_allocated_cells = num_cells;
 	p->start_term = true;
 	p->flags = m->flags;
@@ -393,10 +448,10 @@ parser *parser_create(module *m)
 
 static void consultall(parser *p, cell *l)
 {
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_list(l)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 
 		if (is_iso_list(h))
 			consultall(p, h);
@@ -407,26 +462,64 @@ static void consultall(parser *p, cell *l)
 				fprintf(stderr, "Error: file not found: '%s'\n", s);
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 	}
 }
+
+static bool is_dir_sep(int ch)
+{
+#ifdef _WIN32
+	// Backslash only counts on Windows: on POSIX it is an ordinary
+	// character and a file may legitimately be named with one.
+
+	return (ch == '/') || (ch == '\\');
+#else
+	return ch == '/';
+#endif
+}
+
+static const char *last_dir_sep(const char *s)
+{
+	const char *last = NULL;
+
+	for (const char *p = s; *p; p++) {
+		if (is_dir_sep(*p))
+			last = p;
+	}
+
+	return last;
+}
+
+// A name that already carries a directory is taken as given; a bare one
+// - or an explicitly upward one - is taken relative to the file doing
+// the consulting.
+//
+// basefile is whatever realpath() handed back, and on Windows that is
+// backslash-separated. Scanning for '/' alone found no separator there
+// at all, so the directory was truncated away and the name was left to
+// resolve against the working directory instead of against the
+// consulting file. Consulting a bare name from a file in a
+// subdirectory could only work if the two happened to coincide.
 
 char *relative_to(const char *basefile, const char *relfile)
 {
 	char *tmpbuf = TPL_malloc(strlen(basefile) + strlen(relfile) + 256);
 	ENSURE(tmpbuf);
 	char *ptr = tmpbuf;
+	bool upward = !strncmp(relfile, "../", 3);
 
-	if (!strncmp(relfile, "../", 3) || !strchr(relfile, '/')) {
+#ifdef _WIN32
+	upward = upward || !strncmp(relfile, "..\\", 3);
+#endif
+
+	if (upward || !last_dir_sep(relfile)) {
 		strcpy(tmpbuf, basefile);
-		ptr = tmpbuf + strlen(tmpbuf) - 1;
+		const char *sep = last_dir_sep(tmpbuf);
 
-		while ((ptr != tmpbuf) && (*ptr != '/'))
-			ptr--;
+		// Keep the separator the base was written with, so a Windows
+		// path stays a Windows path.
 
-		if (ptr != tmpbuf)
-			*ptr++ = '/';
-
+		ptr = sep ? tmpbuf + (sep - tmpbuf) + 1 : tmpbuf;
 		*ptr = '\0';
 	}
 
@@ -434,7 +527,7 @@ char *relative_to(const char *basefile, const char *relfile)
 	return tmpbuf;
 }
 
-static void do_op(parser *p, cell *c, bool make_public)
+static void do_op(parser *p, cell *c, bool make_public, bool exported)
 {
 	cell *p1 = c + 1, *p2 = c + 2, *p3 = c + 3;
 
@@ -472,16 +565,16 @@ static void do_op(parser *p, cell *c, bool make_public)
 	}
 
 	TPL_free(spec);
-	LIST_HANDLER(p3);
+	PROLOG_LIST_HANDLER(p3);
 
 	while (is_list(p3)) {
-		cell *h = LIST_HEAD(p3);
+		cell *h = PROLOG_LIST_HEAD(p3);
 
 		if (is_atom(h)) {
 			char *name = DUP_STRING(p, h);
 
 			unsigned tmp_optype = 0;
-			unsigned tmp_pri = search_op(p->m, name, &tmp_optype, p3->arity);
+			unsigned tmp_pri = search_op(p->m, name, &tmp_optype, get_arity(p3));
 
 			if (IS_INFIX(specifier) && IS_POSTFIX(tmp_optype) && (true || p->m->flags.strict_iso)) {
 				if (!p->do_read_term)
@@ -507,6 +600,9 @@ static void do_op(parser *p, cell *c, bool make_public)
 				continue;
 			}
 
+			if (exported)
+				export_op(p->m, name, specifier);
+
 			if (make_public) {
 				if (!set_op(p->pl->user_m, name, specifier, get_smallint(p1))) {
 					if (!p->do_read_term)
@@ -520,13 +616,13 @@ static void do_op(parser *p, cell *c, bool make_public)
 			TPL_free(name);
 		}
 
-		p3 = LIST_TAIL(p3);
+		p3 = PROLOG_LIST_TAIL(p3);
 	}
 
 	if (is_atom(p3) && !is_nil(p3)) {
 		char *name = DUP_STRING(p, p3);
 		unsigned tmp_optype = 0;
-		unsigned tmp_pri = search_op(p->m, name, &tmp_optype, p3->arity);
+		unsigned tmp_pri = search_op(p->m, name, &tmp_optype, get_arity(p3));
 
 		if (IS_INFIX(specifier) && IS_POSTFIX(tmp_optype) && (true || p->m->flags.strict_iso)) {
 			if (!p->do_read_term)
@@ -552,6 +648,9 @@ static void do_op(parser *p, cell *c, bool make_public)
 			return;
 		}
 
+		if (exported)
+			export_op(p->m, name, specifier);
+
 		if (make_public) {
 			if (!set_op(p->pl->user_m, name, specifier, get_smallint(p1))) {
 				if (!p->do_read_term)
@@ -566,18 +665,64 @@ static void do_op(parser *p, cell *c, bool make_public)
 	}
 }
 
+// One place to report a directive the loader could not make sense of.
+// The wording is kept as it was: some callers treat it as an error and
+// stop the load, others merely warn and carry on.
+
+static void report_unknown_directive(parser *p, const char *severity, const char *dirname, unsigned arity)
+{
+	if (p->do_read_term || p->pl->quiet)
+		return;
+
+	fflush(stdout);
+	fprintf(stderr, "%s: unknown directive: %s/%u\n", severity, dirname, arity);
+}
+
+// Runs a directive's goal, distinguishing a goal that raised from one
+// that merely failed so the two can be reported differently...
+
+static bool goal_run_reporting(parser *p, cell *goal, bool *raised)
+{
+	*raised = false;
+
+	if (p->error || p->internal || !is_interned(goal))
+		return false;
+
+	query *q = query_create(p->m);
+
+	if (!q) {
+		p->error = true;
+		return false;
+	}
+
+	execute(q, goal, p->cl->num_vars);
+	bool ok = (q->retry == QUERY_OK);
+
+	if (!ok)
+		*raised = q->did_throw || q->error;
+
+	query_destroy(q);
+	return ok;
+}
+
 static bool goal_run(parser *p, cell *goal)
 {
 	if (p->error || p->internal || !is_interned(goal))
 		return false;
 
-	if ((goal->val_off == g_goal_expansion_s) && (goal->arity == 2))
+	if ((goal->val_off == g_goal_expansion_s) && (get_arity(goal) == 2))
 		return false;
 
 	if (goal->val_off == g_cut_s)
 		return false;
 
 	query *q = query_create(p->m);
+
+	if (!q) {
+		p->error = true;
+		return false;
+	}
+
 	execute(q, goal, p->cl->num_vars);
 
 	if (q->retry != QUERY_OK) {
@@ -606,50 +751,649 @@ static bool conditionals(parser *p, cell *d)
 
 	const char *dirname = C_STR(p, c);
 
-	if (!strcmp(dirname, "if") && (c->arity == 1) && !p->m->ifs_blocked[p->m->if_depth]) {
+	if (!strcmp(dirname, "if") && (get_arity(c) == 1) && !p->m->ifs_blocked[p->m->if_depth]) {
 		bool ok = goal_run(p, FIRST_ARG(c));
 		p->m->ifs_blocked[++p->m->if_depth] = !ok;
 		p->m->ifs_done[p->m->if_depth] = ok;
 		return true;
 	}
 
-	if (!strcmp(dirname, "if") && (c->arity == 1)) {
+	if (!strcmp(dirname, "if") && (get_arity(c) == 1)) {
 		bool save1 = p->m->ifs_blocked[p->m->if_depth];
 		p->m->ifs_blocked[++p->m->if_depth] = save1;
 		p->m->ifs_done[p->m->if_depth] = true;
 		return true;
 	}
 
-	if (!strcmp(dirname, "elif") && (c->arity == 1) && !p->m->ifs_done[p->m->if_depth] && p->m->ifs_blocked[p->m->if_depth]) {
+	if (!strcmp(dirname, "elif") && (get_arity(c) == 1) && !p->m->ifs_done[p->m->if_depth] && p->m->ifs_blocked[p->m->if_depth]) {
 		bool ok = goal_run(p, FIRST_ARG(c));
 		p->m->ifs_blocked[p->m->if_depth] = !ok;
 		p->m->ifs_done[p->m->if_depth] = ok;
 		return true;
 	}
 
-	if (!strcmp(dirname, "elif") && (c->arity == 1)) {
+	if (!strcmp(dirname, "elif") && (get_arity(c) == 1)) {
 		p->m->ifs_blocked[p->m->if_depth] = true;
 		return true;
 	}
 
-	if (!strcmp(dirname, "else") && (c->arity == 0) && !p->m->ifs_done[p->m->if_depth] && p->m->ifs_blocked[p->m->if_depth]) {
+	if (!strcmp(dirname, "else") && (get_arity(c) == 0) && !p->m->ifs_done[p->m->if_depth] && p->m->ifs_blocked[p->m->if_depth]) {
 		p->m->ifs_blocked[p->m->if_depth] = false;
 		p->m->ifs_done[p->m->if_depth] = true;
 		return true;
 	}
 
-	if (!strcmp(dirname, "else") && (c->arity == 0)) {
+	if (!strcmp(dirname, "else") && (get_arity(c) == 0)) {
 		p->m->ifs_blocked[p->m->if_depth] = true;
 		return true;
 	}
 
-	if (!strcmp(dirname, "endif") && (c->arity == 0)) {
+	if (!strcmp(dirname, "endif") && (get_arity(c) == 0)) {
 		--p->m->if_depth;
 		return true;
 	}
 
 	return false;
 }
+
+// Quads are queries using answer descriptions: a '?- Query.' term
+// followed by terms describing the expected toplevel answers. See
+// github.com/trealla-prolog/trealla issue #1063. Each quad is recorded
+// as a '$quad'(Query, VarNames, AnswerDescription, File, Line) fact
+// so that library(quads) can interpret them as tests at run time.
+// Nothing is executed at load time.
+
+void quad_reset(module *m)
+{
+	if (m->quad_query) {
+		cell *c = m->quad_query;
+		pl_idx num_cells = c->num_cells;
+
+		for (pl_idx i = 0; i < num_cells; i++, c++)
+			unshare_cell(c);
+
+		TPL_free(m->quad_query);
+		m->quad_query = NULL;
+	}
+
+	if (m->quad_name) {
+		cell *c = m->quad_name;
+		pl_idx num_cells = c->num_cells;
+
+		for (pl_idx i = 0; i < num_cells; i++, c++)
+			unshare_cell(c);
+
+		TPL_free(m->quad_name);
+		m->quad_name = NULL;
+	}
+
+	m->quad_recorded = false;
+
+	m->quad_num_vars = 0;
+	m->in_quad = false;
+}
+
+// A quad may be labelled: 'Name ?- Query.' names the query with a
+// ground term, so a report can say which quad it is (issue #1071).
+// The label carries no variables to share with the answer.
+
+static bool is_ground_term(const cell *c)
+{
+	pl_idx num_cells = c->num_cells;
+
+	for (pl_idx i = 0; i < num_cells; i++, c++) {
+		if (is_var(c))
+			return false;
+	}
+
+	return true;
+}
+
+// The shape of a toplevel answer, per the grammar in issue #1063
+// plus the annotations used by existing quad suites (Flowlog), and
+// outputs/1 for captured current-output (issue #1082).
+//
+// A toplevel answer reports an answer *substitution*, so every equation
+// in it binds a variable: it has a variable on the left, and no variable
+// is bound twice within one answer. '1 = X' and 'X = 1, X = 2' are
+// therefore not answer descriptions (issue #1074).
+//
+// A substitution is also idempotent: no variable it binds occurs in what
+// another equation binds. 'X = f(Y), Y = 1' is therefore not one either,
+// the answer being 'X = f(1), Y = 1' (issue #1081). An answer annotated
+// 'sto' is exempt, a cyclic term being what such a description states.
+//
+// Such a term is told apart from an ordinary clause that merely follows
+// a quad, because nothing else could be meant by an equation directly
+// after a query. ANSWER_BAD says so, and the caller reports it instead
+// of quietly loading it (which would surface as a permission error on
+// (=)/2, or, worse, as a quad that passes).
+//
+// The same applies once the principal functor is already one that marks
+// an answer description — ','/2, ';'/2, '|'/2 (issue #1087). An unknown
+// conjunct such as 'Y = 2, some_unknown_stuff' is still an answer
+// description (malformed), not "not an answer description": returning
+// ANSWER_NO would warn that the query has no description and fall
+// through to a permission error on (',')/2.
+
+enum answer_kind { ANSWER_NO = 0, ANSWER_OK, ANSWER_BAD };
+
+// Inside a known answer-description constructor, a subterm that is not
+// itself a description is a malformation of this one, not evidence that
+// the outer term is an ordinary clause.
+
+static enum answer_kind answer_as_part(enum answer_kind k)
+{
+	return (k == ANSWER_NO) ? ANSWER_BAD : k;
+}
+
+// The variables already bound by the answer being checked. A new one
+// starts at each alternative, since ';' and '|' separate answers.
+
+typedef struct {
+	unsigned num_vars;
+	unsigned var_num[MAX_VARS];
+	bool sto;
+} answer_vars;
+
+static bool answer_vars_add(answer_vars *seen, unsigned var_num)
+{
+	for (unsigned i = 0; i < seen->num_vars; i++) {
+		if (seen->var_num[i] == var_num)
+			return false;
+	}
+
+	if (seen->num_vars < MAX_VARS)
+		seen->var_num[seen->num_vars++] = var_num;
+
+	return true;
+}
+
+static enum answer_kind answer_one(parser *p, const cell *c, answer_vars *seen);
+
+static enum answer_kind answer_description(parser *p, const cell *c, answer_vars *seen)
+{
+	if (!is_interned(c))
+		return ANSWER_NO;
+
+	const char *name = C_STR(p, c);
+
+	if (get_arity(c) == 0) {
+		if (!strcmp(name, "sto"))
+			seen->sto = true;
+
+		return (!strcmp(name, "true") || !strcmp(name, "false")
+			|| !strcmp(name, "...") || !strcmp(name, "loops")
+			|| !strcmp(name, "instantiation_error")
+			|| !strcmp(name, "system_error")
+			|| !strcmp(name, "ad_infinitum")
+			|| !strcmp(name, "sto")
+			|| !strcmp(name, "unexpected")
+			|| !strcmp(name, "inattendue")
+			|| !strcmp(name, "other_answer_sequence")
+			|| !strcmp(name, "maybe")
+			|| !strcmp(name, "waits"))
+			? ANSWER_OK : ANSWER_NO;
+	}
+
+	if (get_arity(c) == 2) {
+		const cell *lhs = c + 1;
+		const cell *rhs = lhs + lhs->num_cells;
+
+		// 'V ~~ Spec' binds V to a float only approximately, to the
+		// precision Spec is written to (issue #1145). It binds like an
+		// equation does, so it is one for every check made here. The
+		// operator is exported by library(quads), not global, so this
+		// is only ever reached in a file that imported it.
+
+		// A non-variable left of ~~ binds nothing, it is only tested against Spec (issue #1157).
+		if (!strcmp(name, "~~") && !is_var(lhs))
+			return ANSWER_OK;
+
+		if (!strcmp(name, "=") || !strcmp(name, "~~")) {
+			if (!is_var(lhs))
+				return ANSWER_BAD;
+
+			return answer_vars_add(seen, lhs->var_num) ? ANSWER_OK : ANSWER_BAD;
+		}
+
+		if (!strcmp(name, ",")) {
+			enum answer_kind k = answer_as_part(answer_description(p, lhs, seen));
+
+			if (k != ANSWER_OK)
+				return k;
+
+			return answer_as_part(answer_description(p, rhs, seen));
+		}
+
+		if (!strcmp(name, ";") || !strcmp(name, "|")) {
+			answer_vars lhs_seen = {0}, rhs_seen = {0};
+			enum answer_kind k = answer_as_part(answer_one(p, lhs, &lhs_seen));
+
+			if (k != ANSWER_OK)
+				return k;
+
+			return answer_as_part(answer_one(p, rhs, &rhs_seen));
+		}
+
+		if (!strcmp(name, "error")
+			|| !strcmp(name, "type_error")
+			|| !strcmp(name, "domain_error")
+			|| !strcmp(name, "existence_error"))
+			return ANSWER_OK;
+	}
+
+	if (get_arity(c) == 1)
+		return (!strcmp(name, "throw")
+			|| !strcmp(name, "syntax_error")
+			|| !strcmp(name, "representation_error")
+			|| !strcmp(name, "resource_error")
+			|| !strcmp(name, "evaluation_error")
+			|| !strcmp(name, "uninstantiation_error")
+			|| !strcmp(name, "outputs")
+			|| !strcmp(name, "inputs")
+			|| !strcmp(name, "peeks"))
+			? ANSWER_OK : ANSWER_NO;
+
+	if (get_arity(c) == 3)
+		return !strcmp(name, "permission_error") ? ANSWER_OK : ANSWER_NO;
+
+	return ANSWER_NO;
+}
+
+// Walk the equations of one answer again, now that every variable it
+// binds is known, and check that none of them occurs on a right-hand
+// side. Alternatives are not entered: each is an answer of its own and
+// has been checked against its own set.
+
+static bool answer_is_substitution(parser *p, const cell *c, const answer_vars *seen)
+{
+	if (!is_interned(c) || (get_arity(c) != 2))
+		return true;
+
+	const char *name = C_STR(p, c);
+	const cell *lhs = c + 1;
+	const cell *rhs = lhs + lhs->num_cells;
+
+	if (!strcmp(name, ","))
+		return answer_is_substitution(p, lhs, seen)
+			&& answer_is_substitution(p, rhs, seen);
+
+	if (strcmp(name, "=") && strcmp(name, "~~"))
+		return true;
+
+	pl_idx num_cells = rhs->num_cells;
+
+	for (pl_idx i = 0; i < num_cells; i++, rhs++) {
+		if (!is_var(rhs))
+			continue;
+
+		for (unsigned j = 0; j < seen->num_vars; j++) {
+			if (seen->var_num[j] == rhs->var_num)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+// One answer: its shape, then the substitution property over the whole
+// of it, which is only decidable once all its equations have been seen.
+
+static enum answer_kind answer_one(parser *p, const cell *c, answer_vars *seen)
+{
+	enum answer_kind k = answer_description(p, c, seen);
+
+	if ((k != ANSWER_OK) || seen->sto)
+		return k;
+
+	return answer_is_substitution(p, c, seen) ? ANSWER_OK : ANSWER_BAD;
+}
+
+// Build and assert
+// '$quad'(Id, Query, VarNames, AnswerDescription, File, Line).
+// The query was read as one term and the answer description as another,
+// so their variables can only be related by name: VarNames is a list of
+// Name=Var pairs covering the named variables of both terms, and
+// library(quads) unifies same-named entries.
+//
+// Id is the label of 'Name ?- Query.' and an unbound variable when the
+// quad is written with the prefix operator, so 'this quad has no name'
+// needs no reserved atom.
+
+static void quad_record(parser *p, cell *ad)
+{
+	module *m = p->m;
+	cell *q = m->quad_query;
+	cell *id = m->quad_name;
+	pl_idx q_num_cells = q->num_cells;
+	pl_idx ad_num_cells = ad->num_cells;
+	pl_idx id_num_cells = id ? id->num_cells : 1;
+	unsigned q_num_vars = m->quad_num_vars;
+	unsigned ad_num_vars = p->cl->num_vars;
+	unsigned total_vars = q_num_vars + ad_num_vars;
+	unsigned id_var_num = total_vars;
+	if (!id) total_vars++;
+
+	// Collect the named variables of both terms (first occurrence
+	// each). Answer-description vars are renumbered +q_num_vars.
+
+	struct { unsigned var_num; pl_idx off; uint16_t flags; } *vt;
+	vt = TPL_malloc(sizeof(*vt) * (total_vars ? total_vars : 1));
+	if (!vt) { p->error = true; return; }
+	bool *seen = TPL_calloc(total_vars ? total_vars : 1, sizeof(bool));
+	if (!seen) { TPL_free(vt); p->error = true; return; }
+	unsigned num_named = 0;
+
+	for (int pass = 0; pass < 2; pass++) {
+		const cell *c = pass ? ad : q;
+		pl_idx num_cells = pass ? ad_num_cells : q_num_cells;
+		unsigned offset = pass ? q_num_vars : 0;
+
+		for (pl_idx i = 0; i < num_cells; i++, c++) {
+			if (!is_var(c))
+				continue;
+
+			unsigned var_num = c->var_num + offset;
+
+			if (seen[var_num] || is_anon(c) || !strcmp(C_STR(p, c), "_"))
+				continue;
+
+			seen[var_num] = true;
+			vt[num_named].var_num = var_num;
+			vt[num_named].off = c->val_off;
+			vt[num_named].flags = c->flags;
+			num_named++;
+		}
+	}
+
+	// '$quad'/5 + Query + VarNames list + AnswerDescription + File + Line
+
+	pl_idx vn_num_cells = (4 * num_named) + 1;
+	pl_idx total = 1 + id_num_cells + q_num_cells + vn_num_cells + ad_num_cells + 1 + 1;
+	cell *tmp = TPL_calloc(total, sizeof(cell));
+
+	if (!tmp) {
+		TPL_free(vt);
+		TPL_free(seen);
+		p->error = true;
+		return;
+	}
+
+	cell *dst = tmp;
+	dst->tag = TAG_INTERNED;
+	dst->val_off = g_sys_quad_s;
+	dst->flags = 0;
+	set_arity(dst, 6);
+	dst->num_cells = total;
+	dst++;
+
+	if (id) {
+		dup_cells(dst, id, id_num_cells);
+	} else {
+		dst->tag = TAG_VAR;
+		dst->var_num = id_var_num;
+		dst->val_off = g_anon_s;
+		dst->flags = FLAG_VAR_ANON;
+		dst->num_cells = 1;
+	}
+
+	dst += id_num_cells;
+
+	dup_cells(dst, q, q_num_cells);
+	dst += q_num_cells;
+
+	for (unsigned i = 0; i < num_named; i++) {
+		dst->tag = TAG_INTERNED;			// list cell
+		dst->val_off = g_dot_s;
+		dst->flags = 0;
+		set_arity(dst, 2);
+		dst->num_cells = (4 * (num_named - i)) + 1;
+		dst++;
+		dst->tag = TAG_INTERNED;			// Name = Var
+		dst->val_off = g_eq_s;
+		dst->flags = 0;
+		set_arity(dst, 2);
+		dst->num_cells = 3;
+		dst++;
+		dst->tag = TAG_INTERNED;			// Name
+		dst->val_off = vt[i].off;
+		dst->num_cells = 1;
+		dst++;
+		dst->tag = TAG_VAR;					// Var
+		dst->var_num = vt[i].var_num;
+		dst->val_off = vt[i].off;
+		dst->flags = vt[i].flags;
+		dst->num_cells = 1;
+		dst++;
+	}
+
+	dst->tag = TAG_INTERNED;
+	dst->val_off = g_nil_s;
+	dst->num_cells = 1;
+	dst++;
+
+	dup_cells(dst, ad, ad_num_cells);
+
+	for (pl_idx i = 0; i < ad_num_cells; i++) {
+		if (is_var(dst+i))
+			(dst+i)->var_num += q_num_vars;
+	}
+
+	dst += ad_num_cells;
+
+	dst->tag = TAG_INTERNED;
+	dst->val_off = new_atom(p->pl, get_loaded(m, m->filename));
+	dst->num_cells = 1;
+	dst++;
+
+	dst->tag = TAG_INT;
+	set_smallint(dst, m->quad_line_num);
+	dst->num_cells = 1;
+
+	TPL_free(vt);
+	TPL_free(seen);
+
+	// Quads are recorded as data, so a program can add or retract them
+	// the way it can any other data. Without this the first recorded
+	// quad would make '$quad'/5 static and a later assertz/1 would raise
+	// a permission error.
+
+	set_dynamic_in_db(m, "$quad", 6);
+
+	if (assertz_to_db(m, total_vars, tmp, true) == NULL) {
+		fprintf(stderr, "Warning: could not record quad, %s:%d\n", get_loaded(m, m->filename), m->quad_line_num);
+		cell *c = tmp;
+
+		for (pl_idx i = 0; i < total; i++, c++)
+			unshare_cell(c);
+	}
+
+	// On success the asserted copy takes over the cell references
+
+	TPL_free(tmp);
+}
+
+static bool quads(parser *p, cell *d)
+{
+	module *m = p->m;
+
+	if (p->internal || p->error)
+		return false;
+
+	if (!is_interned(d))
+		return false;
+
+	// '?- Query.' or, labelled with a ground term, 'Name ?- Query.'
+
+	if ((d->val_off == g_quad_s) && ((get_arity(d) == 1) || (get_arity(d) == 2))) {
+		cell *id = (get_arity(d) == 2) ? d + 1 : NULL;
+		cell *q = id ? id + id->num_cells : d + 1;
+
+		// A non-ground label is recorded like a malformed answer
+		// description (issue #1078): do not set p->error, or the rest
+		// of the file is abandoned and later quads never run. The
+		// following answer terms must still be consumed, and
+		// library(quads) reports the bad identifier as failed.
+
+		if (m->quad_query && !m->quad_recorded)
+			fprintf(stderr, "Warning: quad query without answer description, %s:%d\n", get_loaded(m, m->filename), m->quad_line_num);
+
+		quad_reset(m);
+		m->quad_query = TPL_malloc(sizeof(cell) * q->num_cells);
+
+		if (!m->quad_query) {
+			p->error = true;
+			return true;
+		}
+
+		dup_cells(m->quad_query, q, q->num_cells);
+
+		if (id) {
+			// A non-ground label cannot be stored as-is: a variable
+			// label is indistinguishable from an unlabelled quad once
+			// retrieved. Record a ground sentinel so the load can
+			// continue (issue #1078) and library(quads) reports it.
+			if (!is_ground_term(id)) {
+				m->quad_name = TPL_malloc(sizeof(cell));
+
+				if (!m->quad_name) {
+					p->error = true;
+					return true;
+				}
+
+				make_atom(m->quad_name, new_atom(p->pl, "$bad_quad_identifier"));
+			} else {
+				m->quad_name = TPL_malloc(sizeof(cell) * id->num_cells);
+
+				if (!m->quad_name) {
+					p->error = true;
+					return true;
+				}
+
+				dup_cells(m->quad_name, id, id->num_cells);
+			}
+		}
+
+		m->quad_num_vars = p->cl->num_vars;
+		m->quad_line_num = p->line_num_start ? p->line_num_start : p->line_num;
+		m->in_quad = true;
+		p->line_num_start = 0;
+
+		// Release the parser's own reference on the consumed term.
+		// Ordinary clause loading hands these cells to assertz_to_db(),
+		// which takes the reference over - which is why the caller can
+		// reset cl->cidx without unsharing. A quad instead dup_cells()
+		// its own copy, so the parser's reference is still outstanding
+		// and nothing else will ever drop it.
+
+		unshare_cells(d, d->num_cells);
+		return true;
+	}
+
+	if (!m->in_quad)
+		return false;
+
+	answer_vars seen = {0};
+	enum answer_kind kind = answer_one(p, d, &seen);
+
+	if (kind == ANSWER_NO) {
+		if (m->quad_query && !m->quad_recorded)
+			fprintf(stderr, "Warning: quad query without answer description, %s:%d\n", get_loaded(m, m->filename), m->quad_line_num);
+
+		quad_reset(m);
+		return false;
+	}
+
+	// A quad may carry more than one answer description, and all of
+	// them have to hold. Keep the query so each following description
+	// is recorded against it, rather than discarding all but the first.
+	//
+	// A malformed one (ANSWER_BAD) is recorded too, so the load carries
+	// on and run_quads reports it as failed, rather than each such case
+	// needing a file of its own (issue #1078). It must still be consumed
+	// here: left to ordinary clause loading, an equation would surface
+	// as a permission error on (=)/2. library(quads) repeats the shape
+	// check, so nothing is lost by not reporting it now.
+
+	if (m->quad_query) {
+		quad_record(p, d);
+		m->quad_recorded = true;
+		m->in_quad = true;		// keep consuming answer-shaped terms
+	}
+
+	p->line_num_start = 0;
+
+	// As above: quad_record() dup_cells() into the '$quad'/6 it asserts,
+	// so the answer description's own cells are still held by the parser
+	// here. Every string literal in an answer description leaked one
+	// strbuf without this.
+
+	unshare_cells(d, d->num_cells);
+	return true;
+}
+
+// A directive is a *declaration* if it tells the loader something about
+// how to read or organise the remaining terms. Anything else is, per ISO
+// 7.4.2, simply a goal to be executed at this point in the load.
+
+static bool is_declaration_name(const char *name)
+{
+	static const char *s_names[] = {
+		"attribute", "autoload", "create_prolog_flag", "discontiguous",
+		"dynamic", "elif", "else", "encoding", "endif", "ensure_loaded",
+		"export", "foreign_struct", "help", "if", "include", "info",
+		"initialization", "meta_predicate", "module", "multifile", "op",
+		"pragma", "public", "reexport", "set_prolog_flag",
+		"use_foreign_module", "use_module",
+		NULL
+	};
+
+	for (const char **n = s_names; *n; n++) {
+		if (!strcmp(*n, name))
+			return true;
+	}
+
+	return false;
+}
+
+// Note: a conjunction counts as a declaration only if every conjunct is
+// one, so that ':- dynamic(a/1), dynamic(b/1).' is still handled by the
+// loader while ':- write(hello), nl.' is run as an ordinary goal...
+
+static bool is_declaration(parser *p, cell *c)
+{
+	if (!is_interned(c))
+		return false;
+
+	if ((c->val_off == g_conjunction_s) && (get_arity(c) == 2)) {
+		cell *lhs = c + 1;
+		cell *rhs = lhs + lhs->num_cells;
+		return is_declaration(p, lhs) && is_declaration(p, rhs);
+	}
+
+	return is_declaration_name(C_STR(p, c));
+}
+
+// Does this directive (or any conjunct of it) declare an
+// initialization goal? Those are recorded whole for the end-of-load
+// runner, so they are not split apart.
+
+static bool has_initialization(parser *p, cell *c)
+{
+	if (!is_interned(c))
+		return false;
+
+	if ((c->val_off == g_conjunction_s) && (get_arity(c) == 2)) {
+		cell *lhs = c + 1;
+		cell *rhs = lhs + lhs->num_cells;
+		return has_initialization(p, lhs) || has_initialization(p, rhs);
+	}
+
+	return !strcmp(C_STR(p, c), "initialization") && (get_arity(c) == 1);
+}
+
+static bool directive_term(parser *p, cell *c);
 
 static bool directives(parser *p, cell *d)
 {
@@ -667,7 +1411,7 @@ static bool directives(parser *p, cell *d)
 	if (strcmp(C_STR(p, d), ":-"))
 		return false;
 
-	if (d->arity != 1)
+	if (get_arity(d) != 1)
 		return false;
 
 	cell *c = d + 1;
@@ -688,28 +1432,84 @@ static bool directives(parser *p, cell *d)
 	d->val_off = new_atom(p->pl, "$directive");
 	CLR_OP(d);
 
-	if (!strcmp(dirname, "initialization") && (c->arity == 1)) {
+	return directive_term(p, c);
+}
+
+// Handles one directive. A conjunction of declarations is the same as
+// giving them separately, so ':- dynamic(a/1), dynamic(b/1).' recurses
+// into each conjunct rather than trying to read ',' as a declaration.
+// initialization/1 is excluded: its goal is recorded as a whole
+// '$directive'(initialization(G)) fact for the end-of-load runner to
+// retract, which a conjunction would not match.
+
+static bool directive_term(parser *p, cell *c)
+{
+	module *m = p->m;
+	const char *dirname = C_STR(p, c);
+
+	if ((c->val_off == g_conjunction_s) && (get_arity(c) == 2)
+		&& is_declaration(p, c) && !has_initialization(p, c)) {
+		cell *lhs = c + 1;
+		cell *rhs = lhs + lhs->num_cells;
+
+		if (!directive_term(p, lhs) || p->error)
+			return false;
+
+		return directive_term(p, rhs);
+	}
+
+	// run_init lives on the module, and a load whose file has no module
+	// directive of its own shares one with whatever consulted it, so
+	// the module flag alone cannot say whose goals are pending. The
+	// parser flag says this load has some of its own; include/1 and
+	// ensure_loaded/1 hand theirs up, since they load with init false
+	// and leave their goals for the load still going on to run.
+
+	if (!strcmp(dirname, "initialization") && (get_arity(c) == 1)) {
 		p->m->run_init = true;
+		p->saw_initialization = true;
 		return false;
 	}
 
-	if (!strcmp(dirname, "info") && (c->arity == 1)) {
+	// Not a declaration? Then it's a goal: run it here, at its position
+	// in the load, rather than silently discarding it...
+
+	if (!is_declaration(p, c)) {
+		bool raised = false;
+
+		if (!goal_run_reporting(p, c, &raised)
+			&& !p->internal && !p->do_read_term && !p->pl->quiet) {
+			fflush(stdout);
+			fprintf(stderr, "Warning: directive %s: %s/%u, %s:%d\n",
+				raised ? "raised an exception" : "failed",
+				dirname, (unsigned)get_arity(c),
+				get_loaded(p->m, p->m->filename), p->line_num);
+		}
+
+		return true;
+	}
+
+	if (!strcmp(dirname, "info") && (get_arity(c) == 1)) {
 		printf("INFO: %s\n", C_STR(p, FIRST_ARG(c)));
 		return true;
 	}
 
 	cell *p1 = c + 1;
 
-	if (!strcmp(dirname, "help") && (c->arity == 2)) {
-		if (!is_compound(p1)) return true;
+	if (!strcmp(dirname, "help") && (get_arity(c) == 2)) {
+		// An atom here is a zero-arity predicate. This used to bail out,
+		// so ':- help(foo, [...])' was accepted and silently did nothing
+		// - which is why nothing in library/ documents a 0-arity
+		// predicate.
+		if (!is_compound(p1) && !is_atom(p1)) return true;
 		cell *p2 = p1 + p1->num_cells;
 		if (!is_iso_list_or_nil(p2)) return true;
-		LIST_HANDLER(p2);
+		PROLOG_LIST_HANDLER(p2);
 		char *desc = NULL;
 		bool iso = false;
 
 		while (is_iso_list(p2)) {
-			cell *h = LIST_HEAD(p2);
+			cell *h = PROLOG_LIST_HEAD(p2);
 
 			if (is_compound(h) && is_atom(h+1) && !strcmp(C_STR(p, h), "iso")) {
 				cell *arg = h + 1;
@@ -728,18 +1528,42 @@ static bool directives(parser *p, cell *d)
 				desc = DUP_STRING(p, arg);
 			}
 
-			p2 = LIST_TAIL(p2);
+			p2 = PROLOG_LIST_TAIL(p2);
 		}
 
 		pl_ctx p1_ctx = 0;
 		query q = (query){0};
 		q.pl = p->pl;
 		q.st.m = p->m;
-		char *dst = print_term_to_strbuf(&q, p1, p1_ctx, 0);
+		char *dst;
+
+		// Argument by argument, so an operator name doesn't print infix.
+
+		if (get_arity(p1)) {
+			SB_alloc(sb, 256);
+			SB_strcat(sb, C_STR(p, p1));
+			SB_strcat(sb, "(");
+			cell *arg = p1 + 1;
+
+			for (unsigned i = 0; i < get_arity(p1); i++, arg += arg->num_cells) {
+				char *s = print_term_to_strbuf(&q, arg, p1_ctx, 0);
+				ENSURE(s);
+				if (i) SB_strcat(sb, ",");
+				SB_strcat(sb, s);
+				TPL_free(s);
+			}
+
+			SB_strcat(sb, ")");
+			dst = TPL_strdup(SB_cstr(sb));
+			SB_free(sb);
+		} else
+			dst = print_term_to_strbuf(&q, p1, p1_ctx, 0);
+
+		ENSURE(dst);
 		builtins *ptr = TPL_calloc(1, sizeof(builtins));
 		ENSURE(ptr);
-		ptr->name = strdup(C_STR(p, p1));
-		ptr->arity = p1->arity;
+		ptr->name = TPL_strdup(C_STR(p, p1));
+		ptr->arity = get_arity(p1);
 		ptr->m = p->m;
 		ptr->desc = desc;
 		char *src = dst;
@@ -750,8 +1574,14 @@ static bool directives(parser *p, cell *d)
 		if (*src == '(')
 			src++;
 
-		char *end = dst + strlen(dst) - 1;
-		*end = '\0';
+		// Strip the closing paren of the argument list. With no arguments
+		// there is no paren, and chopping the last character would eat a
+		// letter off the name.
+
+		if (get_arity(p1)) {
+			char *end = dst + strlen(dst) - 1;
+			*end = '\0';
+		}
 
 		ptr->help = *src ? src : dst;
 		ptr->help2 = dst;
@@ -766,7 +1596,7 @@ static bool directives(parser *p, cell *d)
 		return true;
 	}
 
-	if (!strcmp(dirname, "include") && (c->arity == 1)) {
+	if (!strcmp(dirname, "include") && (get_arity(c) == 1)) {
 		if (!is_atom(p1)) return true;
 		unsigned save_line_nbr = p->line_num;
 		const char *name = C_STR(p, p1);
@@ -785,10 +1615,11 @@ static bool directives(parser *p, cell *d)
 		set_parent(p->m, p->m->actual_filename, p->m->filename);
 		TPL_free(filename);
 		p->line_num = save_line_nbr;
+		p->saw_initialization |= p->m->run_init;
 		return true;
 	}
 
-	if (!strcmp(dirname, "ensure_loaded") && (c->arity == 1)) {
+	if (!strcmp(dirname, "ensure_loaded") && (get_arity(c) == 1)) {
 		if (!is_atom(p1)) return true;
 		unsigned save_line_nbr = p->line_num;
 		const char *name = C_STR(p, p1);
@@ -806,10 +1637,11 @@ static bool directives(parser *p, cell *d)
 
 		TPL_free(filename);
 		p->line_num = save_line_nbr;
+		p->saw_initialization |= p->m->run_init;
 		return true;
 	}
 
-	if (!strcmp(dirname, "pragma") && (c->arity == 2)) {
+	if (!strcmp(dirname, "pragma") && (get_arity(c) == 2)) {
 		cell *p2 = c + 2;
 		const char *name = "";
 		char tmpbuf[1024];
@@ -846,6 +1678,7 @@ static bool directives(parser *p, cell *d)
 		}
 
 		tmp_m = module_create(p->pl, name);
+		if (tmp_m) tmp_m->from_file = true;
 		if (!tmp_m) {
 			if (!p->do_read_term)
 				fprintf(stderr, "Error: module creation failed: %s, %s:%d\n", name, get_loaded(p->m, p->m->filename), p->line_num);
@@ -855,19 +1688,19 @@ static bool directives(parser *p, cell *d)
 		}
 
 		if (tmp_m != p->m)
-			p->m->used[p->m->idx_used++] = tmp_m;
+			module_add_use(p->m, tmp_m);
 
-		LIST_HANDLER(p2);
+		PROLOG_LIST_HANDLER(p2);
 
 		while (is_iso_list(p2)) {
-			LIST_HEAD(p2);
-			p2 = LIST_TAIL(p2);
+			PROLOG_LIST_HEAD(p2);
+			p2 = PROLOG_LIST_TAIL(p2);
 		}
 
 		return true;
 	}
 
-	if (!strcmp(dirname, "attribute") && (c->arity == 1)) {
+	if (!strcmp(dirname, "attribute") && (get_arity(c) == 1)) {
 		cell *arg = c + 1;
 
 		if (arg->val_off == g_slash_s) {
@@ -901,7 +1734,7 @@ static bool directives(parser *p, cell *d)
 		return true;
 	}
 
-	if (!strcmp(dirname, "module") && (c->arity >= 1)) {
+	if (!strcmp(dirname, "module") && (get_arity(c) >= 1)) {
 		module *save_m = p->m;
 		const char *name = "";
 		char tmpbuf[1024];
@@ -936,6 +1769,7 @@ static bool directives(parser *p, cell *d)
 			}
 
 			tmp_m = module_create(p->pl, name);
+			if (tmp_m) tmp_m->from_file = true;
 
 			if (!tmp_m) {
 				if (!p->do_read_term)
@@ -946,19 +1780,19 @@ static bool directives(parser *p, cell *d)
 			}
 
 			if (tmp_m != p->m)
-				p->m->used[p->m->idx_used++] = tmp_m;
+				module_add_use(p->m, tmp_m);
 
 			p->m = tmp_m;
 		}
 
-		if (c->arity == 1)
+		if (get_arity(c) == 1)
 			return true;
 
 		cell *p2 = c + 2;
-		LIST_HANDLER(p2);
+		PROLOG_LIST_HANDLER(p2);
 
 		while (is_iso_list(p2)) {
-			cell *head = LIST_HEAD(p2);
+			cell *head = PROLOG_LIST_HEAD(p2);
 
 			if (is_compound(head)) {
 				if (!strcmp(C_STR(p, head), "/")
@@ -967,10 +1801,10 @@ static bool directives(parser *p, cell *d)
 					if (!is_interned(f)) return true;
 					if (!is_integer(a)) return true;
 					cell tmp = *f;
-					tmp.arity = get_smallint(a);
+	set_arity(&tmp, get_smallint(a));
 
 					if (!strcmp(C_STR(p, head), "//"))
-						tmp.arity += 2;
+						set_arity(&tmp, get_arity(&tmp) + 2);
 
 					predicate *pr = find_predicate(p->m, &tmp);
 					if (!pr) pr = create_predicate(p->m, &tmp, NULL);
@@ -986,8 +1820,9 @@ static bool directives(parser *p, cell *d)
 					}
 
 					pr->is_public = true;
-				} else if (!strcmp(C_STR(p, head), "op") && (head->arity == 3)) {
-					do_op(p, head, true);
+				} else if (!strcmp(C_STR(p, head), "op") && (get_arity(head) == 3)) {
+					// Kept in the declaring module, marked so that importers see it.
+					do_op(p, head, false, true);
 				} else {
 					if (!p->do_read_term)
 						fprintf(stderr, "Error: predicate export failed, '%s' in %s:%d\n", C_STR(p, head), get_loaded(p->m, p->m->filename), p->line_num);
@@ -997,22 +1832,22 @@ static bool directives(parser *p, cell *d)
 				}
 			}
 
-			p2 = LIST_TAIL(p2);
+			p2 = PROLOG_LIST_TAIL(p2);
 		}
 
 		return true;
 	}
 
-	if ((!strcmp(dirname, "use_module") || !strcmp(dirname, "autoload") || !strcmp(dirname, "reexport")) && (c->arity >= 1)) {
+	if ((!strcmp(dirname, "use_module") || !strcmp(dirname, "autoload") || !strcmp(dirname, "reexport")) && (get_arity(c) >= 1)) {
 		if (!is_callable(p1))
 			return true;
 
-		c->arity == 1 ? do_use_module_1(p->m, c) : do_use_module_2(p->m, c);
+		get_arity(c) == 1 ? do_use_module_1(p->m, c) : do_use_module_2(p->m, c);
 		return true;
 	}
 
 #if USE_FFI
-	if (!strcmp(dirname, "foreign_struct") && (c->arity == 2)) {
+	if (!strcmp(dirname, "foreign_struct") && (get_arity(c) == 2)) {
 		if (!is_iso_atom(p1)) {
 			p->error = true;
 			return true;
@@ -1022,7 +1857,7 @@ static bool directives(parser *p, cell *d)
 		return true;
 	}
 
-	if (!strcmp(dirname, "use_foreign_module") && (c->arity == 2)) {
+	if (!strcmp(dirname, "use_foreign_module") && (get_arity(c) == 2)) {
 		if (!is_atom(p1)) {
 			p->error = true;
 			return true;
@@ -1037,18 +1872,23 @@ static bool directives(parser *p, cell *d)
 	}
 #endif
 
-	if (!strcmp(dirname, "meta_predicate") && (c->arity == 1)) {
+	if (!strcmp(dirname, "meta_predicate") && (get_arity(c) == 1)) {
 		if (!is_compound(p1))
 			return true;
 	}
 
-	if (!strcmp(dirname, "set_prolog_flag") && (c->arity == 2)) {
+	if (!strcmp(dirname, "set_prolog_flag") && (get_arity(c) == 2)) {
 		cell *p2 = c + 2;
 
-		if (!is_interned(p2))
-			return true;
+		// The five flags below affect parsing itself (eg. double_quotes
+		// changes how the REST of this file reads), so they need to
+		// take effect right here rather than waiting for the directive
+		// to run as a goal. Their values are always atoms. Anything
+		// else - an unrecognized flag name, or a non-atom value like
+		// the tabling restraint flags' integers - has no parse-time
+		// meaning and falls through to the generic goal path below.
 
-		if (!strcmp(C_STR(p, p1), "double_quotes")) {
+		if (is_interned(p2) && !strcmp(C_STR(p, p1), "double_quotes")) {
 			if (!strcmp(C_STR(p, p2), "atom")) {
 				p->m->flags.double_quote_chars = p->m->flags.double_quote_codes = false;
 				p->m->flags.double_quote_atom = true;
@@ -1065,46 +1905,68 @@ static bool directives(parser *p, cell *d)
 				p->error = true;
 				return true;
 			}
-		} else if (!strcmp(C_STR(p, p1), "character_escapes")) {
+		} else if (is_interned(p2) && !strcmp(C_STR(p, p1), "character_escapes")) {
 			if (!strcmp(C_STR(p, p2), "true") || !strcmp(C_STR(p, p2), "on"))
 				p->m->flags.character_escapes = true;
 			else if (!strcmp(C_STR(p, p2), "false") || !strcmp(C_STR(p, p2), "off"))
 				p->m->flags.character_escapes = false;
-		} else if (!strcmp(C_STR(p, p1), "occurs_check")) {
+		} else if (is_interned(p2) && !strcmp(C_STR(p, p1), "occurs_check")) {
 			if (!strcmp(C_STR(p, p2), "true") || !strcmp(C_STR(p, p2), "on"))
 				p->m->flags.occurs_check = true;
 			else if (!strcmp(C_STR(p, p2), "false") || !strcmp(C_STR(p, p2), "off"))
 				p->m->flags.occurs_check = false;
-		} else if (!strcmp(C_STR(p, p1), "strict_iso")) {
+		} else if (is_interned(p2) && !strcmp(C_STR(p, p1), "strict_iso")) {
 			if (!strcmp(C_STR(p, p2), "true") || !strcmp(C_STR(p, p2), "on"))
 				p->m->flags.strict_iso = true;
 			else if (!strcmp(C_STR(p, p2), "false") || !strcmp(C_STR(p, p2), "off"))
 				p->m->flags.strict_iso = false;
+		} else if (is_interned(p2) && !strcmp(C_STR(p, p1), "empty_args")) {
+			if (!strcmp(C_STR(p, p2), "true") || !strcmp(C_STR(p, p2), "on"))
+				p->m->flags.empty_args = true;
+			else if (!strcmp(C_STR(p, p2), "false") || !strcmp(C_STR(p, p2), "off"))
+				p->m->flags.empty_args = false;
 		} else {
-			//fprintf(stderr, "Warning: unknown flag: %s\n", C_STR(p, p1));
+			// Anything else - tabling, global_bb, the tabling restraint
+			// flags (integer-valued, so is_interned(p2) alone routes
+			// them here) - has no parse-time meaning. Run the directive
+			// as an ordinary goal instead of discarding it: without
+			// this a directive-form set_prolog_flag/2 for any flag not
+			// in the list above was a silent no-op, never forwarded to
+			// the runtime set_prolog_flag/2 that actually implements it.
+
+			bool raised = false;
+
+			if (!goal_run_reporting(p, c, &raised)
+				&& !p->internal && !p->do_read_term && !p->pl->quiet) {
+				fflush(stdout);
+				fprintf(stderr, "Warning: directive %s: %s/%u, %s:%d\n",
+					raised ? "raised an exception" : "failed",
+					dirname, (unsigned)get_arity(c),
+					get_loaded(p->m, p->m->filename), p->line_num);
+			}
 		}
 
 		p->flags = p->m->flags;
 		return true;
 	}
 
-	if (!strcmp(dirname, "op") && (c->arity == 3)) {
-		do_op(p, c, false);
+	if (!strcmp(dirname, "op") && (get_arity(c) == 3)) {
+		do_op(p, c, false, false);
 		return true;
 	}
 
 	if (is_iso_list(p1)) {
-		LIST_HANDLER(p1);
+		PROLOG_LIST_HANDLER(p1);
 
 		while (is_list(p1)) {
-			cell *h = LIST_HEAD(p1);
+			cell *h = PROLOG_LIST_HEAD(p1);
 
-			if (is_interned(h) && (!strcmp(C_STR(p, h), "/") || !strcmp(C_STR(p, h), "//")) && (h->arity == 2)) {
+			if (is_interned(h) && (!strcmp(C_STR(p, h), "/") || !strcmp(C_STR(p, h), "//")) && (get_arity(h) == 2)) {
 				cell *c_name = h + 1;
 
 				if (is_var(c_name)) {
 					if (((!p->do_read_term)) && !p->pl->quiet)
-						fprintf(stderr, "Error: uninstantiated: %s/%d\n", dirname, c->arity);
+						fprintf(stderr, "Error: uninstantiated: %s/%d\n", dirname, get_arity(c));
 
 					p->error = true;
 					return true;
@@ -1130,7 +1992,7 @@ static bool directives(parser *p, cell *d)
 					arity += 2;
 
 				cell tmp = *c_name;
-				tmp.arity = arity;
+				set_arity(&tmp, arity);
 
 				if (!strcmp(dirname, "dynamic")) {
 					predicate * pr = find_predicate(p->m, &tmp);
@@ -1179,15 +2041,13 @@ static bool directives(parser *p, cell *d)
 						}
 					}
 				} else {
-					if (((!p->do_read_term)) && !p->pl->quiet)
-						fprintf(stderr, "Error: unknown directive: %s/%d\n", dirname, c->arity);
-
+					report_unknown_directive(p, "Error", dirname, get_arity(c));
 					p->error = true;
 					return true;
 				}
 			}
 
-			p1 = LIST_TAIL(p1);
+			p1 = PROLOG_LIST_TAIL(p1);
 		}
 	}
 
@@ -1198,17 +2058,24 @@ static bool directives(parser *p, cell *d)
 
 	if (is_var(p1)) {
 		if (((!p->do_read_term)) && !p->pl->quiet)
-			fprintf(stderr, "Error: uninstantiated: %s/%d\n", dirname, c->arity);
+			fprintf(stderr, "Error: uninstantiated: %s/%d\n", dirname, get_arity(c));
 
 		p->error = true;
 		return true;
 	}
 
-	while (is_interned(p1) && (p1->val_off != g_dot_s)) {
+	// Bound the walk by the extent of this directive. Without it the
+	// loop runs on into whatever cells happen to follow, which is how
+	// a conjunct came to be read as a predicate indicator of the
+	// conjunct before it...
+
+	const cell *c_end = c + c->num_cells;
+
+	while ((p1 < c_end) && is_interned(p1) && !is_nil(p1) && (p1->val_off != g_dot_s)) {
 		module *m = p->m;
 		cell *c_id = p1;
 
-		if (!strcmp(C_STR(p, p1), ":") && (p1->arity == 2)) {
+		if (!strcmp(C_STR(p, p1), ":") && (get_arity(p1) == 2)) {
 			cell *c_mod = p1 + 1;
 
 			if (!is_atom(c_mod))
@@ -1219,16 +2086,21 @@ static bool directives(parser *p, cell *d)
 			if (!m)
 				m = module_create(p->pl, C_STR(p, c_mod));
 
+			if (!m) {
+				p->error = true;
+				return true;
+			}
+
 			c_id = p1 + 2;
 		}
 
 		if ((!strcmp(C_STR(p, c_id), "/") || !strcmp(C_STR(p, c_id), "//"))
-			&& (p1->arity == 2)) {
+			&& (get_arity(p1) == 2)) {
 			cell *c_name = c_id + 1;
 
 			if (is_var(c_name)) {
 				if (((!p->do_read_term)) && !p->pl->quiet)
-					fprintf(stderr, "Error: uninstantiated: %s/%d\n", dirname, c->arity);
+					fprintf(stderr, "Error: uninstantiated: %s/%d\n", dirname, get_arity(c));
 
 				p->error = true;
 				return true;
@@ -1250,7 +2122,7 @@ static bool directives(parser *p, cell *d)
 
 			unsigned arity = get_smallint(c_arity);
 			cell tmp = *c_name;
-			tmp.arity = arity;
+			set_arity(&tmp, arity);
 
 
 			if (!strcmp(C_STR(p, c_id), "//"))
@@ -1280,9 +2152,7 @@ static bool directives(parser *p, cell *d)
 				set_dynamic_in_db(m, C_STR(p, c_name), arity);
 				p->error = m->error;
 			} else {
-				if (((!p->do_read_term)) && !p->pl->quiet)
-					fprintf(stderr, "Error: unknown directive: %s/%d\n", dirname, c->arity);
-
+				report_unknown_directive(p, "Error", dirname, get_arity(c));
 				p->error = true;
 				return true;
 			}
@@ -1299,35 +2169,85 @@ static bool directives(parser *p, cell *d)
 			set_meta_predicate_in_db(m, p1);
 			p->error = m->error;
 			p1 += p1->num_cells;
-		} else if (!strcmp(C_STR(p, p1), ",") && (p1->arity == 2))
+		} else if (!strcmp(C_STR(p, p1), ",") && (get_arity(p1) == 2))
 			p1 += 1;
 		else {
-			if (((!p->do_read_term)) && !p->pl->quiet)
-				fprintf(stderr, "Warning: unknown directive: %s/%d\n", dirname, c->arity);
-
+			report_unknown_directive(p, "Warning", dirname, get_arity(c));
 			return true;
-			p1 += 1;
 		}
 	}
 
-	if (!strcmp(dirname, "meta_predicate") && (c->arity == 1))
+	if (!strcmp(dirname, "meta_predicate") && (get_arity(c) == 1))
 		return true;
 
-	if (!strcmp(dirname, "dynamic") && (c->arity == 1))
+	if (!strcmp(dirname, "dynamic") && (get_arity(c) == 1))
 		return true;
 
-	if (!strcmp(dirname, "discontiguous") && (c->arity == 1))
+	if (!strcmp(dirname, "discontiguous") && (get_arity(c) == 1))
 		return true;
 
-	if (!strcmp(dirname, "multifile") && (c->arity == 1))
+	if (!strcmp(dirname, "multifile") && (get_arity(c) == 1))
 		return true;
 
-	if (((!p->do_read_term)) && !p->pl->quiet) {
-		fprintf(stderr, "Warning: unknown directive: %s/%d\n", dirname, c->arity);
+	report_unknown_directive(p, "Warning", dirname, get_arity(c));
+	return true;
+}
+
+// Mark terms immediately followed by ! in a ,/2 chain. Conjunction is
+// xfy, so bodies nest as (A, (B, !)) — tag each goal whose next is cut.
+// Also walk ;/2, ->/2, *->/2 and if/3 so cuts inside those arms are seen.
+
+static bool starts_with_cut(const cell *c)
+{
+	if (!is_interned(c))
+		return false;
+
+	if (c->val_off == g_cut_s)
 		return true;
+
+	if ((get_arity(c) == 2) && (c->val_off == g_conjunction_s))
+		return starts_with_cut(c + 1);
+
+	return false;
+}
+
+static void mark_next_cut(cell *c)
+{
+	if (!is_interned(c) || !get_arity(c))
+		return;
+
+	cell *arg1 = c + 1;
+	cell *arg2 = arg1 + arg1->num_cells;
+
+	if ((c->val_off == g_conjunction_s) && (get_arity(c) == 2)) {
+		if (starts_with_cut(arg2))
+			arg1->flags |= FLAG_INTERNED_NEXT_CUT;
+
+		mark_next_cut(arg1);
+		mark_next_cut(arg2);
+		return;
 	}
 
-	return true;
+	if ((c->val_off == g_disjunction_s) && (get_arity(c) == 2)) {
+		mark_next_cut(arg1);
+		mark_next_cut(arg2);
+		return;
+	}
+
+	if (((c->val_off == g_if_then_s) || (c->val_off == g_soft_cut_s))
+		&& (get_arity(c) == 2)) {
+		mark_next_cut(arg1);
+		mark_next_cut(arg2);
+		return;
+	}
+
+	if ((c->val_off == g_if_s) && (get_arity(c) == 3)) {
+		cell *arg3 = arg2 + arg2->num_cells;
+		mark_next_cut(arg1);
+		mark_next_cut(arg2);
+		mark_next_cut(arg3);
+		return;
+	}
 }
 
 static void check_first_cut(clause *cl)
@@ -1337,9 +2257,10 @@ static void check_first_cut(clause *cl)
 	if (!c)
 		return;
 
+	mark_next_cut(c);
+
 	if (c->val_off == g_cut_s) {
 		cl->is_first_cut = true;
-		cl->is_cut_only = true;
 		return;
 	}
 
@@ -1353,27 +2274,168 @@ static void check_first_cut(clause *cl)
 	}
 }
 
+// Room for entry i, and for `need` bytes of name pool. Both double from
+// small and stop at the limits the errors below already enforce, so a clause
+// with four variables carries four entries rather than a thousand.
+
+static bool vartab_entry_room(parser *p, unsigned i)
+{
+	if (i < p->vartab.alloc)
+		return true;
+
+	if (i >= MAX_VARS)
+		return false;
+
+	unsigned wanted = p->vartab.alloc ? p->vartab.alloc : 16;
+
+	while (wanted <= i)
+		wanted *= 2;
+
+	if (wanted > MAX_VARS)
+		wanted = MAX_VARS;
+
+	var_entry *v = TPL_realloc(p->vartab.v, wanted * sizeof(var_entry));
+
+	if (!v)
+		return false;
+
+	memset(v + p->vartab.alloc, 0,
+		(wanted - p->vartab.alloc) * sizeof(var_entry));
+	p->vartab.v = v;
+	p->vartab.alloc = wanted;
+	return true;
+}
+
+// The pool is scanned until a NUL, so anything new has to arrive zeroed.
+
+static bool vartab_pool_room(parser *p, size_t need)
+{
+	if (need <= p->vartab.pool_size)
+		return true;
+
+	if (need > MAX_VAR_POOL_SIZE)
+		return false;
+
+	size_t wanted = p->vartab.pool_size ? p->vartab.pool_size : 256;
+
+	while (wanted < need)
+		wanted *= 2;
+
+	if (wanted > MAX_VAR_POOL_SIZE)
+		wanted = MAX_VAR_POOL_SIZE;
+
+	char *pool = TPL_realloc(p->vartab.pool, wanted);
+
+	if (!pool)
+		return false;
+
+	memset(pool + p->vartab.pool_size, 0, wanted - p->vartab.pool_size);
+	p->vartab.pool = pool;
+	p->vartab.pool_size = wanted;
+	return true;
+}
+
+// Records a name offset for a variable, growing to fit. Silently does
+// nothing past MAX_VARS: the caller that matters has already raised
+// "too many vars", and the rest only ever clear an entry.
+
+static void vartab_set_off(parser *p, unsigned i, pl_idx off)
+{
+	if (vartab_entry_room(p, i))
+		p->vartab.v[i].off = off;
+}
+
+// Reset empties the table without giving the memory back: a consult runs
+// thousands of clauses through one parser, and freeing per clause would
+// trade a fixed cost for a churning one.
+
+static void vartab_reset(parser *p)
+{
+	if (p->vartab.pool)
+		memset(p->vartab.pool, 0, p->vartab.pool_size);
+
+	if (p->vartab.v)
+		memset(p->vartab.v, 0, p->vartab.alloc * sizeof(var_entry));
+
+	p->vartab.num_vars = 0;
+}
+
+static void vartab_free(parser *p)
+{
+	TPL_free(p->vartab.pool);
+	TPL_free(p->vartab.v);
+	memset(&p->vartab, 0, sizeof(p->vartab));
+}
+
+// Goal expansion hands the table to a sub-parser and takes it back, which
+// was a struct assignment when the table was inline. It has to be a real
+// copy: the two parsers go on to be destroyed independently, and one error
+// path destroys the sub-parser without ever copying back.
+
+static bool vartab_copy(parser *dst, const parser *src)
+{
+	vartab_free(dst);
+
+	if (src->vartab.pool_size) {
+		dst->vartab.pool = TPL_malloc(src->vartab.pool_size);
+
+		if (!dst->vartab.pool)
+			return false;
+
+		memcpy(dst->vartab.pool, src->vartab.pool, src->vartab.pool_size);
+		dst->vartab.pool_size = src->vartab.pool_size;
+	}
+
+	if (src->vartab.alloc) {
+		dst->vartab.v = TPL_malloc(src->vartab.alloc * sizeof(var_entry));
+
+		if (!dst->vartab.v)
+			return false;
+
+		memcpy(dst->vartab.v, src->vartab.v,
+			src->vartab.alloc * sizeof(var_entry));
+		dst->vartab.alloc = src->vartab.alloc;
+	}
+
+	dst->vartab.num_vars = src->vartab.num_vars;
+	return true;
+}
+
 static pl_idx get_varno(parser *p, const char *src, bool in_body, unsigned depth)
 {
 	int anon = !strcmp(src, "_");
 	size_t offset = 0;
 	unsigned i = 0, nesting_offset = p->is_consulting ? 0 : 1;
 
-	while (p->vartab.pool[offset]) {
+	// The walk is bounded by both the pool AND MAX_VARS. The pool holds
+	// MAX_VAR_POOL_SIZE bytes, so with short names it can describe far
+	// more variables than the parallel arrays have room for - 16000
+	// bytes of "_G1\0" is about 4000 against MAX_VARS of 1024 - and
+	// every one of in_head[i], in_body[i], depth[i], off[i], vars[i]
+	// was being written at that unbounded i.
+
+	while ((offset < p->vartab.pool_size) && (i < MAX_VARS)
+		&& p->vartab.pool[offset]) {
 		if (!strcmp(p->vartab.pool+offset, src) && !anon) {
 			if (in_body)
-				p->vartab.in_body[i]++;
+				p->vartab.v[i].in_body++;
 			else
-				p->vartab.in_head[i]++;
+				p->vartab.v[i].in_head++;
 
-			if (depth > p->vartab.depth[i])
-				p->vartab.depth[i] = depth - nesting_offset;
+			if (depth > p->vartab.v[i].depth)
+				p->vartab.v[i].depth = depth - nesting_offset;
 
 			return i;
 		}
 
 		offset += strlen(p->vartab.pool+offset) + 1;
 		i++;
+	}
+
+	if (i >= MAX_VARS) {
+		fprintf(stderr, "Error: too many vars, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+		p->error = true;
+		return 0;
 	}
 
 	size_t len = strlen(src);
@@ -1384,15 +2446,22 @@ static pl_idx get_varno(parser *p, const char *src, bool in_body, unsigned depth
 		return 0;
 	}
 
+	// One past the name's own NUL, so the scan still finds a terminator.
+	if (!vartab_pool_room(p, offset+len+2) || !vartab_entry_room(p, i)) {
+		fprintf(stderr, "Error: out of memory, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+		p->error = true;
+		return 0;
+	}
+
 	memcpy(p->vartab.pool+offset, src, len+1);
 
 	if (in_body)
-		p->vartab.in_body[i]++;
+		p->vartab.v[i].in_body++;
 	else
-		p->vartab.in_head[i]++;
+		p->vartab.v[i].in_head++;
 
-	if (depth > p->vartab.depth[i])
-		p->vartab.depth[i] = depth - nesting_offset;
+	if (depth > p->vartab.v[i].depth)
+		p->vartab.v[i].depth = depth - nesting_offset;
 
 	p->vartab.num_vars++;
 	return i;
@@ -1404,9 +2473,10 @@ static unsigned get_in_head(parser *p, const char *name)
 	size_t offset = 0;
 	unsigned i = 0;
 
-	while (p->vartab.pool[offset]) {
+	while ((offset < p->vartab.pool_size) && (i < MAX_VARS)
+		&& p->vartab.pool[offset]) {
 		if (!strcmp(p->vartab.pool+offset, name) && !anon) {
-			return p->vartab.in_head[i];
+			return p->vartab.v[i].in_head;
 		}
 
 		offset += strlen(p->vartab.pool+offset) + 1;
@@ -1422,9 +2492,10 @@ static unsigned get_in_body(parser *p, const char *name)
 	size_t offset = 0;
 	unsigned i = 0;
 
-	while (p->vartab.pool[offset]) {
+	while ((offset < p->vartab.pool_size) && (i < MAX_VARS)
+		&& p->vartab.pool[offset]) {
 		if (!strcmp(p->vartab.pool+offset, name) && !anon) {
-			return p->vartab.in_body[i];
+			return p->vartab.v[i].in_body;
 		}
 
 		offset += strlen(p->vartab.pool+offset) + 1;
@@ -1441,11 +2512,10 @@ void assign_vars(parser *p, unsigned start, bool rebase)
 
 	clause *cl = p->cl;
 	cl->is_first_cut = false;
-	cl->is_cut_only = false;
 	p->start_term = true;
 
 	if (!p->reuse) {
-		memset(&p->vartab, 0, sizeof(p->vartab));
+		vartab_reset(p);
 		cl->num_vars = 0;
 		p->num_vars = 0;
 	}
@@ -1482,8 +2552,9 @@ void assign_vars(parser *p, unsigned start, bool rebase)
 			return;
 		}
 
-		p->vartab.off[c->var_num] = c->val_off;
-		p->vartab.used[c->var_num]++;
+		vartab_set_off(p, c->var_num, c->val_off);
+		if (vartab_entry_room(p, c->var_num))
+			p->vartab.v[c->var_num].used++;
 	}
 
 	// ... then the head...
@@ -1517,8 +2588,9 @@ void assign_vars(parser *p, unsigned start, bool rebase)
 			return;
 		}
 
-		p->vartab.off[c->var_num] = c->val_off;
-		p->vartab.used[c->var_num]++;
+		vartab_set_off(p, c->var_num, c->val_off);
+		if (vartab_entry_room(p, c->var_num))
+			p->vartab.v[c->var_num].used++;
 	}
 
 	cl->num_vars = p->vartab.num_vars;
@@ -1532,7 +2604,30 @@ void assign_vars(parser *p, unsigned start, bool rebase)
 		if (!is_var(c))
 			continue;
 
+		// A ref is a runtime variable: val_off is NOT an offset into
+		// the global atom table, so C_STR() on it reads wherever that
+		// happens to land. ASan on a Logtalk load: 16 bytes past a
+		// 144000-byte atom table, faulting in get_in_head()'s first
+		// strcmp. The flag is the only thing distinguishing a ref from
+		// a named var, and it was being cleared one line before the
+		// name was used.
+		//
+		// A ref carries no source name, so there is nothing to count
+		// occurrences of. Classify it global - the conservative answer,
+		// costing an optimisation rather than risking a wrong one.
+
+		bool was_ref = is_ref(c);
 		c->flags &= ~FLAG_VAR_REF;
+
+		if (was_ref) {
+			// It may carry an anonymous mark from functor/3 and the like, which only holds while it occurs once.
+
+			if (!rebase || (c->var_num >= p->vartab.alloc) || (p->vartab.v[c->var_num].used != 1))
+				c->flags &= ~(FLAG_VAR_ANON | FLAG_VAR_VOID);
+
+			c->flags |= FLAG_VAR_GLOBAL;
+			continue;
+		}
 
 		if (c->val_off == g_anon_s)
 			c->flags |= FLAG_VAR_ANON;
@@ -1542,9 +2637,9 @@ void assign_vars(parser *p, unsigned start, bool rebase)
 		unsigned occurrances = var_in_head + var_in_body;
 		bool var_is_global = is_global(c);
 
-		if (var_in_head && (p->vartab.depth[c->var_num] > 1)) {
+		if (var_in_head && (p->vartab.v[c->var_num].depth > 1)) {
 			var_is_global = true;
-		} else if (var_in_body && (p->vartab.depth[c->var_num] > 1)) {
+		} else if (var_in_body && (p->vartab.v[c->var_num].depth > 1)) {
 			var_is_global = true;
 		}
 
@@ -1564,17 +2659,22 @@ void assign_vars(parser *p, unsigned start, bool rebase)
 	}
 
 	for (unsigned i = 0; i < cl->num_vars; i++) {
-		if (p->is_consulting && !p->do_read_term && (p->vartab.used[i] == 1)
+		if (p->is_consulting && !p->do_read_term && ((i < p->vartab.alloc) && (p->vartab.v[i].used == 1))
 			// && (p->vartab.name[i][strlen(p->vartab.name[i])-1] != '_')
-			&& (GET_POOL(p, p->vartab.off[i])[0] != '_')) {
+			&& (GET_POOL(p, vartab_off(p, i))[0] != '_')) {
 			if (!p->pl->quiet
-				&& !((cl->cells->val_off == g_neck_s) && cl->cells->arity == 1))
-				fprintf(stderr, "Warning: singleton: %s, near %s:%d\n", GET_POOL(p, p->vartab.off[i]), get_loaded(p->m, p->m->filename), p->line_num);
+				&& !((cl->cells->val_off == g_neck_s) && get_arity(cl->cells) == 1)
+				&& !((cl->cells->val_off == g_quad_s) && ((get_arity(cl->cells) == 1) || (get_arity(cl->cells) == 2)))
+				&& !p->m->in_quad)
+				fprintf(stderr, "Warning: singleton: %s, near %s:%d\n", GET_POOL(p, vartab_off(p, i)), get_loaded(p->m, p->m->filename), p->line_num);
 		}
 	}
 
 	cell *c = make_a_cell(p);
-	ENSURE(c);
+
+	if (!c)
+		return;
+
 	c->tag = TAG_END;
 	c->num_cells = 1;
 }
@@ -1598,6 +2698,12 @@ static void replace_double_bar(parser *p, pl_idx i, pl_idx last_idx)
 	} else {
 		char *src = C_STR(p, lhs);
 		query *q = query_create(p->m);
+
+		if (!q) {
+			p->error = true;
+			return;
+		}
+
 		cell *l = string_to_chars_list(q, lhs);
 		unshare_cells(lhs, lhs->num_cells);
 		cell *tmp = TPL_calloc((l->num_cells-1)+rhs->num_cells+1, sizeof(cell));
@@ -1615,7 +2721,9 @@ static void replace_double_bar(parser *p, pl_idx i, pl_idx last_idx)
 		unsigned extra_cells = tmp->num_cells - tot_cells;
 		//printf("*** tot_cells = %u, extra_cells = %u\n", tot_cells, extra_cells);
 
-		make_room(p, extra_cells);
+		if (!make_room(p, extra_cells))
+			return;
+
 		c = p->cl->cells + i;
 		lhs = p->cl->cells + last_idx;
 		rhs = c + 1;
@@ -1631,7 +2739,7 @@ static void replace_double_bar(parser *p, pl_idx i, pl_idx last_idx)
 }
 
 // Reduce a vector of cells in token order to a parse tree. This is
-// done in two passes: first find the lowest priority un-applied
+// done in two passes: first find the lowest priority unapplied
 // operator then apply args to that operator. This works by swapping
 // in place the args eg. 'arg1 op arg2' becomes 'op arg1 arg2' in
 // the resultant vector. This is done as long as necessary for the
@@ -1659,6 +2767,15 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 			c->priority = 0;
 			i++;
 			continue;
+		}
+
+		// '||' is priority 0 with a priority 0 tail, so binds before any op (issue #1161)
+
+		if (c->val_off == g_double_bar_s) {
+			lowest = c->priority;
+			work_idx = i;
+			do_work = true;
+			break;
 		}
 
 		if (bind_le ? c->priority <= lowest : c->priority < lowest) {
@@ -1696,14 +2813,14 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 			printf("*** OP2 last=%u/start=%u '%s' type=%u, specifier=%u, pri=%u, last_op=%d, is_op=%d\n", last_idx, start_idx, C_STR(p, c), c->tag, GET_OP(c), c->priority, last_op, IS_OP(c));
 #endif
 
-		c->arity = 1;
+		set_arity(c, 1);
 
 		// Prefix...
 
 		if (is_fx(c)) {
 			const cell *rhs = c + 1;
 
-			if (is_fx(rhs) && !rhs->arity && (rhs->priority == c->priority)) {
+			if (is_fx(rhs) && !get_arity(rhs) && (rhs->priority == c->priority)) {
 				if (!p->do_read_term)
 					fprintf(stderr, "Error: syntax error, operator clash, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -1728,7 +2845,7 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 		if (is_prefix(c)) {
 			cell *rhs = c + 1;
 
-			if (is_infix(rhs) && !rhs->arity && (rhs->priority > c->priority)) {
+			if (is_infix(rhs) && !get_arity(rhs) && (rhs->priority > c->priority)) {
 				if (!p->do_read_term)
 					fprintf(stderr, "Error: syntax error, operator clash, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -1737,7 +2854,7 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 				return false;
 			}
 
-			if (is_prefix(rhs) && !rhs->arity && (rhs->priority > c->priority)) {
+			if (is_prefix(rhs) && !get_arity(rhs) && (rhs->priority > c->priority)) {
 				if (!p->do_read_term)
 					fprintf(stderr, "Error: syntax error, operator clash, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -1777,7 +2894,7 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 			return false;
 		}
 
-		if (is_prefix(rhs) && !rhs->arity && (rhs->priority > c->priority)) {
+		if (is_prefix(rhs) && !get_arity(rhs) && (rhs->priority > c->priority)) {
 			if (!p->do_read_term)
 				fprintf(stderr, "Error: syntax error, operator clash, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -1817,11 +2934,29 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 		// Infix...
 
 		if (c->val_off == g_double_bar_s) {
+			if ((pl_idx)(rhs - p->cl->cells) > end_idx) {
+				if (!p->do_read_term)
+					fprintf(stderr, "Error: syntax error, missing operand to infix, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+
+				p->error_desc = "operand_missing";
+				p->error = true;
+				return false;
+			}
+
+			if (is_interned(rhs) && (rhs->num_cells == 1) && rhs->priority) {
+				if (!p->do_read_term)
+					fprintf(stderr, "Error: syntax error, operator clash, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+
+				p->error_desc = "operator_clash";
+				p->error = true;
+				return false;
+			}
+
 			replace_double_bar(p, i, last_idx);
 			break;
 		}
 
-		if (is_infix(rhs) && !rhs->arity) {
+		if (is_infix(rhs) && !get_arity(rhs)) {
 			if (!p->do_read_term)
 				fprintf(stderr, "Error: syntax error, operator clash, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -1846,7 +2981,7 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 
 		cell *lhs = p->cl->cells + last_idx;
 
-		if (is_infix(lhs) && !lhs->arity) {
+		if (is_infix(lhs) && !get_arity(lhs)) {
 			if (!p->do_read_term)
 				fprintf(stderr, "Error: syntax error, operator clash, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -1864,7 +2999,7 @@ static bool reduce(parser *p, pl_idx start_idx, bool last_op)
 
 		*c = save;
 		c->num_cells += rhs->num_cells;
-		c->arity = 2;
+		set_arity(c, 2);
 
 		if (is_xfx(c)) {
 			cell *next = c + c->num_cells;
@@ -1911,67 +3046,26 @@ static bool analyze(parser *p, pl_idx start_idx, bool last_op)
 	return !p->error;
 }
 
-static bool term_expansion(parser *p);
+// An argument, element or bracketed term has to reduce to one term, as a whole clause does
 
-static bool dcg_expansion(parser *p)
+static bool analyze_one(parser *p, pl_idx start_idx, bool last_op)
 {
-	query *q = query_create(p->m);
-	check_error(q);
+	if (!analyze(p, start_idx, last_op))
+		return false;
 
-	q->trace = false;
-	cell *c = p->cl->cells;
-	cell *tmp = alloc_heap(q, 1+c->num_cells+1+1);
-	make_instr(tmp, g_dcg_translate_s, NULL, 2, c->num_cells+1);
-	dup_cells(tmp+1, p->cl->cells, c->num_cells);
-	make_ref(tmp+1+c->num_cells, p->cl->num_vars, 0);
-	make_end(tmp+1+c->num_cells+1);
-	bool ok = execute(q, tmp, p->cl->num_vars+MAX_ARITY);
+	if ((start_idx < p->cl->cidx) && (p->cl->cells[start_idx].num_cells < (p->cl->cidx - start_idx))) {
+		if (!p->do_read_term)
+			fprintf(stderr, "Error: syntax error, operator expected, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
-	if (!ok || q->abort) {
-		query_destroy(q);
+		p->error_desc = "operator_expected";
 		p->error = true;
 		return false;
 	}
-
-	cell *arg1 = tmp + 1;
-	cell *arg2 = arg1 + arg1->num_cells;
-	c = deref(q, arg2, 0);
-	q->max_depth = -1;
-	char *src = print_canonical_to_strbuf(q, c, q->latest_ctx, 1);
-
-	if (!src) {
-		query_destroy(q);
-		p->error = true;
-		return false;
-	}
-
-	strcat(src, ".");
-	query_destroy(q);
-
-	parser *p2 = parser_create(p->m);
-	check_error(p2);
-	p2->srcptr = src;
-	tokenize(p2, false, false);
-
-	if (p2->error) {
-		parser_destroy(p2);
-		query_destroy(q);
-		p->error = true;
-		return false;
-	}
-
-	process_clause(p2->m, p2->cl, NULL);
-	TPL_free(src);
-
-	clear_clause(p->cl);
-	TPL_free(p->cl);
-	p->cl = p2->cl;					// Take the completed clause
-	p->num_vars = p2->num_vars;
-	p2->cl = NULL;
-	parser_destroy(p2);
 
 	return true;
 }
+
+static bool term_expansion(parser *p);
 
 static bool term_expansion(parser *p)
 {
@@ -1979,10 +3073,6 @@ static bool term_expansion(parser *p)
 		return false;
 
 	cell *c = p->cl->cells;
-
-	if ((c->val_off == g_dcg_s) && (c->arity == 2)) {
-		dcg_expansion(p); // FIXME: need to term_expand & may be a list?
-	}
 
 	c = p->cl->cells;
 	module *m = p->m;
@@ -2001,8 +3091,19 @@ static bool term_expansion(parser *p)
 	//if (h->val_off == g_term_expansion_s)
 	//	return false;
 
-	if (h->val_off == g_colon_s)
-		return false;
+	// Module-qualified heads: skip expansion for hook installations
+	// (M:term_expansion/M:goal_expansion clauses would otherwise feed
+	// back into the expander), but let ordinary M:Head clauses through -
+	// eg. clauses of tabled predicates need the rename expansion.
+
+	if (h->val_off == g_colon_s) {
+		cell *qh = h + 1;
+		qh = qh + qh->num_cells;
+
+		if (is_interned(qh) && ((qh->val_off == g_term_expansion_s)
+			|| !CMP_STRING_TO_CSTR(p, qh, "goal_expansion")))
+			return false;
+	}
 
 	query *q = query_create(m);
 	check_error(q);
@@ -2033,22 +3134,24 @@ static bool term_expansion(parser *p)
 		return false;
 	}
 
-	//fprintf(stderr, "+++ term_expansion %s/%u ==> ", C_STR(p, h), h->arity);
+	//fprintf(stderr, "+++ term_expansion %s/%u ==> ", C_STR(p, h), get_arity(h));
 
 	strcat(src, ".");
 	parser *p2 = parser_create(p->m);
 	check_error(p2);
 	p2->srcptr = src;
+	p2->expand_dcg = true;		// a --> result gets translated (issue #1142)
 	tokenize(p2, false, false);
 
 	if (p2->error) {
 		parser_destroy(p2);
 		query_destroy(q);
+		TPL_free(src);	// FIX: free leaked src
 		p->error = true;
 		return false;
 	}
 
-	process_clause(p2->m, p2->cl, NULL);
+	process_clause(p2->m, p2->cl);
 	TPL_free(src);
 
 	clear_clause(p->cl);
@@ -2064,12 +3167,106 @@ static bool term_expansion(parser *p)
 	return term_expansion(p);
 }
 
+static void fixup_expansion_var_collisions(cell *goal, unsigned num_vars_before, parser *p2)
+{
+	bool in_goal[MAX_VARS] = {0};
+
+	for (cell *c = goal, *end = goal + goal->num_cells; c < end; c++) {
+		if (is_var(c) && (c->var_num < MAX_VARS))
+			in_goal[c->var_num] = true;
+	}
+
+	pl_idx remap_from[MAX_VARS], remap_to[MAX_VARS];
+	unsigned nremaps = 0;
+
+	// A renamed variable is new to the whole clause, so it numbers past every one the clause had: the sub-parser can count fewer.
+
+	if (p2->cl->num_vars < num_vars_before)
+		p2->cl->num_vars = num_vars_before;
+
+	for (pl_idx i = 0; i < p2->cl->cidx; i++) {
+		cell *c = p2->cl->cells + i;
+
+		if (!is_var(c))
+			continue;
+
+		if (c->var_num >= num_vars_before)
+			continue;
+
+		if ((c->var_num < MAX_VARS) && in_goal[c->var_num])
+			continue;
+
+		unsigned found = nremaps;
+
+		for (unsigned j = 0; j < nremaps; j++) {
+			if (remap_from[j] == c->var_num) {
+				found = j;
+				break;
+			}
+		}
+
+		if (found == nremaps) {
+			if (nremaps >= MAX_VARS)
+				continue;
+
+			remap_from[nremaps] = c->var_num;
+			remap_to[nremaps] = (pl_idx)p2->cl->num_vars++;
+			nremaps++;
+		}
+
+		c->var_num = remap_to[found];
+
+		if (c->var_num < MAX_VARS)
+			vartab_set_off(p2, c->var_num, 0);
+	}
+}
+
+
+static cell *goal_expansion_(parser *p, cell *goal);
+
+// goal_expansion() and term_to_body_conversion() call each other: an
+// expansion's output is re-walked as a body, and any goal in it is
+// expanded again. A goal that reintroduces itself therefore recurses
+// through BOTH functions, so the guard has to be nesting depth held on the
+// prolog instance - each expansion runs in a NEW parser, so a counter
+// on the parser resets every round too.
+//
+// Issue #900: goal_expansion(p(B), B) :- b((m,p(_))). The expansion
+// changes the goal every time, so a fixpoint check alone never fires;
+// the C stack gave out at ~5500 levels.
+
+// Each level allocates a parser AND a query, so the C stack gives out
+// somewhere past 750 levels. Real chains are two or three deep - dcgs,
+// clpz and atts all expand once - so this leaves ample headroom while
+// staying an order of magnitude below the stack limit.
+
+#define MAX_GOAL_EXPANSIONS 64
+
 static cell *goal_expansion(parser *p, cell *goal)
+{
+	if (p->pl->goal_expansions >= MAX_GOAL_EXPANSIONS) {
+		if (!p->error) {
+			fprintf(stderr, "Error: goal_expansion/2 did not terminate, %s:%d\n",
+				get_loaded(p->m, p->m->filename), p->line_num);
+			p->error_desc = "goal_expansion_limit";
+			p->error = true;
+		}
+
+		return goal;
+	}
+
+	p->pl->goal_expansions++;
+	cell *ret = goal_expansion_(p, goal);
+	p->pl->goal_expansions--;
+	return ret;
+}
+
+static cell *goal_expansion_(parser *p, cell *goal)
 {
 	if (p->error || p->internal || !is_interned(goal) || !is_callable(goal))
 		return goal;
 
-	if ((goal->val_off == g_goal_expansion_s) && (goal->arity == 2))
+	if ((goal->val_off == g_goal_expansion_s) && (get_arity(goal) == 2))
 		return goal;
 
 	if (goal->val_off == g_cut_s)
@@ -2088,14 +3285,30 @@ static cell *goal_expansion(parser *p, cell *goal)
 	//	return goal;
 
 	if (p->pl->in_goal_expansion) {
-		//printf("??? goal_expansion %s/%u\n", C_STR(p, goal), goal->arity);
+		//printf("??? goal_expansion %s/%u\n", C_STR(p, goal), get_arity(goal));
 		return goal;
 	}
 
-	//printf("*** [%s] goal_expansion %s/%u, p->is_command=%d\n", p->m->name, C_STR(p, goal), goal->arity, p->is_command);
+	//printf("*** [%s] goal_expansion %s/%u, p->is_command=%d\n", p->m->name, C_STR(p, goal), get_arity(goal), p->is_command);
 
-	query *q = query_create(p->m);
-	check_error(q);
+	// Scryer-compatible: user:goal_expansion/2 is registered in `user`, but
+	// each module has its own (empty) goal_expansion/2 that shadows it. When
+	// the hook lives only in `user`, run the expansion query in user_m so the
+	// unqualified call resolves it (no need to export goal_expansion/2).
+	module *exp_m = p->m;
+	if (!find_goal_expansion(p->m, goal) && p->pl->user_m && find_goal_expansion_specific(p->pl->user_m, goal))
+		exp_m = p->pl->user_m;
+
+	query *q = query_create(exp_m);
+
+	// Not check_error(): goal_expansion() feeds its result straight into
+	// term_to_body_conversion(), so a null here would crash there.
+
+	if (!q) {
+		p->error = true;
+		return goal;
+	}
+
 	q->trace = false;
 	q->varnames = true;
 	q->max_depth = -1;
@@ -2112,13 +3325,14 @@ static cell *goal_expansion(parser *p, cell *goal)
 	// variables should create anew. Hence we pull the
 	// vartab from the main parser... IS THIS TRUE?
 
-	//printf("+++ goal_expansion %s/%u\n", C_STR(p, goal), goal->arity);
+	//printf("+++ goal_expansion %s/%u\n", C_STR(p, goal), get_arity(goal));
 	p->pl->in_goal_expansion = true;
-	parser *p2 = parser_create(p->m);
+	const unsigned num_vars_before = p->cl->num_vars;
+	parser *p2 = parser_create(exp_m);
 	check_error(p2, query_destroy(q));
 	q->top = p2;
 	p2->cl->num_vars = p->cl->num_vars;
-	p2->vartab = p->vartab;
+	if (!vartab_copy(p2, p)) { p->error = true; }
 	p2->reuse = true;
 	p2->line_num = p->line_num;
 	p2->skip = true;
@@ -2133,7 +3347,7 @@ static cell *goal_expansion(parser *p, cell *goal)
 		return goal;
 	}
 
-	process_clause(p2->m, p2->cl, NULL);
+	process_clause(p2->m, p2->cl);
 	execute(q, p2->cl->cells, p2->cl->num_vars);
 	SB_free(s);
 	p->pl->in_goal_expansion = false;
@@ -2144,22 +3358,28 @@ static cell *goal_expansion(parser *p, cell *goal)
 		return goal;
 	}
 
-	//printf("-- goal_expansion %s/%u\n", C_STR(p, goal), goal->arity);
+	//printf("-- goal_expansion %s/%u\n", C_STR(p, goal), get_arity(goal));
 
 	clear_write_options(q);
 
 	for (unsigned i = 0; i < p->cl->num_vars; i++)
-		q->ignores[i] = true;
+		ignore_name(q, i);
 
-	p->cl->num_vars = p2->cl->num_vars;
+	// Never let the variable count go backwards: the sub-parser may
+	// have fewer variables than the clause already has, and lowering
+	// the count makes the next expansion hand out a slot that is
+	// still in use, silently merging two distinct variables...
+
+	if (p2->cl->num_vars > p->cl->num_vars)
+		p->cl->num_vars = p2->cl->num_vars;
 	frame *f = GET_FRAME(0);
 	char *src = NULL;
 
 	for (unsigned i = 0; i < p2->cl->num_vars; i++) {
-		if (!p2->vartab.off[i])
+		if (!vartab_off(p2, i))
 			continue;
 
-		if (strcmp(GET_POOL(p, p2->vartab.off[i]), "_TermOut"))
+		if (strcmp(GET_POOL(p, vartab_off(p2, i)), "_TermOut"))
 			continue;
 
 		slot *e = get_slot(q, f, i);
@@ -2189,7 +3409,7 @@ static cell *goal_expansion(parser *p, cell *goal)
 
 	parser_reset(p2);
 	p2->cl->num_vars = p->cl->num_vars;
-	p2->vartab = p->vartab;
+	if (!vartab_copy(p2, p)) { p->error = true; }
 	p2->reuse = true;
 	p2->srcptr = src;
 	tokenize(p2, false, false);
@@ -2210,17 +3430,24 @@ static cell *goal_expansion(parser *p, cell *goal)
 		return goal;
 	}
 
-	process_clause(p2->m, p2->cl, NULL);
+	process_clause(p2->m, p2->cl);
 	TPL_free(src);
+	fixup_expansion_var_collisions(goal, num_vars_before, p2);
 
 	// Push the updated vartab back...
 
-	p->cl->num_vars = p2->cl->num_vars;
-	p->vartab = p2->vartab;
+	if (p2->cl->num_vars > p->cl->num_vars)
+		p->cl->num_vars = p2->cl->num_vars;
+
+	if (!vartab_copy(p, p2)) { p->error = true; }
 
 	// snip the old goal...
 
 	const unsigned goal_idx = goal - p->cl->cells;
+	const unsigned save_num_cells = goal->num_cells;
+	cell *save_cells = TPL_malloc(sizeof(cell) * save_num_cells);
+	if (!save_cells) return goal;
+	memcpy(save_cells, goal, sizeof(cell) * save_num_cells);
 	unsigned trailing = p->cl->cidx - (goal_idx + goal->num_cells);
 	p->cl->cidx -= goal->num_cells;
 	unshare_cells(goal, goal->num_cells);
@@ -2230,7 +3457,12 @@ static cell *goal_expansion(parser *p, cell *goal)
 
 	const unsigned new_cells = p2->cl->cidx-1;		// skip TAG_END
 	trailing = p->cl->cidx - goal_idx;
-	make_room(p, new_cells);
+	// Like every other early-out here, hand back the goal unexpanded;
+	// p->error is already set, so the clause is discarded regardless.
+
+	if (!make_room(p, new_cells))
+		return p->cl->cells + goal_idx;
+
 	goal = p->cl->cells + goal_idx;
 
 	// shift up...
@@ -2249,20 +3481,32 @@ static cell *goal_expansion(parser *p, cell *goal)
 	parser_destroy(p2);
 	query_destroy(q);
 
+	const bool unchanged = (new_cells == save_num_cells)
+		&& !memcmp(goal, save_cells, sizeof(cell) * new_cells);
+
+	TPL_free(save_cells);
+
+	if (unchanged)
+		return goal;
+
 	return goal_expansion(p, goal);
 }
 
 static void expand_meta_predicate(parser *p, predicate *pr, cell *goal)
 {
-	int arity = goal->arity;
+	uint32_t arity = get_arity(goal);
+
+	// Both `goal` and `k` point into p->cl->cells, which make_room()
+	// below can grow and hence move. Their indices survive the realloc
+	// where the pointers do not.
+
+	const unsigned goal_idx = goal - p->cl->cells;
 
 	for (cell *k = goal+1, *m = pr->meta_args+1; arity--; k += k->num_cells, m += m->num_cells) {
 		cell tmpbuf[2];
 
-		if (is_interned(k) && ((k->val_off == g_call_s) || (k->val_off == g_once_s) || (k->val_off == g_ignore_s)))
-			continue;
-		else if ((k->arity == 2) && (k->val_off == g_colon_s) && is_atom(FIRST_ARG(k)))
-			continue;
+		if ((get_arity(k) == 2) && (k->val_off == g_colon_s) && (is_atom(FIRST_ARG(k)) || is_var(FIRST_ARG(k))))
+			continue;		// a variable module is left to the call, by when it's bound
 		else if (!is_interned(k) || is_iso_list(k))
 			continue;
 		else if (is_interned(m) && (m->val_off == g_colon_s)) {
@@ -2280,7 +3524,18 @@ static void expand_meta_predicate(parser *p, predicate *pr, cell *goal)
 
 		unsigned new_cells = 2, k_idx = k - p->cl->cells;
 		unsigned trailing = (p->cl->cidx - k_idx) + 1;
-		make_room(p, new_cells);
+
+		if (!make_room(p, new_cells))
+			return;
+
+		// ... and re-derive, because that may have moved the clause.
+		// k_idx was already being computed for the trailing count; the
+		// pointers were simply never refreshed from it. A parsed clause
+		// usually arrives with enough slack that make_room() returns
+		// without reallocating, which is why this stayed latent.
+
+		k = p->cl->cells + k_idx;
+		goal = p->cl->cells + goal_idx;
 
 		// shift up...
 
@@ -2299,9 +3554,12 @@ static bool is_meta_arg(predicate *pr, cell *c, unsigned arg, int *extra)
 	if (!pr->meta_args)
 		return false;
 
+	if (arg >= get_arity(&pr->key))
+		return false;
+
 	unsigned i = 0;
 
-	for (cell *m = pr->meta_args+1; m && (i < c->arity); m += m->num_cells, i++) {
+	for (cell *m = pr->meta_args+1; m && (i < get_arity(&pr->key)); m += m->num_cells, i++) {
 		if (!is_integer(m) || (i != arg))
 			continue;
 
@@ -2317,7 +3575,9 @@ static bool is_meta_arg(predicate *pr, cell *c, unsigned arg, int *extra)
 static cell *insert_call_here(parser *p, cell *c, cell *p1)
 {
 	pl_idx c_idx = c - p->cl->cells, p1_idx = p1 - p->cl->cells;
-	make_room(p, 1);
+
+	if (!make_room(p, 1))
+		return p->cl->cells + c_idx;
 
 	cell *last = p->cl->cells + (p->cl->cidx - 1);
 	int cells_to_move = p->cl->cidx - p1_idx;
@@ -2334,7 +3594,7 @@ static cell *insert_call_here(parser *p, cell *c, cell *p1)
 
 static cell *term_to_body_conversion(parser *p, cell *c)
 {
-	//printf("*** term_to_body_conversion %s/%u, p->is_command=%d\n", C_STR(p, c), c->arity, p->is_command);
+	//printf("*** term_to_body_conversion %s/%u, p->is_command=%d\n", C_STR(p, c), get_arity(c), p->is_command);
 
 	pl_idx c_idx = c - p->cl->cells;
 	bool is_head = c_idx == 0;
@@ -2352,7 +3612,7 @@ static cell *term_to_body_conversion(parser *p, cell *c)
 				c = insert_call_here(p, c, lhs);
 				lhs = c + 1;
 			} else {
-				lhs->arity += extra;
+				set_arity(lhs, get_arity(lhs) + extra);
 
 				if ((c->val_off != g_neck_s))
 					lhs = goal_expansion(p, lhs);
@@ -2360,20 +3620,37 @@ static cell *term_to_body_conversion(parser *p, cell *c)
 				if (!is_head)
 					lhs = term_to_body_conversion(p, lhs);
 
-				lhs->arity -= extra;
+				set_arity(lhs, get_arity(lhs) - extra);
 			}
 
 			cell *rhs = lhs + lhs->num_cells;
 			extra = 0;
 			c = p->cl->cells + c_idx;
 
-			if (is_var(rhs))
+			if (is_var(rhs)) {
+				// insert_call_here() grows the clause, so lhs and rhs
+				// go stale here just as they do in the else branch -
+				// and both are dereferenced below to size c. Only c was
+				// being refreshed.
+
+				const pl_idx lhs_idx = lhs - p->cl->cells;
+				const pl_idx rhs_idx = rhs - p->cl->cells;
 				c = insert_call_here(p, c, rhs);
-			else {
-				rhs->arity += extra;
+				lhs = p->cl->cells + lhs_idx;
+				rhs = p->cl->cells + rhs_idx;
+			} else {
+				pl_idx lhs_idx = lhs - p->cl->cells;
+				set_arity(rhs, get_arity(rhs) + extra);
 				rhs = goal_expansion(p, rhs);
 				rhs = term_to_body_conversion(p, rhs);
-				rhs->arity -= extra;
+				set_arity(rhs, get_arity(rhs) - extra);
+
+				// Both calls above can grow, and hence move, the
+				// clause. Re-derive the pointers into it; rhs is
+				// already the freshly returned one...
+
+				lhs = p->cl->cells + lhs_idx;
+				c = p->cl->cells + c_idx;
 			}
 
 			c->num_cells = 1 + lhs->num_cells + rhs->num_cells;
@@ -2388,6 +3665,7 @@ static cell *term_to_body_conversion(parser *p, cell *c)
 			} else {
 				rhs = goal_expansion(p, rhs);
 				rhs = term_to_body_conversion(p, rhs);
+				c = p->cl->cells + c_idx;	// may have moved
 			}
 
 			c->num_cells = 1 + rhs->num_cells;
@@ -2396,40 +3674,70 @@ static cell *term_to_body_conversion(parser *p, cell *c)
 
 			if (!is_var(rhs)) {
 				rhs = goal_expansion(p, rhs);
+				c = p->cl->cells + c_idx;	// may have moved
 				c->num_cells = 1 + rhs->num_cells;
 			}
 		}
-	} else if (!is_head && c->arity) {
+	} else if (!is_head && get_arity(c)) {
 		bool is_goal_expansion = find_goal_expansion(p->m, c);
 		predicate *pr = find_predicate(p->m, c);
 		bool meta = !pr || pr->is_meta_predicate || is_goal_expansion || p->m->wild_goal_expansion;
 		bool control = false;
 
-		if ((c->val_off == g_throw_s) && (c->arity == 1))
+		if ((c->val_off == g_throw_s) && (get_arity(c) == 1))
 			control = true;
-		else if ((c->val_off == g_catch_s) && (c->arity == 3))
+		else if ((c->val_off == g_catch_s) && (get_arity(c) == 3))
 			control = true;
 
 		if (pr) {
 			if (pr->alias)
 				pr = pr->alias;
 
-			if (pr->is_meta_predicate)
+			if (pr->is_meta_predicate) {
 				expand_meta_predicate(p, pr, c);
+
+				// It inserts cells, so the clause may have moved.
+
+				c = p->cl->cells + c_idx;
+			}
 		}
 
 		if (meta) {
+			pl_idx old_val_off = c->val_off;
+			unsigned old_arity = get_arity(c);
 			c = goal_expansion(p, c);
+			c_idx = c - p->cl->cells;
+
+			if ((c->val_off != old_val_off) || (get_arity(c) != old_arity)) {
+				pr = find_predicate(p->m, c);
+
+				if (pr) {
+					if (pr->alias)
+						pr = pr->alias;
+
+					if (pr->is_meta_predicate) {
+						expand_meta_predicate(p, pr, c);
+						c = p->cl->cells + c_idx;
+					}
+				}
+
+				control = false;
+
+				if ((c->val_off == g_throw_s) && (get_arity(c) == 1))
+					control = true;
+				else if ((c->val_off == g_catch_s) && (get_arity(c) == 3))
+					control = true;
+			}
 		}
 
 		cell *arg = c + 1;
-		int arity = c->arity, i = 0;
+		uint32_t arity = get_arity(c), i = 0;
 
 		while (arity--) {
 			int extra = 0;
 			bool meta = pr ? is_meta_arg(pr, c, i, &extra) : false;
 			int save_num_cells = arg->num_cells;
-			arg->arity += extra;
+			set_arity(arg, get_arity(arg) + extra);
 
 			if (meta)
 				arg = goal_expansion(p, arg);
@@ -2437,7 +3745,8 @@ static cell *term_to_body_conversion(parser *p, cell *c)
 			if (control || meta)
 				arg = term_to_body_conversion(p, arg);
 
-			arg->arity -= extra;
+			set_arity(arg, get_arity(arg) - extra);
+			c = p->cl->cells + c_idx;	// may have moved
 			c->num_cells += arg->num_cells - save_num_cells;
 			arg += arg->num_cells;
 			i++;
@@ -2454,27 +3763,26 @@ void term_to_body(parser *p)
 	p->cl->cells->num_cells = p->cl->cidx - 1;	// Drops TAG_END
 }
 
+// The right-hand chain in a loop, the left recursed into, so a long
+// conjunction doesn't run out of C stack.
+
 cell *check_body_callable(cell *c)
 {
-	if ((c->arity == 2) && (is_xfx(c) || is_xfy(c))) {
-		if ((c->val_off == g_conjunction_s)
-			|| (c->val_off == g_disjunction_s)
-			|| (c->val_off == g_if_then_s)
-			|| (c->val_off == g_soft_cut_s)
-			|| (c->val_off == g_neck_s)) {
-			cell *lhs = c + 1;
-			cell *tmp;
+	while ((get_arity(c) == 2) && (is_xfx(c) || is_xfy(c))) {
+		if ((c->val_off != g_conjunction_s)
+			&& (c->val_off != g_disjunction_s)
+			&& (c->val_off != g_if_then_s)
+			&& (c->val_off != g_soft_cut_s)
+			&& (c->val_off != g_neck_s))
+			return NULL;
 
-			if ((tmp = check_body_callable(lhs)) != NULL)
-				return tmp;
+		cell *lhs = c + 1;
+		cell *tmp;
 
-			cell *rhs = lhs + lhs->num_cells;
+		if ((tmp = check_body_callable(lhs)) != NULL)
+			return tmp;
 
-			if ((tmp = check_body_callable(rhs)) != NULL)
-				return tmp;
-		}
-
-		return NULL;
+		c = lhs + lhs->num_cells;
 	}
 
 	return !is_callable(c) && !is_var(c) ? c : NULL;
@@ -2501,6 +3809,10 @@ bool virtual_term(parser *p, const char *src)
 cell *make_interned(parser *p, pl_idx offset)
 {
 	cell *c = make_a_cell(p);
+
+	if (!c)
+		return NULL;
+
 	c->tag = TAG_INTERNED;
 	c->num_cells = 1;
 	c->val_off = offset;
@@ -2574,10 +3886,12 @@ const char *g_anti_escapes = "eafbtvrnsd'\\\"`";
 static int get_escape(parser *p, const char **_src, bool *error, bool number)
 {
 	const char *src = *_src;
-	int ch = *src++;
+	int ch = (unsigned char)*src++;
 	const char *ptr = strchr(g_anti_escapes, ch);
 
-	if (ptr && ((ch != 's') || !p->flags.strict_iso))
+	// \s, \e and \d are extensions, so strict ISO refuses them
+
+	if (ptr && (!p->flags.strict_iso || ((ch != 's') && (ch != 'e') && (ch != 'd'))))
 		ch = g_escapes[ptr-g_anti_escapes];
 	else if ((isdigit(ch) || (ch == 'x')
 		|| (((ch == 'u') || (ch == 'U')) && (p->flags.json || !p->flags.strict_iso))
@@ -2649,10 +3963,10 @@ void read_integer(parser *p, mp_int v2, int base, const char **srcptr)
 		if ((base == 8) && !isodigit(*src))
 			break;
 
-		if ((base == 10) && !isdigit(*src))
+		if ((base == 10) && !isdigit((unsigned char)*src))
 			break;
 
-		if ((base == 16) && !isxdigit(*src))
+		if ((base == 16) && !isxdigit((unsigned char)*src))
 			break;
 
 		if (spacers > 1) {
@@ -2690,9 +4004,9 @@ void read_integer(parser *p, mp_int v2, int base, const char **srcptr)
 		return;
 	}
 
-	if ((base != 16) && !isdigit(src[-1]))
+	if ((base != 16) && !isdigit((unsigned char)src[-1]))
 		src--;
-	else if ((base == 16) && !isxdigit(src[-1]))
+	else if ((base == 16) && !isxdigit((unsigned char)src[-1]))
 		src--;
 
 	mp_int_read_cstring(v2, base, (char*)SB_cstr(p->token), NULL);
@@ -2711,7 +4025,7 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 
 	PARSE_LOOP:
 
-	if ((*s == '.') && isdigit(s[1])) {
+	if ((*s == '.') && isdigit((unsigned char)s[1])) {
 		if (!p->do_read_term)
 			fprintf(stderr, "Error: syntax error, parsing number, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -2720,10 +4034,13 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 		return false;
 	}
 
-	if (!isdigit(*s))
+	// These index a ctype table with a char, which is signed: any byte
+	// over 0x7f arrives negative, and the lookup is then undefined. A
+	// 4-byte codepoint after 0' starts at 0xf0, i.e. -16.
+	if (!isdigit((unsigned char)*s))
 		return false;
 
-	if ((s[0] == '0') && (s[1] == '\'') && iscntrl(s[2])) {
+	if ((s[0] == '0') && (s[1] == '\'') && iscntrl((unsigned char)s[2])) {
 		if (!p->do_read_term)
 			fprintf(stderr, "Error: syntax error, parsing number, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -2733,7 +4050,7 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 	}
 
 	if ((s[0] == '0') && (s[1] == '\'') && (s[2] == '\'')
-		&& (iswspace(s[3]) || (s[3] == '.') || (s[3] == ',') || (s[3] == ';') || !s[3])) {
+		&& (isspace((unsigned char)s[3]) || (s[3] == '.') || (s[3] == ',') || (s[3] == ';') || !s[3])) {
 		if (!p->do_read_term)
 			fprintf(stderr, "Error: syntax error, parsing number, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -2751,7 +4068,7 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 		return false;
 	}
 
-	if ((s[0] == '0') && (s[1] == '\'') && (s[2] == '\\') && isdigit(s[3])) {
+	if ((s[0] == '0') && (s[1] == '\'') && (s[2] == '\\') && isdigit((unsigned char)s[3])) {
 		char *s2 = (char*)s+3;
 		long long v = strtoll(s2, &s2, 8);
 
@@ -2819,7 +4136,8 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 			int save_ch = s[0];
 			v = get_escape(p, &s, &p->error, false);
 
-			if ((((save_ch == '0')) && !iscntrl(v)) || p->error) {
+			// v is a codepoint, so the wide form here.
+			if ((((save_ch == '0')) && !iswcntrl(v)) || p->error) {
 				//printf("*** *s=%d, iscntrl=%d, save_ch=%d, v=%d\n", *s, iscntrl(*s), save_ch, v);
 
 				if (!p->do_read_term)
@@ -2833,7 +4151,7 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 		} else if ((*s == '\'') && s[1] == '\'') {
 			s++;
 			v = *s++;
-		} else if ((*s == '\'') && p->flags.strict_iso && search_op(p->m, "", NULL, false)) {
+		} else if (*s == '\'') {	// 0'' before anything but a quote is no character literal (#766, #798)
 			if (!p->do_read_term)
 				fprintf(stderr, "Error: syntax error, parsing number, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -2931,16 +4249,23 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 
 	read_integer(p, &v2, 10, &s);
 
-	if (p->flags.json && s && ((*s == 'e') || (*s == 'E')) && isdigit(s[1])) {
+	// An overflowing float is syntactically fine, it just exceeds an
+	// implementation defined limit, so 8.12.2 f applies and not
+	// 8.16.7.3 e (issue #1140). Which limit depends on the sign, as
+	// with min_integer/max_integer: strtod only ever sees the digits
+	// here, the sign is carried in neg.
+
+	if (p->flags.json && s && ((*s == 'e') || (*s == 'E')) && isdigit((unsigned char)s[1])) {
 		p->v.tag = TAG_FLOAT;
 		errno = 0;
 		pl_flt v = strtod(tmpptr, &tmpptr);
 
-		if ((int)v && (errno == ERANGE)) {
+		if (isinf(v) && (errno == ERANGE)) {
 			if (!p->do_read_term)
-				fprintf(stderr, "Error: syntax error, float op %g, %s:%d\n", v, get_loaded(p->m, p->m->filename), p->line_num);
+				fprintf(stderr, "Error: float overflow, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
-			p->error_desc = "float_overflow";
+			p->error_desc = neg ? "min_float" : "max_float";
+			p->error_type = "representation_error";
 			p->error = true;
 			return false;
 		}
@@ -2954,16 +4279,17 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 		return true;
 	}
 
-	if (s && (*s == '.') && isdigit(s[1])) {
+	if (s && (*s == '.') && isdigit((unsigned char)s[1])) {
 		p->v.tag = TAG_FLOAT;
 		errno = 0;
 		pl_flt v = strtod(tmpptr, &tmpptr);
 
-		if ((int)v && (errno == ERANGE)) {
+		if (isinf(v) && (errno == ERANGE)) {
 			if (!p->do_read_term)
-				fprintf(stderr, "Error: syntax error, float op %g, %s:%d\n", v, get_loaded(p->m, p->m->filename), p->line_num);
+				fprintf(stderr, "Error: float overflow, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
-			p->error_desc = "float_overflow";
+			p->error_desc = neg ? "min_float" : "max_float";
+			p->error_type = "representation_error";
 			p->error = true;
 			return false;
 		}
@@ -2992,7 +4318,7 @@ static bool parse_number(parser *p, const char **srcptr, bool neg)
 	int ch;
 	p->v.tag = TAG_INT;
 
-	if ((s[-1] == '.') || isspace(s[-1]))
+	if ((s[-1] == '.') || isspace((unsigned char)s[-1]))
 		s--;
 
 	*srcptr = s;
@@ -3020,6 +4346,62 @@ inline static bool is_matching_pair(int ch, int next_ch, int lh, int rh)
 	return (ch == lh) && (next_ch == rh);
 }
 
+// Same as getline(), but for a socket-backed parser waits in short,
+// alarm-aware poll() slices first - see tpl_wait_fd_readable() - and
+// then reads the line with tpl_getline_nb() rather than
+// tpl_getline_fp(): a socket fd is non-blocking now, and getc()'s EOF on
+// EAGAIN is indistinguishable there from a real end of file, so the
+// plain version silently returns a half-arrived line as though it were
+// whole. Everything past a term's first line is read here, so a term
+// whose closing ".\n" lands in a later packet than its body used to be
+// truncated into a syntax error - see the linda library's tests.
+
+static ssize_t getline_interruptible(parser *p)
+{
+	if (p->strm)
+		return tpl_getline(&p->save_line, &p->n_line, p->q, p->strm);
+
+	if (p->is_socket && p->q) {
+		if (!tpl_wait_fd_readable(p->q, fileno(p->fp))) {
+			errno = EINTR;
+			return -1;
+		}
+
+		return tpl_getline_nb(&p->save_line, &p->n_line, p->q, p->fp, NULL);
+	}
+
+	return tpl_getline_fp(&p->save_line, &p->n_line, p->fp);
+}
+
+// Only a byte of 0x80 or above can start an ill-formed sequence, so ASCII skips the decode.
+
+static inline bool not_a_character(const char *src)
+{
+	return ((unsigned char)*src >= 0x80) && (peek_char_utf8_strict(src) == UTF8_INVALID);
+}
+
+// Skip a line comment to its newline, or to an ill-formed byte for
+// get_token() to report as not a character (issue #1099).
+
+static const char *skip_line_comment(const char *src)
+{
+	while (*src && (*src != '\n')) {
+		if ((unsigned char)*src < 0x80) {
+			src++;
+			continue;
+		}
+
+		const char *next = src;
+
+		if (get_char_utf8_strict(&next) == UTF8_INVALID)
+			break;
+
+		src = next;
+	}
+
+	return src;
+}
+
 char *eat_space(parser *p)
 {
 	if (!*p->srcptr)
@@ -3031,7 +4413,7 @@ char *eat_space(parser *p)
 
 	do {
 		if (!src) {
-			if (p->no_fp || getline(&p->save_line, &p->n_line, p->fp) == -1) {
+			if (p->no_fp || getline_interruptible(p) == -1) {
 				if (!p->do_read_term)
 					fprintf(stderr, "Error: syntax error, parsing number, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -3044,6 +4426,13 @@ char *eat_space(parser *p)
 		}
 
 		done = true;
+
+		// The lax decoder reads past an ill-formed byte and can return the
+		// layout behind it, which would skip the byte as space (issue #1099).
+
+		if (not_a_character(src))
+			return (char*)src;
+
 		int ch = peek_char_utf8(src);
 
 		while (iswspace(ch)) {
@@ -3051,12 +4440,18 @@ char *eat_space(parser *p)
 				p->line_num++;
 
 			get_char_utf8(&src);
+
+			if (not_a_character(src))
+				return (char*)src;
+
 			ch = peek_char_utf8(src);
 		}
 
-		if ((*src == '%') && !p->fp) {
-			while (*src && (*src != '\n'))
-				src++;
+		if ((*src == '%') && !p->fp && !p->strm) {
+			src = skip_line_comment(src);
+
+			if (*src && (*src != '\n'))
+				return (char*)src;
 
 			if (*src == '\n')
 				p->line_num++;
@@ -3066,9 +4461,11 @@ char *eat_space(parser *p)
 			continue;
 		}
 
-		if ((!*src || (*src == '%')) && p->fp) {
-			while (*src && (*src != '\n'))
-				src++;
+		if ((!*src || (*src == '%')) && (p->fp || p->strm)) {
+			src = skip_line_comment(src);
+
+			if (*src && (*src != '\n'))
+				return (char*)src;
 
 			if (*src == '\n')
 				p->line_num++;
@@ -3079,8 +4476,16 @@ char *eat_space(parser *p)
 				continue;
 			}
 
-			if (p->no_fp || getline(&p->save_line, &p->n_line, p->fp) == -1)
+			if (p->no_fp || getline_interruptible(p) == -1) {
+				if (errno == EINTR) {
+					if (p->fp)
+						clearerr(p->fp);
+
+					p->error = true;
+				}
+
 				return p->srcptr = "";
+			}
 
 			p->did_getline = true;
 			src = p->srcptr = p->save_line;
@@ -3109,11 +4514,14 @@ char *eat_space(parser *p)
 			if (*src == '\n')
 				p->line_num++;
 
-			if (p->is_comment)
-				src++;
+			if (p->is_comment && not_a_character(src))
+				return (char*)src;	// for get_token() to report (issue #1099)
 
-			if ((!src || !*src) && p->is_comment && p->fp) {
-				if (p->no_fp || getline(&p->save_line, &p->n_line, p->fp) == -1) {
+			if (p->is_comment)
+				src += ((unsigned char)*src >= 0x80) ? len_char_utf8(src) : 1;
+
+			if ((!src || !*src) && p->is_comment && (p->fp || p->strm)) {
+				if (p->no_fp || getline_interruptible(p) == -1) {
 					if (!p->do_read_term)
 						fprintf(stderr, "Error: syntax error, parsing number, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -3139,16 +4547,16 @@ static bool check_space_before_function(parser *p, int ch, const char *src)
 		//src = eat_space(p);
 		bool nl = false;
 
-		while (iswblank(*src))
-			src++;
+		while (is_blank_utf8(peek_char_utf8(src)))
+			src += len_char_utf8(src);
 
 		while (*src == '\n') {
 			nl = true;
 			src++;
 		}
 
-		while (iswblank(*src))
-			src++;
+		while (is_blank_utf8(peek_char_utf8(src)))
+			src += len_char_utf8(src);
 
 		if ((!src || !*src) && !nl) {
 			if (!p->do_read_term)
@@ -3174,9 +4582,6 @@ static bool check_space_before_function(parser *p, int ch, const char *src)
 
 static bool contains_null(const char *src, size_t len)
 {
-	if (!*src)
-		return false;
-
 	for (size_t i = 0; i < len; i++) {
 		if (!*src++)
 			return true;
@@ -3213,10 +4618,43 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 		return false;
 	}
 
+	// Where a token would start there may be no character at all: an
+	// ill-formed UTF-8 sequence is not text, so there is nothing here
+	// for a syntax to be wrong about. It is reported as the same
+	// representation error a character-level read of it gives (ISO
+	// 13211-1 8.12.1.3 i), which is what lets read/1 meet a stream's
+	// 0xff sentinel and say so (issue #1099).
+
+	if (peek_char_utf8_strict(src) == UTF8_INVALID) {
+		if (!p->do_read_term)
+			fprintf(stderr, "Error: not a character, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+
+		p->error_desc = "character";
+		p->error_type = "representation_error";
+		p->error = true;
+		p->srcptr = (char*)src;
+		return false;
+	}
+
 	if (p->double_bar) {
 		p->double_bar = false;
 		p->is_op = true;
 		SB_strcpy(p->token, DOUBLE_BAR);
+		return true;
+	}
+
+	// A closing quote's lookahead for '||' (below) found a single '|'
+	// instead. It cannot just leave that '|' unconsumed in the source
+	// for this call to re-scan, because finding out took an eat_space()
+	// that may have crossed a line - and with it, getline()'d over the
+	// buffer the '|' lived in (issue #1134). So it is handed back as
+	// its own token here instead, the way a genuine '||' already is
+	// above, rather than by rewinding a pointer that may be stale.
+
+	if (p->pending_bar) {
+		p->pending_bar = false;
+		p->is_op = true;
+		SB_strcpy(p->token, "|");
 		return true;
 	}
 
@@ -3232,7 +4670,15 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 
 	if ((*src != '-') && parse_number(p, &src, neg)) {
 		if (neg) p->cl->cidx--;
-		SB_strcatn(p->token, tmpptr, src-tmpptr);
+
+		if (p->q && !SB_try_strcatn(p->token, tmpptr, src-tmpptr)) {
+			SB_free(p->token);
+			(void)throw_error(p->q, p->q->st.instr, p->q->st.cur_ctx,
+				"resource_error", "memory");
+			return false;
+		} else if (!p->q)
+			SB_strcatn(p->token, tmpptr, src-tmpptr);
+
 		p->srcptr = (char*)src;
 		int ch = peek_char_utf8(src);
 
@@ -3258,6 +4704,18 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 
 	// Quoted...
 
+	// A back quoted string is no term in ISO, so strict ISO refuses it
+
+	if ((*src == '`') && p->flags.strict_iso) {
+		if (!p->do_read_term)
+			fprintf(stderr, "Error: syntax error, back quoted string, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+
+		p->error_desc = "back_quoted_string";
+		p->error = true;
+		p->srcptr = (char*)src + 1;
+		return false;
+	}
+
 	if ((*src == '"') || (*src == '`') || (*src == '\'')) {
 		p->quote_char = *src++;
 		p->is_quoted = true;
@@ -3269,7 +4727,23 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 		for (;;) {
 			int ch = 0;
 
-			for (; *src && (ch = get_char_utf8(&src));) {
+			for (; *src;) {
+				// Quoted or not, an ill-formed byte is no character (issue #1099).
+
+				if (not_a_character(src)) {
+					if (!p->do_read_term)
+						fprintf(stderr, "Error: not a character, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+
+					p->error_desc = "character";
+					p->error_type = "representation_error";
+					p->error = true;
+					p->srcptr = (char*)src;
+					return false;
+				}
+
+				if (!(ch = get_char_utf8(&src)))
+					break;
+
 				if (ch == '\n') {
 					if (!p->do_read_term)
 						fprintf(stderr, "Error: syntax error, unterminated quoted atom, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
@@ -3293,8 +4767,6 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 
 					// Check for double bar
 
-					bool multi_bar = false;
-					const char *save_src = src;
 					p->srcptr = (char*)src;
 					src = eat_space(p);
 
@@ -3308,7 +4780,16 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 					src = eat_space(p);
 
 					if (*src != '|') {
-						src = (char*)save_src;
+						// Only a single '|', not '||': it belongs to
+						// whatever follows the string, not to it. Both
+						// eat_space() calls above may have crossed a
+						// line and getline()'d a new one into the same
+						// buffer, so the position before them can no
+						// longer be trusted as a rewind target (issue
+						// #1134) - hand the '|' back as its own token
+						// on the next call instead (see p->pending_bar
+						// at the top of this function).
+						p->pending_bar = true;
 						p->quote_char = 0;
 						break;
 					}
@@ -3371,8 +4852,8 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 				SB_putchar(p->token, ch);
 			}
 
-			if (p->quote_char && p->fp) {
-				if (p->no_fp || getline(&p->save_line, &p->n_line, p->fp) == -1) {
+			if (p->quote_char && (p->fp || p->strm)) {
+				if (p->no_fp || getline_interruptible(p) == -1) {
 					p->srcptr = "";
 
 					if (!p->do_read_term)
@@ -3545,6 +5026,12 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 		if (ch_next == '%')
 			break;
 
+		// An ill-formed byte is no character, so it cannot extend a
+		// symbol token: leave it for the checks that report it (#1099).
+
+		if (peek_char_utf8_strict(src) == UTF8_INVALID)
+			break;
+
 		if (p->flags.json && (ch_next == '-'))
 			break;
 
@@ -3565,8 +5052,8 @@ bool get_token(parser *p, bool last_op, bool was_postfix)
 		return false;
 
 	if (*src) {
-		while (iswspace(*src))
-			src++;
+		while (is_space_utf8(peek_char_utf8(src)))
+			src += len_char_utf8(src);
 	}
 
 	ch = peek_char_utf8(src);
@@ -3591,8 +5078,14 @@ static bool process_term(parser *p, cell *p1)
 	if (p->m->ifs_blocked[p->m->if_depth])
 		return true;
 
-	// Note: we actually assert directives after processing
-	// so that they can be examined.
+	if (quads(p, p1))
+		return true;
+
+	// A directive that the loader has fully handled needs no clause in
+	// the database. The exception is initialization/1, which returns
+	// false here so that it is stored as '$directive'(initialization(G))
+	// for the end-of-load runner to retract and call; plain clauses
+	// return false too, and are stored as themselves.
 
 	directives(p, p1);
 
@@ -3630,7 +5123,7 @@ static bool process_term(parser *p, cell *p1)
 		h->tag = TAG_INTERNED;
 		h->val_off = off;
 		h->flags = 0;
-		h->arity = 0;
+		set_arity(h, 0);
 	}
 
 	rule *r;
@@ -3653,11 +5146,11 @@ static bool process_term(parser *p, cell *p1)
 
 bool expand_term(parser *p, cell *c)
 {
-	LIST_HANDLER(c);
+	PROLOG_LIST_HANDLER(c);
 	bool tail = false;
 
 	while (is_iso_list(c)) {
-		cell *h = LIST_HEAD(c);
+		cell *h = PROLOG_LIST_HEAD(c);
 		parser *p2 = parser_create(p->m);
 		check_error(p2);
 		TPL_free(p2->cl);
@@ -3677,6 +5170,32 @@ bool expand_term(parser *p, cell *c)
 		} else {
 			cell *c2 = p2->cl->cells;
 
+			// A --> among the terms the hook returned, which never
+			// met tokenize()'s translation branch (issue #1142).
+			// dcg_expand_clause() emits fresh vars named but unnumbered
+			// and zeroes num_vars, so the assign_vars() after it is not
+			// optional (see new_var() in bif_dcgs.c); the other two
+			// finish a clause built here rather than tokenized.
+
+			if (is_interned(c2) && (c2->val_off == g_dcg_s)
+				&& (get_arity(c2) == 2)) {
+				if (!dcg_expand_clause(p2)) {
+					parser_destroy(p2);
+					return false;
+				}
+
+				assign_vars(p2, 0, false);
+
+				if (p2->error) {
+					parser_destroy(p2);
+					return false;
+				}
+
+				process_clause(p2->m, p2->cl);
+				term_to_body(p2);
+				c2 = p2->cl->cells;
+			}
+
 			if (!process_term(p2, c2)) {
 				parser_destroy(p2);
 				return false;
@@ -3689,7 +5208,7 @@ bool expand_term(parser *p, cell *c)
 		}
 
 		parser_destroy(p2);
-		c = LIST_TAIL(c);
+		c = PROLOG_LIST_TAIL(c);
 
 		if (is_nil(c) || is_var(c))
 			tail = true;
@@ -3708,11 +5227,19 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 	pl_idx arg_idx = p->cl->cidx, save_idx = 0;
 	bool last_op = true, is_func = false, last_num = false;
 	bool last_bar = false, last_prefix = false, last_postfix = false;
+	bool prev_operator = false, this_operator = false;
 	int entered = p->entered;
 	unsigned arity = 1;
 	p->depth++;
 
 	while (get_token(p, last_op, last_postfix)) {
+		prev_operator = this_operator;
+		this_operator = false;
+
+		// Functional notation needs the ( straight after the name, so look before any layout or comment is skipped
+
+		const bool paren_next = p->srcptr && (*p->srcptr == '(');
+
 		if (p->error && !p->do_read_term)
 			break;
 
@@ -3729,17 +5256,32 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			SB_cstr(p->token), ch, p->line_num, p->is_symbol, p->quote_char, p->v.tag, p->is_op, last_op, p->is_string);
 #endif
 
-		if (!p->quote_char
+		if (!p->quote_char && !p->is_quoted	// a quoted '.' is never the end token, operator or not
 			&& !SB_strcmp(p->token, ".")
 			&& (*p->srcptr != ',')
 			&& (*p->srcptr != '(')
 			&& (*p->srcptr != ')')
 			&& (*p->srcptr != ']')
 			&& (*p->srcptr != '}')
-			&& !iswalnum(*p->srcptr)
+			&& !isalnum((unsigned char)*p->srcptr)
 			&& (*p->srcptr != '_')
-			&& ((*p->srcptr != ' ') || !p->is_op)
 			) {
+
+			// The character after the end token has to be looked at to
+			// confirm it (6.4.8), and there may be no character there
+			// at all: an ill-formed byte is the representation error a
+			// character-level read of it gives, not a syntax error
+			// (issue #1099).
+
+			if (peek_char_utf8_strict(p->srcptr) == UTF8_INVALID) {
+				if (!p->do_read_term)
+					fprintf(stderr, "Error: not a character, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+
+				p->error_desc = "character";
+				p->error_type = "representation_error";
+				p->error = true;
+				return 0;
+			}
 
 			if (p->nesting_parens || p->nesting_brackets || p->nesting_braces) {
 				if (!p->do_read_term)
@@ -3769,6 +5311,50 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 					return 0;
 				}
 
+				// DCG translation happens HERE, ahead of assign_vars(),
+				// so the translated clause goes through the ENTIRE
+				// pipeline exactly as a hand-written one would.
+				//
+				// This is not a free choice. goal_expansion() prints a
+				// goal and re-parses it, carrying variable identity
+				// across that boundary by NAME through the inherited
+				// vartab (p2->vartab = p->vartab, reuse = true). Fresh
+				// variables invented after assign_vars() have no vartab
+				// entry, so that re-parse hands them new slots and the
+				// S0/S threading is silently lost. Letting assign_vars()
+				// see them is what registers the names.
+
+				if ((p->is_consulting || p->expand_dcg) && !p->skip && !p->internal
+					&& is_interned(p->cl->cells)
+					&& (p->cl->cells->val_off == g_dcg_s)
+					&& (get_arity(p->cl->cells) == 2)) {
+					// expand_dcg is the re-parse of a term_expansion/2
+					// result (issue #1142). A --> the hook emitted has
+					// already sailed past this branch as whatever the
+					// hook was given, so it is translated on the way
+					// back in - still ahead of assign_vars(), the order
+					// dcg_expand_clause() requires. We used to assert
+					// it raw as a fact for '-->'/2.
+					//
+					// Still true, and the reason the hook cannot simply
+					// move ahead of translation: term_expansion()
+					// produces a fully processed clause via its own
+					// print-and-reparse, so it cannot move ahead of
+					// assign_vars(), and translation cannot move after
+					// it without losing the variable registration that
+					// goal_expansion depends on (see §10 of
+					// docs/native-dcg-design.md). So a --> term written
+					// in the source still never reaches the hook.
+					//
+					// Note also that tabled DCG rules work *because*
+					// the rename in library/tabling.pl's
+					// user:term_expansion runs after translation.
+
+					dcg_expand_clause(p);
+
+					if (p->error) return 0;
+				}
+
 				assign_vars(p, p->read_term_slots, false);
 
 				if (p->error) return 0;
@@ -3782,7 +5368,8 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 					return 0;
 				}
 
-				process_clause(p->m, p->cl, NULL);
+
+				process_clause(p->m, p->cl);
 
 				if (!p->one_shot /*|| p->is_command*/)
 					term_to_body(p);
@@ -3791,7 +5378,7 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 					term_expansion(p);
 					cell *p1 = p->cl->cells;
 
-					if (!p1->arity && !strcmp(C_STR(p, p1), "begin_of_file")) {
+					if (!get_arity(p1) && !strcmp(C_STR(p, p1), "begin_of_file")) {
 						p->end_of_term = true;
 						last_op = true;
 						last_num = false;
@@ -3799,9 +5386,14 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 						continue;
 					}
 
-					if (!p1->arity && !strcmp(C_STR(p, p1), "end_of_file")) {
+					if (!get_arity(p1) && !strcmp(C_STR(p, p1), "end_of_file")) {
 						p->end_of_term = true;
 						p->end_of_file = true;
+
+						if (p->m->quad_query && !p->m->quad_recorded)
+							fprintf(stderr, "Warning: quad query without answer description, %s:%d\n", get_loaded(p->m, p->m->filename), p->m->quad_line_num);
+
+						quad_reset(p->m);
 						process_module(p->m);
 						return 0;
 					}
@@ -3860,7 +5452,11 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 		if (!p->quote_char && !SB_strcmp(p->token, "[")) {
 			save_idx = p->cl->cidx;
 			cell *c = make_interned(p, g_dot_s);
-			c->arity = 2;
+
+			if (!c)
+				break;
+
+			set_arity(c, 2);
 			p->start_term = true;
 			p->nesting_brackets++;
 			bool was_consing = p->was_consing;
@@ -3881,6 +5477,23 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			c = p->cl->cells + save_idx;
 			c->num_cells = p->cl->cidx - save_idx;
 			fix_list(c);
+
+			// Each element has to reduce to one term, or what is left over is taken for the tail
+
+			const cell *tail = c;
+
+			while (is_iso_list(tail))
+				tail = tail + 1 + (tail + 1)->num_cells;
+
+			if ((tail + tail->num_cells) != (p->cl->cells + p->cl->cidx)) {
+				if (!p->do_read_term)
+					fprintf(stderr, "Error: syntax error, operator expected, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
+
+				p->error_desc = "operator_expected";
+				p->error = true;
+				break;
+			}
+
 			last_num = false;
 			continue;
 		}
@@ -3888,8 +5501,11 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 		if (!p->quote_char && !SB_strcmp(p->token, "{")) {
 			save_idx = p->cl->cidx;
 			cell *c = make_interned(p, g_braces_s);
-			ENSURE(c);
-			c->arity = 1;
+
+			if (!c)
+				break;
+
+			set_arity(c, 1);
 			p->start_term = true;
 			p->nesting_braces++;
 			p->entered = '{';
@@ -3918,8 +5534,54 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 				break;
 
 			if (is_func) {
+				// f() is how both SWI and XSB spell a zero-argument
+				// call, and the Janus interface is written in it
+				// throughout. ISO has no such term and Trealla has no
+				// way to represent one - functor(X, f, 0) is the atom f
+				// - so under the empty_args flag it reads as '()'(f):
+				// an ordinary compound, distinct from the atom, that
+				// every other part of the system already understands.
+				// The functor is not a possible identifier, so nothing
+				// can collide with it.
+
+				if ((tmp_arity == 1) && p->flags.empty_args && p->last_empty_arglist) {
+					cell *arg = make_a_cell(p);
+
+					if (!arg)
+						break;
+
+					cell *c = p->cl->cells + save_idx;	// may have moved
+					*arg = *c;
+					arg->num_cells = 1;
+					arg->priority = 0;
+					SET_OP(arg, 0);
+					set_arity(arg, 0);
+					c->tag = TAG_INTERNED;
+					c->flags = 0;
+					c->priority = 0;
+					SET_OP(c, 0);
+					c->val_off = new_atom(p->pl, "()");
+					tmp_arity = 1;
+				}
+
 				cell *c = p->cl->cells + save_idx;
-				c->arity = tmp_arity;
+
+				if (is_cstring(c)) {
+					pl_idx off = new_atom(p->pl, C_STR(p, c));
+
+					if (off == ERR_IDX) {
+						p->error = true;
+						break;
+					}
+
+					unshare_cell(c);
+					c->tag = TAG_INTERNED;
+					c->flags = 0;
+					c->match = NULL;
+					c->val_off = off;
+				}
+
+				set_arity(c, tmp_arity);
 				c->num_cells = p->cl->cidx - save_idx;
 			}
 
@@ -3983,7 +5645,11 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			}
 
 			cell *c = make_interned(p, g_dot_s);
-			c->arity = 2;
+
+			if (!c)
+				break;
+
+			set_arity(c, 2);
 			p->start_term = last_op = true;
 			last_num = false;
 			p->last_close = false;
@@ -4004,7 +5670,9 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 				break;
 			}
 
-			analyze(p, arg_idx, last_op);
+			if (!(is_consing ? analyze(p, arg_idx, last_op) : analyze_one(p, arg_idx, last_op)))
+				break;
+
 			arg_idx = p->cl->cidx;
 
 			if (*p->srcptr == ',') {
@@ -4016,18 +5684,8 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 				break;
 			}
 
-			if (is_arg_processing) {
+			if (is_arg_processing)
 				arity++;
-
-				if (arity > MAX_ARITY) {
-					if (!p->do_read_term)
-						fprintf(stderr, "Error: max arity reached, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
-
-					p->error_desc = "max_arity";
-					p->error = true;
-					break;
-				}
-			}
 
 			if (is_consing && !SB_strcmp(p->token, "|")) {
 				p->was_consing = last_bar = true;
@@ -4067,7 +5725,14 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			break;
 		}
 
-		if (!p->quote_char && p->start_term &&
+		// f() under the empty_args flag: an empty argument list is
+		// allowed for a functor, and only for a functor. Bare () stays a
+		// syntax error, as do [] spelled this way and {}.
+
+		bool empty_arglist = is_arg_processing && p->flags.empty_args
+			&& !p->quote_char && !SB_strcmp(p->token, ")");
+
+		if (!p->quote_char && p->start_term && !empty_arglist &&
 			(!SB_strcmp(p->token, "]") || !SB_strcmp(p->token, ")") || !SB_strcmp(p->token, "}"))) {
 			if (!p->do_read_term)
 				fprintf(stderr, "Error: syntax error, start of rule expected, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
@@ -4078,7 +5743,7 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 		}
 
 		if (!p->quote_char && !SB_strcmp(p->token, ")")) {
-			if (arg_idx == p->cl->cidx) {
+			if ((arg_idx == p->cl->cidx) && !empty_arglist) {
 				if (!p->do_read_term)
 					fprintf(stderr, "Error: syntax error, missing arg '%s', %s:%d\n", p->save_line?p->save_line:"", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -4097,8 +5762,9 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			}
 
 			p->last_close = true;
+			p->last_empty_arglist = (arg_idx == p->cl->cidx);
 			p->nesting_parens--;
-			analyze(p, arg_idx, last_op=false);
+			analyze_one(p, arg_idx, last_op=false);
 			return arity;
 		}
 
@@ -4148,13 +5814,13 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 
 			p->last_close = true;
 			p->nesting_braces--;
-			analyze(p, arg_idx, last_op=false);
+			analyze_one(p, arg_idx, last_op=false);
 			return arity;
 		}
 
 		p->last_close = false;
 
-		if (p->is_var && (*p->srcptr == '(')) {
+		if (p->is_var && paren_next) {
 			if (!p->do_read_term)
 				fprintf(stderr, "Error: syntax error, var as functor, %s:%d\n", get_loaded(p->m, p->m->filename), p->line_num);
 
@@ -4192,7 +5858,20 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			}
 #endif
 
-			priority = search_op(p->m, SB_cstr(p->token), &specifier, last_op);
+			// A postfix operator completes an operand, so what follows it is read as infix where it can be
+
+			priority = search_op(p->m, SB_cstr(p->token), &specifier, last_op && !last_postfix);
+		}
+
+		const int op_priority = priority;
+
+		// A - before a numeral negates it, whether or not - is a prefix operator
+
+		bool neg_numeral = false;
+
+		if (p->last_neg && !p->is_string && !SB_strcmp(p->token, "-")) {
+			char *s = eat_space(p);
+			neg_numeral = s && isdigit((unsigned char)*s);
 		}
 
 		if (!SB_strcmp(p->token, "!") &&
@@ -4247,14 +5926,30 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 
 		// Operators in canonical form..
 
-		if (last_op && priority && (*p->srcptr == '(')) {
+		if (last_op && priority && paren_next) {
 			p->v.tag = TAG_INTERNED;
 			specifier = 0;
 			priority = 0;
 			p->quote_char = 0;
 		}
 
-		is_func = last_op && is_interned(&p->v) && !specifier && !last_num && (*p->srcptr == '(');
+		is_func = last_op && is_interned(&p->v) && !specifier && !last_num && paren_next;
+
+		// Under strict_iso an operator taken as an atom, quoted or not, must stand alone, as an argument or between brackets
+
+		if (p->flags.strict_iso && op_priority && !priority && !is_func && !p->is_string && !neg_numeral) {
+			char *s = eat_space(p);
+			int nextch = s ? *s : 0;
+
+			if (prev_operator || ((nextch != ',') && (nextch != ')') && (nextch != ']') && (nextch != '|') && (nextch != '}'))) {
+				if (!p->do_read_term)
+					fprintf(stderr, "Error: syntax error, parens needed around operator '%s', %s:%d\n", SB_cstr(p->token), get_loaded(p->m, p->m->filename), p->line_num);
+
+				p->error_desc = "parens_needed";
+				p->error = true;
+				break;
+			}
+		}
 
 		if (!is_func && last_op && (is_arg_processing && priority >= 1200) && !p->is_quoted) {
 			if (!p->do_read_term)
@@ -4307,12 +6002,17 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			break;
 		}
 
-		last_op = SB_strcmp(p->token, ")") && priority;
+		last_op = (SB_strcmp(p->token, ")") && priority) || neg_numeral;
 		last_postfix = IS_POSTFIX(specifier);
 		last_prefix = last_op && IS_PREFIX(specifier);
+		this_operator = priority;
 
 		p->start_term = false;
 		cell *c = make_a_cell(p);
+
+		if (!c)
+			break;
+
 		c->num_cells = 1;
 		c->tag = p->v.tag;
 		c->flags = p->v.flags;
@@ -4331,7 +6031,8 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 			feclearexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW);
 #endif
 		} else if (!p->is_string
-			&& (!p->is_quoted || is_func || p->is_op || p->is_var || p->is_consulting
+			&& (!p->is_quoted || is_func || p->is_op || p->is_var
+			|| (p->is_consulting && !contains_null(SB_cstr(p->token), SB_strlen(p->token))) // interning stops at a NUL
 			|| (get_builtin(p->pl, SB_cstr(p->token), SB_strlen(p->token), 0, &found, NULL), found)
 			|| !SB_strcmp(p->token, "[]"))
 			) {
@@ -4364,7 +6065,7 @@ unsigned tokenize(parser *p, bool is_arg_processing, bool is_consing)
 
 				if (p->is_string) {
 					c->flags |= FLAG_CSTR_STRING;
-					c->arity = 2;
+					set_arity(c, 2);
 				}
 
 				if (!p->is_number_chars)
@@ -4434,10 +6135,27 @@ bool run(parser *p, const char *prolog_src, bool dump, query **subq, unsigned in
 		}
 
 		query *q = query_create(p->m);
-		CHECKED(q, p->srcptr = NULL, SB_free(pr));
 
-		if (subq)
+		// Spelt out rather than CHECKED(): that macro keeps only its
+		// first vararg as the error action and drops the return, so the
+		// extra cleanup here would fall through to a null q.
+
+		if (!q) {
+			p->srcptr = NULL;
+			SB_free(pr);
+			return false;
+		}
+
+
+		// A returned query outlives this call, and its goal's cells -
+		// a string literal among them - live in this parser's clause.
+		// So the parser goes with the query rather than being destroyed
+		// underneath it.
+
+		if (subq) {
 			*subq = q;
+			q->owns_top = true;
+		}
 
 		if (yield_time_in_ms > 0)
 			do_yield_at(q, yield_time_in_ms);
@@ -4456,7 +6174,10 @@ bool run(parser *p, const char *prolog_src, bool dump, query **subq, unsigned in
 		p->pl->error = q->error;
 		p->pl->is_redo = q->is_redo;
 		ok = !q->error;
-		p->m = q->st.m;
+
+		// p->m is not taken from q->st.m: a goal ending in another module
+		// (any library predicate does) would move the toplevel there, so
+		// later consults and asserts would land in it (issue #1079).
 
 		if (!subq)
 			query_destroy(q);
@@ -4468,8 +6189,12 @@ bool run(parser *p, const char *prolog_src, bool dump, query **subq, unsigned in
 			break;
 	}
 
+	// No fflush() here: streams[0] is stdin, and flushing an input stream
+	// is undefined. glibc and the BSDs ignore it, but musl, MSVCRT and
+	// Solaris libc discard the buffered input - which is the rest of a
+	// piped query stream, so only the first query ever ran there.
+
 	stream *str = &p->pl->streams[0];
-	fflush(str->fp);
 	TPL_free(str->data);
 	str->data = NULL;
 	str->data_len = 0;

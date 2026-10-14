@@ -2,6 +2,8 @@
 
 #include "query.h"
 
+static const size_t INITIAL_VAR_TABLE_SIZE = 256;
+
 typedef struct { lnode hdr; cell *c; pl_ctx c_ctx; slot *e; uint32_t save_vgen; } snode;
 
 static bool accum_var(query *q, const cell *c, pl_ctx c_ctx)
@@ -19,7 +21,7 @@ static bool accum_var(query *q, const cell *c, pl_ctx c_ctx)
 	sl_app(q->vars, e, (void*)(size_t)q->tab_idx);
 
 	if (!q->tabs) {
-		q->tabs_size = MAX_ARITY;
+		q->tabs_size = INITIAL_VAR_TABLE_SIZE;
 		q->tabs = TPL_malloc(sizeof(var_item)*q->tabs_size);
 
 		if (!q->tabs)
@@ -43,53 +45,15 @@ static bool accum_var(query *q, const cell *c, pl_ctx c_ctx)
 	return false;
 }
 
-static void collect_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth);
-
-static void collect_vars_lists(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
-{
-	cell *l = p1;
-	pl_ctx l_ctx = p1_ctx;
-	bool any1 = false, any2 = false;
-
-	while (is_iso_list(l)) {
-		cell *h = l + 1;
-		pl_ctx h_ctx = l_ctx;
-		slot *e = NULL;
-		uint32_t save_vgen;
-		int both = 0;
-
-		DEREF_VAR(any1, both, save_vgen, e, e->vgen, h, h_ctx, q->vgen);
-
-		if (!both && is_var(h) && !(h->flags & FLAG_VAR_CYCLIC))
-			accum_var(q, h, h_ctx);
-		else if (!both)
-			collect_vars_internal(q, h, h_ctx, depth+1);
-
-		if (e) e->vgen = save_vgen;
-		l = l + 1; l += l->num_cells;
-		e = NULL;
-		both = 0;
-
-		DEREF_VAR(any2, both, save_vgen, e, e->vgen, l, l_ctx, q->vgen);
-
-		if (both)
-			return;
-	}
-
-	if (any2) {
-		l = p1;
-		l_ctx = p1_ctx;
-
-		while (is_iso_list(l)) {
-			l = l + 1; l += l->num_cells;
-			cell *c = l;
-			pl_ctx c_ctx = l_ctx;
-			RESTORE_VAR(c, c_ctx, l, l_ctx, q->vgen);
-		}
-	}
-
-	collect_vars_internal(q, l, l_ctx, depth+1);
-}
+typedef struct {
+	lnode hdr;
+	cell *p1;
+	pl_ctx p1_ctx;
+	uint32_t arity;
+	unsigned depth;
+	slot *e;
+	uint32_t save_vgen;
+} vnode;
 
 static void collect_vars_internal(query *q, cell *p1, pl_idx p1_ctx, unsigned depth)
 {
@@ -101,92 +65,121 @@ static void collect_vars_internal(query *q, cell *p1, pl_idx p1_ctx, unsigned de
 	if (!is_compound(p1) || is_ground(p1))
 		return;
 
-	if (is_iso_list(p1)) {
-		collect_vars_lists(q, p1, p1_ctx, depth+1);
-		return;
-	}
+	// Transform recursion into stack iteration (as in has_vars_internal):
+	//
+	// Unlike has_vars_internal() we must preserve the order in which
+	// variables are encountered, so we cannot use a plain FIFO/LIFO of
+	// pending nodes: a variable that is a direct argument would then be
+	// accumulated before the variables inside an earlier sibling that was
+	// only queued. Instead each frame walks one compound's arguments
+	// left-to-right and we descend into a child compound immediately, which
+	// reproduces the pre-order, depth-first, left-to-right walk of the
+	// recursion exactly. The (e, save_vgen) pair belongs to the parent
+	// arg-slot that caused us to descend and is restored once this subtree
+	// is fully collected - i.e. at the point the recursive call would have
+	// returned.
 
-	bool any = false;
-	int arity = p1->arity;
-	p1++;
+	list stack = {0};
+	vnode *n = TPL_malloc(sizeof(vnode));
+	if (!n) return;
+	n->arity = get_arity(p1);
+	n->p1 = p1 + 1;
+	n->p1_ctx = p1_ctx;
+	n->depth = depth;
+	n->e = NULL;
+	n->save_vgen = 0;
+	list_push_back(&stack, n);
 
-	while (arity--) {
-		cell *c = p1;
-		pl_idx c_ctx = p1_ctx;
+	while ((n = (vnode*)list_back(&stack)) != NULL) {
+		if (!n->arity) {
+			// This node's arguments are all done - the point at which the
+			// recursive call would have returned. Restore the parent
+			// arg-slot's vgen mark now that its subtree is complete.
+			slot *pending_e = n->e;
+			uint32_t pending_vgen = n->save_vgen;
+
+			list_pop_back(&stack);
+			TPL_free(n);
+
+			if (pending_e)
+				set_vgen(q, pending_e, pending_vgen);
+
+			continue;
+		}
+
+		n->arity--;
+		cell *c = n->p1;
+		pl_ctx c_ctx = n->p1_ctx;
 		slot *e = NULL;
 		uint32_t save_vgen = 0;
+		bool any = false;
 		int both = 0;
 
-		DEREF_VAR(any, both, save_vgen, e, e->vgen, c, c_ctx, q->vgen);
+		DEREF_VAR(any, both, save_vgen, e, c, c_ctx, q->vgen);
+		n->p1 += n->p1->num_cells;
 
-		if (!both && is_var(c) && !(c->flags & FLAG_VAR_CYCLIC))
+		if (both) {
+			if (e) set_vgen(q, e, save_vgen);
+			continue;
+		}
+
+		if (is_var(c) && !(c->flags & FLAG_VAR_CYCLIC)) {
 			accum_var(q, c, c_ctx);
-		else if (!both)
-			collect_vars_internal(q, c, c_ctx, depth+1);
+			if (e) set_vgen(q, e, save_vgen);
+		} else if (is_compound(c) && !is_ground(c)) {
+			// Descend iteratively instead of recursing; defer the vgen
+			// restore until this child's whole subtree is finished.
+			vnode *cn = TPL_malloc(sizeof(vnode));
 
-		if (e) e->vgen = save_vgen;
-		p1 += p1->num_cells;
+			if (!cn) {
+				while ((n = (vnode*)list_pop_back(&stack)) != NULL)
+					TPL_free(n);
+
+				return;
+			}
+
+			cn->arity = get_arity(c);
+			cn->p1 = c + 1;
+			cn->p1_ctx = c_ctx;
+			cn->depth = n->depth + 1;
+			cn->e = e;
+			cn->save_vgen = save_vgen;
+			list_push_back(&stack, cn);
+		} else {
+			// atom, number, ground compound or cyclic var: nothing to collect
+			if (e) set_vgen(q, e, save_vgen);
+		}
 	}
 }
 
-void collect_vars(query *q, cell *p1, pl_ctx p1_ctx)
+// Several terms can share one table: a term's new variables start at the tab_idx before its collect_vars_add().
+
+void collect_vars_begin(query *q)
 {
-	if (++q->vgen == 0) q->vgen = 1;
 	q->tab_idx = 0;
 	TPL_free(q->tabs);
 	q->tabs = NULL;
-	q->tabs_size = MAX_ARITY;
+	q->tabs_size = INITIAL_VAR_TABLE_SIZE;
 	ENSURE(q->vars = sl_create(NULL, NULL, NULL));
+}
+
+void collect_vars_add(query *q, cell *p1, pl_ctx p1_ctx)
+{
+	if (++q->vgen == 0) q->vgen = 1;
 	collect_vars_internal(q, p1, p1_ctx, 0);
+}
+
+void collect_vars_end(query *q)
+{
 	sl_destroy(q->vars);
 	q->vars = NULL;
 }
 
-static bool has_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth);
-
-static bool has_vars_lists(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
+void collect_vars(query *q, cell *p1, pl_ctx p1_ctx)
 {
-	cell *l = p1;
-	pl_ctx l_ctx = p1_ctx;
-	bool any1 = false, any2 = false;
-
-	while (is_iso_list(l)) {
-		cell *h = l + 1;
-		pl_ctx h_ctx = l_ctx;
-		slot *e = NULL;
-		uint32_t save_vgen;
-		int both = 0;
-
-		DEREF_VAR(any1, both, save_vgen, e, e->vgen, h, h_ctx, q->vgen);
-
-		if (!both)
-			if (has_vars_internal(q, h, h_ctx, depth+1))
-				return true;
-
-		if (e) e->vgen = save_vgen;
-		l = l + 1; l += l->num_cells;
-		e = NULL;
-		both = 0;
-
-		DEREF_VAR(any2, both, save_vgen, e, e->vgen, l, l_ctx, q->vgen);
-
-		if (both)
-			return false;
-	}
-
-	if (any2) {
-		l = p1;
-		l_ctx = p1_ctx;
-
-		while (is_iso_list(l)) {
-			l = l + 1; l += l->num_cells;
-			cell *c = l;
-			pl_ctx c_ctx = l_ctx;
-			RESTORE_VAR(c, c_ctx, l, l_ctx, q->vgen);
-		}
-	}
-
-	return has_vars_internal(q, l, l_ctx, depth+1);
+	collect_vars_begin(q);
+	collect_vars_add(q, p1, p1_ctx);
+	collect_vars_end(q);
 }
 
 static bool has_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
@@ -196,9 +189,6 @@ static bool has_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
 
 	if (!is_compound(p1) || is_ground(p1))
 		return false;
-
-	if (is_iso_list(p1))
-		return has_vars_lists(q, p1, p1_ctx, depth+1);
 
 	// Transform recursion into stack iteration...
 
@@ -213,7 +203,7 @@ static bool has_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
 		pl_ctx p1_ctx = n->c_ctx;
 		TPL_free(n);
 
-		if (!is_compound(p1) || is_iso_list(p1)) {
+		if (!is_compound(p1)) {
 			if (has_vars_internal(q, p1, p1_ctx, depth+1)) {
 				while ((n = (snode*)list_pop_front(&stack)) != NULL)
 					TPL_free(n);
@@ -225,7 +215,7 @@ static bool has_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
 		}
 
 		bool any = false;
-		int arity = p1->arity;
+		uint32_t arity = get_arity(p1);
 		p1++;
 
 		while (arity--) {
@@ -235,7 +225,7 @@ static bool has_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
 			uint32_t save_vgen = 0;
 			int both = 0;
 
-			DEREF_VAR(any, both, save_vgen, e, e->vgen, c, c_ctx, q->vgen);
+			DEREF_VAR(any, both, save_vgen, e, c, c_ctx, q->vgen);
 
 			if (is_var(c)) {
 				while ((n = (snode*)list_pop_front(&stack)) != NULL)
@@ -250,7 +240,7 @@ static bool has_vars_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
 				n->c_ctx = c_ctx;
 				list_push_back(&stack, n);
 			} else if (e)
-				e->vgen = save_vgen;
+				set_vgen(q, e, save_vgen);
 
 			p1 += p1->num_cells;
 		}
@@ -265,55 +255,23 @@ bool has_vars(query *q, cell *p1, pl_ctx p1_ctx)
 	return has_vars_internal(q, p1, p1_ctx, 0);
 }
 
-static bool is_cyclic_term_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth);
-
-static bool is_cyclic_term_lists(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
+static void cyclic_stack_abort(query *q, list *stack)
 {
-	cell *l = p1;
-	pl_ctx l_ctx = p1_ctx;
-	bool any1 = false, any2 = false;
+	vnode *n;
 
-	while (is_iso_list(l)) {
-		cell *h = l + 1;
-		pl_ctx h_ctx = l_ctx;
-		slot *e = NULL;
-		uint32_t save_vgen;
-		int both = 0;
+	while ((n = (vnode*)list_pop_back(stack)) != NULL) {
+		if (n->e)
+			set_vgen(q, n->e, n->save_vgen);
 
-		DEREF_VAR(any1, both, save_vgen, e, e->vgen, h, h_ctx, q->vgen);
-
-		if (both)
-			return true;
-
-		if (is_cyclic_term_internal(q, h, h_ctx, depth+1))
-			return true;
-
-		if (e) e->vgen = save_vgen;
-		l = l + 1; l += l->num_cells;
-		e = NULL;
-		both = 0;
-
-		DEREF_VAR(any2, both, save_vgen, e, e->vgen, l, l_ctx, q->vgen);
-
-		if (both)
-			return true;
+		TPL_free(n);
 	}
-
-	if (any2) {
-		l = p1;
-		l_ctx = p1_ctx;
-
-		while (is_iso_list(l)) {
-			l = l + 1; l += l->num_cells;
-			cell *c = l;
-			pl_ctx c_ctx = l_ctx;
-			RESTORE_VAR(c, c_ctx, l, l_ctx, q->vgen);
-		}
-	}
-
-	return is_cyclic_term_internal(q, l, l_ctx, depth+1);
 }
 
+// Stack iteration as in collect_vars_internal(): each frame walks one
+// compound's arguments left-to-right; vgen restore for the slot that led
+// here is deferred until the frame pops (recursive-return point). That
+// keeps ancestor marks live for cycle detection and removes the need for
+// a post-pass RESTORE_VAR over list spines.
 static bool is_cyclic_term_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned depth)
 {
 	if (depth >= g_max_depth)
@@ -322,30 +280,74 @@ static bool is_cyclic_term_internal(query *q, cell *p1, pl_ctx p1_ctx, unsigned 
 	if (!is_compound(p1) || is_ground(p1))
 		return false;
 
-	if (is_iso_list(p1))
-		return is_cyclic_term_lists(q, p1, p1_ctx, depth);
+	list stack = {0};
+	vnode *n = TPL_malloc(sizeof(vnode));
 
-	int arity = p1->arity;
-	p1++;
+	if (!n)
+		return true;
 
-	while (arity--) {
-		cell *c = p1;
-		pl_ctx c_ctx = p1_ctx;
+	n->arity = get_arity(p1);
+	n->p1 = p1 + 1;
+	n->p1_ctx = p1_ctx;
+	n->depth = depth;
+	n->e = NULL;
+	n->save_vgen = 0;
+	list_push_back(&stack, n);
+
+	while ((n = (vnode*)list_back(&stack)) != NULL) {
+		if (!n->arity) {
+			slot *pending_e = n->e;
+			uint32_t pending_vgen = n->save_vgen;
+
+			list_pop_back(&stack);
+			TPL_free(n);
+
+			if (pending_e)
+				set_vgen(q, pending_e, pending_vgen);
+
+			continue;
+		}
+
+		if (n->depth >= g_max_depth) {
+			cyclic_stack_abort(q, &stack);
+			return true;
+		}
+
+		n->arity--;
+		cell *c = n->p1;
+		pl_ctx c_ctx = n->p1_ctx;
 		slot *e = NULL;
-		uint32_t save_vgen;
+		uint32_t save_vgen = 0;
 		bool any = false;
 		int both = 0;
 
-		DEREF_VAR(any, both, save_vgen, e, e->vgen, c, c_ctx, q->vgen);
+		DEREF_VAR(any, both, save_vgen, e, c, c_ctx, q->vgen);
+		n->p1 += n->p1->num_cells;
 
-		if (both)
+		if (both) {
+			cyclic_stack_abort(q, &stack);
 			return true;
+		}
 
-		if (is_cyclic_term_internal(q, c, c_ctx, depth+1))
-			return true;
+		if (is_compound(c) && !is_ground(c)) {
+			vnode *cn = TPL_malloc(sizeof(vnode));
 
-		if (e) e->vgen = save_vgen;
-		p1 += p1->num_cells;
+			if (!cn) {
+				cyclic_stack_abort(q, &stack);
+				return true;
+			}
+
+			cn->arity = get_arity(c);
+			cn->p1 = c + 1;
+			cn->p1_ctx = c_ctx;
+			// List spines do not consume depth (same as the old iterative
+			// is_cyclic_term_lists); only non-list compounds do.
+			cn->depth = is_iso_list(c) ? n->depth : n->depth + 1;
+			cn->e = e;
+			cn->save_vgen = save_vgen;
+			list_push_back(&stack, cn);
+		} else if (e)
+			set_vgen(q, e, save_vgen);
 	}
 
 	return false;
@@ -362,7 +364,7 @@ bool is_acyclic_term(query *q, cell *p1, pl_ctx p1_ctx)
 	return !is_cyclic_term(q, p1, p1_ctx);
 }
 
-inline static cell *term_next(query *q, cell *c, pl_ctx *c_ctx, bool *done)
+cell *term_next(query *q, cell *c, pl_ctx *c_ctx, bool *done)
 {
 	if (!is_iso_list(c)) {
 		*done = true;
@@ -397,9 +399,10 @@ LOOP:
 		const char *src = C_STR(q, head);
 		size_t len_src = C_STRLEN(q, head);
 		const char *save_src = src;
+		const bool bytes = is_bytes(head);
 
 		while ((max-- > 0) && (len_src > 0)) {
-			size_t len = len_char_utf8(src);
+			size_t len = bytes ? 1 : len_char_utf8(src);
 			len_src -= len;
 			src += len;
 			*skip += 1;
@@ -413,6 +416,11 @@ LOOP:
 			tmp = head;
 		} else {
 			make_stringn(tmp, src, C_STRLEN(q, head) - (src-save_src));
+
+			// The remainder has to be walked the same way as the whole.
+
+			if (bytes && is_string(tmp))
+				tmp->flags |= FLAG_CSTR_BYTES;
 		}
 
 		*skip += offset;
@@ -505,6 +513,7 @@ bool check_list(query *q, cell *p1, pl_ctx p1_ctx, bool *is_partial, pl_int *ski
 
 	if (is_partial)
 		*is_partial = false;
+
 	cell *c = skip_max_list(q, p1, &c_ctx, max, &skip, &tmp);
 	unshare_cell(&tmp);
 
@@ -521,4 +530,3 @@ bool check_list(query *q, cell *p1, pl_ctx p1_ctx, bool *is_partial, pl_int *ski
 
 	return false;
 }
-

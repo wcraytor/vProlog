@@ -1,6 +1,14 @@
-#define _XOPEN_SOURCE
+#if defined(__sun)
+#define __EXTENSIONS__
+#endif
+#define _XOPEN_SOURCE 700
 #include <ctype.h>
+#include "tpl_features.h"
+
+#if TPL_FEATURE_FILESYSTEM
 #include <dirent.h>
+#endif
+
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -9,16 +17,18 @@
 
 #include <sys/stat.h>
 
-#ifndef _WIN32
 #ifndef USE_MMAP
 #define USE_MMAP 1
 #endif
-#if USE_MMAP
+
+// Windows has no <sys/mman.h>: it gets the shims further down instead.
+
+#if USE_MMAP && !defined(_WIN32)
 #include <sys/mman.h>
-#endif
 #endif
 
 #include "history.h"
+#include "files.h"
 #include "module.h"
 #include "network.h"
 #include "query.h"
@@ -215,7 +225,7 @@ skip_readlink:
 		return memcpy(resolved, output, q+1);
 	}
 	if (stat(output, &st) == -1) return NULL;
-	return strdup(output);
+	return TPL_strdup(output);
 
 toolong:
 	errno = ENAMETOOLONG;
@@ -351,59 +361,7 @@ char *realpath(const char *path, char resolved_path[PATH_MAX])
 }
 #endif
 
-#ifdef _WIN32
-ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
-    size_t pos;
-    int c;
-
-    if (lineptr == NULL || stream == NULL || n == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    c = getc(stream);
-    if (c == EOF) {
-        return -1;
-    }
-
-    if (*lineptr == NULL) {
-        *lineptr = TPL_malloc(128);
- 		check_error(*lineptr);
-       if (*lineptr == NULL) {
-            return -1;
-        }
-        *n = 128;
-    }
-
-    pos = 0;
-    while(c != EOF) {
-        if (pos + 1 >= *n) {
-            size_t new_size = *n + (*n >> 2);
-            if (new_size < 128) {
-                new_size = 128;
-            }
-            char *new_ptr = TPL_realloc(*lineptr, new_size);
-            if (new_ptr == NULL) {
-                return -1;
-            }
-            *n = new_size;
-            *lineptr = new_ptr;
-        }
-
-        ((unsigned char *)(*lineptr))[pos ++] = c;
-        if (c == '\n') {
-            break;
-        }
-        c = getc(stream);
-    }
-
-    (*lineptr)[pos] = '\0';
-    return pos;
-}
-#endif
-
-// FIXME: this is too slow. There should be one overall
-// alias map, not one per stream.
+// FIXME: there should be one overall alias map, not one per stream
 
 int get_named_stream(prolog *pl, const char *name, size_t len)
 {
@@ -463,26 +421,53 @@ int new_stream(prolog *pl)
 	for (int i = 3; i < MAX_STREAMS; i++) {
 		stream *str = &pl->streams[i];
 
-		if (str->fp)
+		if (str->is_active)
 			continue;
 
+		str->timeout_ms = 0;
+		str->is_closing = false;
 		str->is_pipe = false;
+		str->is_popen = false;
 		str->is_socket = false;
 		str->is_alias = false;
 		str->is_engine = false;
-		str->is_map = false;
 		str->is_memory = false;
+		str->is_string = false;
+		str->ssl = false;				// a recycled slot must not look like its old TLS socket
+		str->sslptr = NULL;
+		str->captures = NULL;
 		str->idx = i;
 		str->bom = false;
 		str->repo = false;
 		str->binary = false;
 		str->at_end_of_file = false;
+		str->ungetch = 0;
+		str->did_getc = false;
+		str->invalid_pending = false;
+		str->fp = str->fp_in = str->fp_out = NULL;
+		str->is_active = true;
 		prolog_unlock(pl);
 		return i;
 	}
 
 	prolog_unlock(pl);
 	return -1;
+}
+
+// isatty() is a syscall, and it was on the path of every line read. It only decides whether to write an
+// interactive prompt, so remember it per stream and re-check only if the FILE* changes under us.
+
+static bool stream_is_tty(stream *str, FILE *fp)
+{
+	if (!fp || str->is_string)
+		return false;
+
+	if (str->tty_fp != fp) {
+		str->tty_fp = fp;
+		str->tty_val = isatty(fileno(fp)) ? true : false;
+	}
+
+	return str->tty_val;
 }
 
 bool is_closed_stream(prolog *pl, cell *p1)
@@ -502,10 +487,10 @@ static void add_stream_properties(query *q, int n)
 	char tmpbuf[1024*8];
 	char *dst = tmpbuf;
 	*dst = '\0';
-	off_t pos = !str->is_socket && !str->is_map && !str->is_engine ? ftello(str->fp) : 0;
+	off_t pos = !str->is_socket && !str->is_engine ? stream_tell(str) : 0;
 	bool at_end_of_file = false;
 
-	if (!str->at_end_of_file && (n > 2) && !str->is_socket && !str->is_engine && !str->is_map && !str->p) {
+	if (!str->at_end_of_file && (n > 2) && !str->is_socket && !str->is_engine && !str->is_pipe && !str->p && str->filename) {
 #if 0
 		if (str->p) {
 			if (str->p->srcptr && *str->p->srcptr) {
@@ -514,12 +499,12 @@ static void add_stream_properties(query *q, int n)
 		}
 #endif
 
-		int ch = str->ungetch ? str->ungetch : net_getc(str);
+		int ch = str->ungetch ? str->ungetch : tpl_getc(str);
 
 		if (str->ungetch)
 			;
-		else if (feof(str->fp) || ferror(str->fp)) {
-			clearerr(str->fp);
+		else if (stream_eof(str) || stream_error(str)) {
+			stream_clearerr(str);
 
 			if (str->eof_action != eof_action_reset)
 				at_end_of_file = true;
@@ -538,13 +523,17 @@ static void add_stream_properties(query *q, int n)
 
 	sl_done(iter);
 
-	if (!str->is_engine && !str->is_map) {
-		char *dst2 = formatted(str->filename, strlen(str->filename), false, false);
-		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, file_name('%s')).\n", n, dst2);
-		TPL_free(dst2);
-		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, file_no(%u)).\n", n, fileno(str->fp));
+	if (!str->is_engine) {
+		if (str->filename) {
+			char *dst2 = formatted(str->filename, strlen(str->filename), false, false);
+			dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, file_name('%s')).\n", n, dst2);
+			TPL_free(dst2);
+		}
 
-		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, file(%llu)).\n", n, (unsigned long long)(size_t)str->fp);
+		if (!str->is_string)
+			dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, file_no(%u)).\n", n, stream_fileno(str));
+
+		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, file(%llu)).\n", n, (unsigned long long)(size_t)str->fp_in);
 		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, mode(%s)).\n", n, str->mode);
 		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, type(%s)).\n", n, str->binary ? "binary" : "text");
 		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, line_count(%d)).\n", n, str->p ? str->p->line_num : 1);
@@ -568,12 +557,14 @@ static void add_stream_properties(query *q, int n)
 
 	if (str->is_engine)
 		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, engine(true)).\n", n);
-	else if (str->is_map)
-		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, skiplist(true)).\n", n);
 	else if (str->is_alias)
 		dst += snprintf(dst, sizeof(tmpbuf)-strlen(tmpbuf), "'$stream_property'(%d, alias(true)).\n", n);
 
 	parser *p = parser_create(q->st.m);
+
+	if (!p)
+		return;
+
 	p->srcptr = tmpbuf;
 	p->is_consulting = true;
 	tokenize(p, false, false);
@@ -590,10 +581,10 @@ static bool del_stream_properties(query *q, int n)
 	CHECKED(vnbr != -1);
 	make_ref(tmp+2, vnbr, q->st.cur_ctx);
 	tmp->num_cells = 3;
-	tmp->arity = 2;
+	set_arity(tmp, 2);
 	q->retry = QUERY_OK;
 
-	while (do_retract(q, tmp, q->st.cur_ctx, DO_RETRACTALL)) {
+	while (do_retract(q, NULL, tmp, q->st.cur_ctx, DO_RETRACTALL)) {
 		if (q->did_throw) return false;
 		q->retry = QUERY_RETRY;
 		retry_choice(q);
@@ -622,21 +613,21 @@ static bool do_stream_property(query *q)
 	}
 
 	if (!CMP_STRING_TO_CSTR(q, p1, "file_no")) {
-		if (!str->fp)
+		if (!str->fp_in || str->is_string)
 			return false;
 
 		cell tmp;
-		make_int(&tmp, fileno(str->fp));
+		make_int(&tmp, stream_fileno(str));
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		return ok;
 	}
 
 	if (!CMP_STRING_TO_CSTR(q, p1, "file")) {
-		if (!str->fp)
+		if (!str->fp_in)
 			return false;
 
 		cell tmp;
-		make_uint(&tmp, (size_t)str->fp);
+		make_uint(&tmp, (size_t)str->fp_in);
 		bool ok = unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 		return ok;
 	}
@@ -667,12 +658,6 @@ static bool do_stream_property(query *q)
 	if (!CMP_STRING_TO_CSTR(q, p1, "engine")) {
 		cell tmp;
 		make_atom(&tmp, new_atom(q->pl, str->is_engine?"true":"false"));
-		return unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
-	}
-
-	if (!CMP_STRING_TO_CSTR(q, p1, "skiplist")) {
-		cell tmp;
-		make_atom(&tmp, new_atom(q->pl, str->is_map?"true":"false"));
 		return unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 	}
 
@@ -730,7 +715,13 @@ static bool do_stream_property(query *q)
 	if (!CMP_STRING_TO_CSTR(q, p1, "end_of_stream") && is_stream(pstr)) {
 		bool at_end_of_file = false;
 
-		if (!str->at_end_of_file && (n > 2)) {
+		// A speculative tpl_getc() here would misreport a live, merely
+		// idle socket as at EOF: the fd is always non-blocking now (see
+		// bif_net.c), so "nothing pending yet" and "peer closed" both
+		// leave ferror() set with no data. add_stream_properties() above
+		// already excludes sockets from the equivalent peek for the same
+		// reason.
+		if (!str->at_end_of_file && (n > 2) && !str->is_socket) {
 			if (str->p) {
 				if (str->p->srcptr && *str->p->srcptr) {
 					int ch = get_char_utf8((const char**)&str->p->srcptr);
@@ -738,12 +729,12 @@ static bool do_stream_property(query *q)
 				}
 			}
 
-			int ch = str->ungetch ? str->ungetch : net_getc(str);
+			int ch = str->ungetch ? str->ungetch : tpl_getc(str);
 
 			if (str->ungetch)
 				;
-			else if (feof(str->fp) || ferror(str->fp)) {
-				clearerr(str->fp);
+			else if (stream_eof(str) || stream_error(str)) {
+				stream_clearerr(str);
 
 				if (str->eof_action != eof_action_reset)
 					at_end_of_file = true;
@@ -764,8 +755,13 @@ static bool do_stream_property(query *q)
 	}
 
 	if (!CMP_STRING_TO_CSTR(q, p1, "position") && !is_var(pstr)) {
+		pl_int pos = stream_tell(str);
+
+		if (str->ungetch)
+			pos -= put_len_utf8(str->ungetch);
+
 		cell tmp;
-		make_int(&tmp, ftello(str->fp));
+		make_int(&tmp, pos);
 		return unify(q, c, c_ctx, &tmp, q->st.cur_ctx);
 	}
 
@@ -783,7 +779,7 @@ static void clear_streams_properties(query *q)
 	cell tmp;
 	make_atom(&tmp, g_sys_stream_property_s);
 	tmp.num_cells = 1;
-	tmp.arity = 2;
+	set_arity(&tmp, 2);
 
 	predicate *pr = find_predicate(q->st.m, &tmp);
 
@@ -816,7 +812,7 @@ static bool bif_iso_stream_property_2(query *q)
 			return throw_error(q, pstr, q->st.cur_ctx, "domain_error", "stream");
 	}
 
-	if (p1->arity > 1)
+	if (get_arity(p1) > 1)
 		return throw_error(q, p1, p1_ctx, "domain_error", "stream_property");
 
 	if (!is_var(p1) && !is_callable(p1))
@@ -832,7 +828,6 @@ static bool bif_iso_stream_property_2(query *q)
 			if (!q->pl->streams[i].fp)
 				continue;
 
-			stream *str = &q->pl->streams[i];
 			add_stream_properties(q, i);
 		}
 	}
@@ -842,7 +837,7 @@ static bool bif_iso_stream_property_2(query *q)
 	CHECKED(tmp);
 	tmp->val_off = g_sys_stream_property_s;
 
-	if (match_clause(q, tmp, q->st.cur_ctx, NULL, DO_CLAUSE) != true) {
+	if (match_clause(q, NULL, tmp, q->st.cur_ctx, NULL, DO_CLAUSE) != true) {
 		clear_streams_properties(q);
 
 		if (is_callable(p1) && !strstr(s_properties, C_STR(q, p1)))
@@ -851,7 +846,7 @@ static bool bif_iso_stream_property_2(query *q)
 		return false;
 	}
 
-	GET_FIRST_ARG(pstrx,any);
+	GET_FIRST_ARG(pstrx,integer);
 	pstrx->flags |= FLAG_INT_STREAM;
 	return true;
 }
@@ -884,44 +879,124 @@ bool valid_list(query *q, cell *c, pl_ctx c_ctx)
 #define MAP_SHARED	0x01		/* Share changes.  */
 #define MAP_PRIVATE	0x02		/* Changes are private.  */
 
+// Windows will not truncate or delete a file while a view of it exists, and
+// the mapping now outlives close/1 - hence a private copy, at the file's size.
+
 static void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t offset)
 {
+	(void)start; (void)prot;
 	size_t len;
 	struct stat st;
-	uint64_t o = offset;
-	uint32_t l = o & 0xFFFFFFFF;
-	uint32_t h = (o >> 32) & 0xFFFFFFFF;
 
 	if (!fstat(fd, &st))
 		len = (size_t) st.st_size;
 	else {
 		fprintf(stderr, "ERROR: mmap could not determine filesize");
-		return NULL;
+		return MAP_FAILED;
 	}
+
+	if (!(flags & MAP_PRIVATE) || ((size_t)offset >= len)) {
+		fprintf(stderr, "ERROR: Invalid usage of mmap");
+		return MAP_FAILED;
+	}
+
+	// Refused rather than clamped: the caller sized its slice from its own
+	// fstat, so a file that shrank since would read past this buffer.
 
 	if ((length + offset) > len)
-		length = len - offset;
+		return MAP_FAILED;
 
-	if (!(flags & MAP_PRIVATE)) {
-		fprintf(stderr, "ERROR: Invalid usage of mmap");
-		return NULL;
+	HANDLE hfile = (HANDLE)_get_osfhandle(fd);
+	char *dst = TPL_malloc(length);
+
+	if (!dst || (hfile == INVALID_HANDLE_VALUE)) {
+		TPL_free(dst);
+		return MAP_FAILED;
 	}
 
-	HANDLE hmap = CreateFileMapping((HANDLE)_get_osfhandle(fd), 0, PAGE_WRITECOPY, 0, 0, 0);
+	// Read through the handle: a view never saw the fd's text mode.
 
-	if (!hmap) {
-		fprintf(stderr, "ERROR: CreateFileMapping failed");
-		return NULL;
+	LARGE_INTEGER save, seek;
+	seek.QuadPart = 0;
+
+	if (!SetFilePointerEx(hfile, seek, &save, FILE_CURRENT)) {
+		TPL_free(dst);
+		return MAP_FAILED;
 	}
 
-	void *temp = MapViewOfFileEx(hmap, FILE_MAP_COPY, h, l, length, start);
+	seek.QuadPart = offset;
+	size_t got = 0;
 
-	if (!CloseHandle(hmap))
-		fprintf(stderr, "Unable to close file mapping handle\n");
+	if (SetFilePointerEx(hfile, seek, NULL, FILE_BEGIN)) {
+		while (got < length) {
+			size_t rest = length - got;
+			DWORD want = rest > (1u << 30) ? (1u << 30) : (DWORD)rest, n = 0;
 
-	return temp ? temp : MAP_FAILED;
+			if (!ReadFile(hfile, dst + got, want, &n, NULL) || !n)
+				break;
+
+			got += n;
+		}
+	}
+
+	// The caller's FILE* reads from wherever this leaves the handle, so a
+	// restore that failed has to fail the mapping with it.
+
+	if (!SetFilePointerEx(hfile, save, NULL, FILE_BEGIN) || (got < length)) {
+		TPL_free(dst);
+		return MAP_FAILED;
+	}
+
+	return dst;
+}
+
+static int munmap(void *addr, size_t length)
+{
+	// A copy, not a view: it goes back whole, so no length here either.
+
+	(void)length;
+	TPL_free(addr);
+	return 0;
 }
 #endif
+
+
+// Release a stream slot that was handed out by new_stream() but never
+// finished being built. open/4 allocates filename, mode and the alias
+// skiplist BEFORE parsing options, and the option loop has a dozen
+// error exits; each one used to return straight out. The slot stayed
+// is_active, so 1024 bad-option opens exhausted MAX_STREAMS and every
+// later open/4 raised resource_error(too_many_streams). The paths that
+// did clear is_active still leaked the three allocations.
+//
+// Not stream_close(): that assumes a fully built stream and would
+// tpl_close() a NULL fp. Here fp may or may not exist, so close it
+// only if it does.
+
+void unwind_stream(query *q, int n)
+{
+	stream *str = &q->pl->streams[n];
+
+	if (str->is_string) {
+		SB_free(str->sb);
+	} else if (str->fp && (str->fp != stdin) && (str->fp != stdout) && (str->fp != stderr))
+		fclose(str->fp);
+
+	str->fp = str->fp_in = str->fp_out = NULL;
+	parser_destroy(str->p);
+	str->p = NULL;
+	sl_destroy(str->alias);
+	str->alias = NULL;
+	TPL_free(str->filename);
+	str->filename = NULL;
+	TPL_free(str->mode);
+	str->mode = NULL;
+	TPL_free(str->addr);
+	str->addr = NULL;
+	TPL_free(str->data);
+	str->data = NULL;
+	str->is_active = false;
+}
 
 
 static bool bif_iso_open_4(query *q)
@@ -930,65 +1005,85 @@ static bool bif_iso_open_4(query *q)
 	GET_NEXT_ARG(p2,atom);
 	GET_NEXT_ARG(p3,var);
 	GET_NEXT_ARG(p4,list_or_nil);
-	int n = new_stream(q->pl);
-	char *src = NULL;
 
-	if (n < 0)
-		return throw_error(q, p1, p1_ctx, "resource_error", "too_many_streams");
+	// Everything that can throw happens BEFORE new_stream(), so that a
+	// bad call never takes a stream slot it then has to give back. The
+	// old shape took the slot first and every one of the twenty-odd
+	// error exits had to remember unwind_stream() - see bif_threads.c
+	// and bif_os.c for the same change.
+	//
+	// Order of errors is unchanged, with one deliberate addition: in
+	// read mode a missing file is reported here rather than after
+	// fopen() fails, which is the common case and the one that used to
+	// allocate a slot, a filename, an alias table and a mode string
+	// only to throw them away.
+	//
+	// Two things need the slot number: alias(current_input/output/error),
+	// recorded in std_alias, and a plain alias(A), recorded in alias. Both
+	// are applied at the very end, for the reason given there.
 
-	char *filename;
+	// --- validate the source_sink. Shape only, nothing allocated yet.
+
 	stream *oldstr = NULL;
+	cell *oldc = NULL;
+	pl_ctx oldc_ctx = 0;
+	bool old_repo = false;
 
-	if (is_compound(p1) && (p1->arity == 1) && !CMP_STRING_TO_CSTR(q, p1, "stream")) {
-		int oldn = get_stream(q, p1+1);
+	if (is_compound(p1) && (get_arity(p1) == 1) && !CMP_STRING_TO_CSTR(q, p1, "stream")) {
+		cell *c = deref(q, p1+1, p1_ctx);
+		pl_ctx c_ctx = q->latest_ctx;
+
+		if (is_var(c))
+			return throw_error(q, c, c_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
+
+		int oldn = get_stream(q, c);
 
 		if (oldn < 0)
-			return throw_error(q, p1, p1_ctx, "type_error", "not_a_stream");
+			return throw_error(q, c, c_ctx, "type_error", "stream_or_alias");
 
 		oldstr = &q->pl->streams[oldn];
-		filename = oldstr->filename;
-	} else if (is_atom(p1))
-		filename = src = DUP_STRING(q, p1);
-	else if (!is_iso_list(p1))
+
+		if (oldstr->is_string || oldstr->is_engine)
+			return throw_error(q, p1, p1_ctx, "permission_error", "open,source_sink");
+
+		oldc = c;
+		oldc_ctx = c_ctx;
+		old_repo = (oldn > 2) && !oldstr->is_socket && oldstr->repo;
+	} else if (!is_atom(p1) && !is_iso_list(p1))
 		return throw_error(q, p1, p1_ctx, "domain_error", "source_sink");
+	else if (is_iso_list(p1) && !scan_is_chars_list(q, p1, p1_ctx, true))
+		return throw_error(q, p1, p1_ctx, "type_error", "atom");
 
-	if (is_iso_list(p1)) {
-		size_t len = scan_is_chars_list(q, p1, p1_ctx, true);
+	// --- validate the options, collecting what the commit will need.
 
-		if (!len)
-			return throw_error(q, p1, p1_ctx, "type_error", "atom");
-
-		filename = src = chars_list_to_string(q, p1, p1_ctx);
-	}
-
-	stream *str = &q->pl->streams[n];
-	CHECKED(str->filename = strdup(filename));
-	CHECKED(str->alias = sl_create((void*)fake_strcmp, (void*)keyfree, NULL));
-	CHECKED(str->mode = DUP_STRING(q, p2));
+	cell *alias = NULL;
+	int std_alias = 0;			// 0 none, 1 input, 2 output, 3 error
 	bool binary = false, repo = true;
 	uint8_t eof_action = eof_action_eof_code;
-	TPL_free(src);
+	bool bom_specified = false, use_bom = false, is_alias = false;
 
 #if USE_MMAP
 	cell *mmap_var = NULL;
 	pl_ctx mmap_ctx = 0;
 #endif
 
-	bool bom_specified = false, use_bom = false, is_alias = false;
-	LIST_HANDLER(p4);
+	PROLOG_LIST_HANDLER(p4);
 
 	while (is_list(p4)) {
-		cell *h = LIST_HEAD(p4);
+		cell *h = PROLOG_LIST_HEAD(p4);
 		cell *c = deref(q, h, p4_ctx);
 		pl_ctx c_ctx = q->latest_ctx;
 
 		if (is_var(c))
 			return throw_error(q, c, q->latest_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 
+		// Every option is name(Arg): anything else has no argument to read.
+
+		if (!is_compound(c) || (get_arity(c) != 1))
+			return throw_error(q, c, c_ctx, "domain_error", "stream_option");
+
 		cell *name = c + 1;
 		name = deref(q, name, c_ctx);
-
-		//printf("*** %s %s : %s\n", str->filename, C_STR(q, c), C_STR(q, name));
 
 		if (!CMP_STRING_TO_CSTR(q, c, "mmap")) {
 #if USE_MMAP
@@ -1012,24 +1107,14 @@ static bool bif_iso_open_4(query *q)
 			if (get_named_stream(q->pl, C_STR(q, name), C_STRLEN(q, name)) >= 0)
 				return throw_error(q, c, c_ctx, "permission_error", "open,source_sink");
 
-			if (!CMP_STRING_TO_CSTR(q, name, "current_input")) {
-				q->pl->current_input = n;
-			} else if (!CMP_STRING_TO_CSTR(q, name, "current_output")) {
-				q->pl->current_output = n;
-			} else if (!CMP_STRING_TO_CSTR(q, name, "current_error")) {
-				q->pl->current_error = n;
-			} else {
-				sl_app(str->alias, DUP_STRING(q, name), NULL);
-#if 0
-				cell tmp;
-				make_atom(&tmp, new_atom(q->pl, C_STR(q, name)));
-
-				if (!unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx))
-					return false;
-
-				is_alias = true;
-#endif
-			}
+			if (!CMP_STRING_TO_CSTR(q, name, "current_input"))
+				std_alias = 1;
+			else if (!CMP_STRING_TO_CSTR(q, name, "current_output"))
+				std_alias = 2;
+			else if (!CMP_STRING_TO_CSTR(q, name, "current_error"))
+				std_alias = 3;
+			else
+				alias = name;
 		} else if (!CMP_STRING_TO_CSTR(q, c, "type")) {
 			if (is_var(name))
 				return throw_error(q, name, q->latest_ctx, "instantiation_error", "stream_option");
@@ -1037,9 +1122,9 @@ static bool bif_iso_open_4(query *q)
 			if (!is_atom(name))
 				return throw_error(q, c, c_ctx, "domain_error", "stream_option");
 
-			if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "binary")) {
+			if (!CMP_STRING_TO_CSTR(q, name, "binary"))
 				binary = true;
-			} else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "text"))
+			else if (!CMP_STRING_TO_CSTR(q, name, "text"))
 				binary = false;
 			else
 				return throw_error(q, c, c_ctx, "domain_error", "stream_option");
@@ -1052,9 +1137,9 @@ static bool bif_iso_open_4(query *q)
 
 			bom_specified = true;
 
-			if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "true"))
+			if (!CMP_STRING_TO_CSTR(q, name, "true"))
 				use_bom = true;
-			else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "false"))
+			else if (!CMP_STRING_TO_CSTR(q, name, "false"))
 				use_bom = false;
 		} else if (!CMP_STRING_TO_CSTR(q, c, "reposition")) {
 			if (is_var(name))
@@ -1063,9 +1148,9 @@ static bool bif_iso_open_4(query *q)
 			if (!is_atom(name))
 				return throw_error(q, c, c_ctx, "domain_error", "stream_option");
 
-			if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "true"))
+			if (!CMP_STRING_TO_CSTR(q, name, "true"))
 				repo = true;
-			else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "false"))
+			else if (!CMP_STRING_TO_CSTR(q, name, "false"))
 				repo = false;
 		} else if (!CMP_STRING_TO_CSTR(q, c, "eof_action")) {
 			if (is_var(name))
@@ -1074,18 +1159,16 @@ static bool bif_iso_open_4(query *q)
 			if (!is_atom(name))
 				return throw_error(q, c, c_ctx, "domain_error", "stream_option");
 
-			if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "error")) {
+			if (!CMP_STRING_TO_CSTR(q, name, "error"))
 				eof_action = eof_action_error;
-			} else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "eof_code")) {
+			else if (!CMP_STRING_TO_CSTR(q, name, "eof_code"))
 				eof_action = eof_action_eof_code;
-			} else if (is_atom(name) && !CMP_STRING_TO_CSTR(q, name, "reset")) {
+			else if (!CMP_STRING_TO_CSTR(q, name, "reset"))
 				eof_action = eof_action_reset;
-			}
-		} else {
+		} else
 			return throw_error(q, c, c_ctx, "domain_error", "stream_option");
-		}
 
-		p4 = LIST_TAIL(p4);
+		p4 = PROLOG_LIST_TAIL(p4);
 		p4 = deref(q, p4, p4_ctx);
 		p4_ctx = q->latest_ctx;
 
@@ -1093,8 +1176,77 @@ static bool bif_iso_open_4(query *q)
 			return throw_error(q, p4, p4_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 	}
 
+#if USE_MMAP
+	// The mapping is the file from an offset, so both the new stream and
+	// any stream it reopens must be repositionable.
+
+	if (mmap_var && oldstr && !old_repo)
+		return throw_error(q, oldc, oldc_ctx, "permission_error", "reposition,stream");
+
+	if (mmap_var && !repo)
+		return throw_error(q, p1, p1_ctx, "permission_error", "reposition,stream");
+#endif
+
+	// --- materialise the filename and stat it. Three exits below still
+	// free src by hand; that is three, not twenty, and none of them has
+	// a stream slot to worry about.
+
+	char *src = NULL;
+	const char *filename;
+
+	if (oldstr)
+		filename = oldstr->filename;
+	else if (is_atom(p1))
+		filename = src = DUP_STRING(q, p1);
+	else
+		filename = src = chars_list_to_string(q, p1, p1_ctx);
+
 	struct stat st = {0};
-	stat(str->filename, &st);
+	bool statted = !stat(filename, &st);
+	int stat_errno = errno;
+
+	// A directory can be handed to fopen() in read mode on POSIX: it
+	// succeeds and only the subsequent reads fail with EISDIR. Catch
+	// it here so open/4 reports it like any other unopenable sink.
+
+	if (statted && S_ISDIR(st.st_mode)) {
+		TPL_free(src);
+		return throw_error(q, p1, p1_ctx, "permission_error", "open,source_sink");
+	}
+
+	bool is_read = !CMP_STRING_TO_CSTR(q, p2, "read");
+
+	if (!is_read
+		&& CMP_STRING_TO_CSTR(q, p2, "write")
+		&& CMP_STRING_TO_CSTR(q, p2, "append")
+		&& CMP_STRING_TO_CSTR(q, p2, "update")) {
+		TPL_free(src);
+		return throw_error(q, p2, p2_ctx, "domain_error", "io_mode");
+	}
+
+	// Reading something that is not there. Only ENOENT: if stat failed
+	// for any other reason (EACCES on a parent directory, say) fopen is
+	// left to produce the error it always did.
+
+	if (is_read && !oldstr && !statted && (stat_errno == ENOENT)) {
+		TPL_free(src);
+		return throw_error(q, p1, p1_ctx, "existence_error", "source_sink");
+	}
+
+	// --- commit. Only fopen/fdopen can fail from here.
+
+	int n = new_stream(q->pl);
+
+	if (n < 0) {
+		TPL_free(src);
+		return throw_error(q, p1, p1_ctx, "resource_error", "too_many_streams");
+	}
+
+	stream *str = &q->pl->streams[n];
+	CHECKED(str->filename = TPL_strdup(filename));
+	TPL_free(src);
+	CHECKED(str->alias = sl_create((void*)fake_strcmp, (void*)keyfree, NULL));
+	CHECKED(str->mode = DUP_STRING(q, p2));
 
 	if (!S_ISREG(st.st_mode) && !bom_specified) {
 		bom_specified = true;
@@ -1107,10 +1259,24 @@ static bool bif_iso_open_4(query *q)
 	str->bom = false;
 	str->did_getc = false;
 	str->srclen = str->ungetch = 0;
+	str->invalid_pending = false;
 	str->at_end_of_file = false;
 
+	// A reopened stream starts where the old one had got to, as the
+	// position property reports it.
+
+	off_t start = 0;
+
 	if (oldstr) {
-		int fd = fileno(oldstr->fp);
+		start = ftello(oldstr->fp);
+
+		if (oldstr->ungetch)
+			start -= put_len_utf8(oldstr->ungetch);
+
+		if (start < 0)
+			start = 0;
+
+		int fd = stream_fileno(oldstr);
 
 		if (!strcmp(str->mode, "read"))
 			str->fp = fdopen(fd, str->binary?"rb":"r");
@@ -1118,10 +1284,8 @@ static bool bif_iso_open_4(query *q)
 			str->fp = fdopen(fd, str->binary?"wb":"w");
 		else if (!strcmp(str->mode, "append"))
 			str->fp = fdopen(fd, str->binary?"ab":"a");
-		else if (!strcmp(str->mode, "update"))
-			str->fp = fdopen(fd, str->binary?"rb+":"r+");
 		else
-			return throw_error(q, p2, p2_ctx, "domain_error", "io_mode");
+			str->fp = fdopen(fd, str->binary?"rb+":"r+");
 	} else {
 		if (!strcmp(str->mode, "read"))
 			str->fp = fopen(str->filename, str->binary?"rb":"r");
@@ -1129,35 +1293,38 @@ static bool bif_iso_open_4(query *q)
 			str->fp = fopen(str->filename, str->binary?"wb":"w");
 		else if (!strcmp(str->mode, "append"))
 			str->fp = fopen(str->filename, str->binary?"ab":"a");
-		else if (!strcmp(str->mode, "update"))
-			str->fp = fopen(str->filename, str->binary?"rb+":"r+");
 		else
-			return throw_error(q, p2, p2_ctx, "domain_error", "io_mode");
+			str->fp = fopen(str->filename, str->binary?"rb+":"r+");
 	}
 
 	if (!str->fp) {
-		if ((errno == EACCES) || (strcmp(str->mode, "read")
-			&& ((errno == EROFS) || (errno == EISDIR))
-			))
+		bool perm = (errno == EACCES)
+			|| (!is_read && ((errno == EROFS) || (errno == EISDIR)));
+		unwind_stream(q, n);
+
+		if (perm)
 			return throw_error(q, p1, p1_ctx, "permission_error", "open,source_sink");
-		//else if ((strcmp(str->mode, "read") && (errno == EISDIR)))
-		//	return throw_error(q, p1, p1_ctx, "permission_error", "open,isadir");
 		else
 			return throw_error(q, p1, p1_ctx, "existence_error", "source_sink");
 	}
 
+	str->fp_out = str->fp;
+
 	if (S_ISFIFO(st.st_mode))
 		setvbuf(str->fp, NULL, _IONBF, 0);
 
+	if (start)
+		fseeko(str->fp, start, SEEK_SET);
+
 #if USE_MMAP
-	size_t offset = 0;
+	size_t offset = start;
 #endif
 
-	if (!strcmp(str->mode, "read") && !str->binary && (!bom_specified || use_bom)) {
-		int ch = xgetc_utf8(net_getc, str);
+	if (!start && !strcmp(str->mode, "read") && !str->binary && (!bom_specified || use_bom)) {
+		int ch = xgetc_utf8_lax(tpl_getc, str);
 
-		if (feof(str->fp))
-			clearerr(str->fp);
+		if (stream_eof(str))
+			stream_clearerr(str);
 
 		if ((unsigned)ch == 0xFEFF) {
 			str->bom = true;
@@ -1170,7 +1337,7 @@ static bool bif_iso_open_4(query *q)
 		int ch = 0xFEFF;
 		char tmpbuf[MAX_BYTES_PER_CODEPOINT+1];
 		put_char_utf8(tmpbuf, ch);
-		net_write(tmpbuf, strlen(tmpbuf), str);
+		tpl_write(tmpbuf, strlen(tmpbuf), str);
 		str->bom = true;
 	}
 
@@ -1183,38 +1350,111 @@ static bool bif_iso_open_4(query *q)
 		prot = PROT_WRITE;
 
 	if (mmap_var && is_var(mmap_var)) {
-		int fd = fileno(str->fp);
+		int fd = stream_fileno(str);
 		struct stat st = {0};
 		fstat(fd, &st);
 		size_t len = st.st_size;
-		void *addr = mmap(0, len, prot, MAP_PRIVATE, fd, offset);
-		check_error(addr);
 		cell tmp = {0};
 
-		if (len) {
+		// Nothing past the offset is just the empty list, and must not be
+		// mapped: mmap() rejects a zero length with MAP_FAILED, which is -1
+		// rather than null and so slips past a null check. The stray
+		// pointer only bites where munmap() polices its arguments -
+		// POSIX ignores it, wasm faults.
+		//
+		// Otherwise map from 0, as mmap() offsets must be page-aligned,
+		// and start the string at the offset (a BOM or reopen position).
+
+		if (len <= offset) {
+			make_atom(&tmp, g_nil_s);
+		} else {
+			void *addr = mmap(0, len, prot, MAP_PRIVATE, fd, 0);
+
+			if (addr == MAP_FAILED)
+				addr = NULL;
+
+			// Past new_stream(), so the slot goes back by hand. This used
+			// to fail the goal silently and keep the slot: 1024 mappings
+			// that could not be made and every later open/4 raised
+			// resource_error(too_many_streams).
+
+			if (!addr) {
+				// A stream with no read access cannot be mapped at all;
+				// anything else here is out of address space.
+
+				bool perm = strcmp(str->mode, "read") && strcmp(str->mode, "update");
+				unwind_stream(q, n);
+
+				if (perm)
+					return throw_error(q, p1, p1_ctx, "permission_error", "input,stream");
+
+				return throw_error(q, p1, p1_ctx, "resource_error", "memory");
+			}
+
 			tmp.tag = TAG_CSTR;
 			tmp.flags = FLAG_CSTR_BLOB | FLAG_CSTR_STRING | FLAG_CSTR_SLICE;
+
+			// A binary stream hands back the bytes as they lie. The
+			// mapping is still shared, not copied - the flag only
+			// changes how the slice is walked.
+
+			if (str->binary)
+				tmp.flags |= FLAG_CSTR_BYTES;
+
 			tmp.num_cells = 1;
-			tmp.arity = 2;
-			tmp.val_str = addr;
-			tmp.str_len = len;
-		} else
-			make_atom(&tmp, g_nil_s);
+			set_arity(&tmp, 2);
+			tmp.val_str = (char*)addr + offset;
+			tmp.str_len = len - offset;
+
+			// The query owns this mapping, not the stream: a slice
+			// carries no refcount, so close/1 unmapping it would leave
+			// every term holding one pointing at nothing. It goes
+			// instead when the open/4 is backtracked over, by which
+			// point no binding can reach it, or when the query ends.
+
+			if (!undo_mmap_on_backtrack(q, addr, len)) {
+				munmap(addr, len);
+				unwind_stream(q, n);
+				return throw_error(q, p1, p1_ctx, "resource_error", "memory");
+			}
+		}
 
 		unify(q, mmap_var, mmap_ctx, &tmp, q->st.cur_ctx);
 	}
 #endif
 
+	// Named last: an earlier exit would leave current_input on a slot
+	// unwind_stream() has released, and a name lets another thread find a
+	// stream that is still being built.
+
+	if (std_alias == 1)
+		q->pl->current_input = n;
+	else if (std_alias == 2)
+		q->pl->current_output = n;
+	else if (std_alias == 3)
+		q->pl->current_error = n;
+	else if (alias)
+		sl_app(str->alias, DUP_STRING(q, alias), NULL);
+
 	if (!is_alias) {
 		cell tmp ;
 		make_int(&tmp, n);
 		tmp.flags |= FLAG_INT_STREAM;
-
-		if (!unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx))
-			return false;
+		unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx);
 	}
 
 	return true;
+}
+
+// Called from the query's undo list, which is where a mapping now lives.
+
+void stream_unmap(void *addr, size_t len)
+{
+#if USE_MMAP
+	munmap(addr, len);
+#else
+	(void)addr; (void)len;
+#endif
 }
 
 bool stream_close(query *q, int n)
@@ -1239,45 +1479,116 @@ bool stream_close(query *q, int n)
 
 	if (sl_get(str->alias, "user_input", NULL)) {
 		stream *str2 = &q->pl->streams[0];
-		sl_app(str2->alias, strdup("user_input"), NULL);
+		sl_app(str2->alias, TPL_strdup("user_input"), NULL);
 	}
 
 	if (sl_get(str->alias, "user_output", NULL)) {
 		stream *str2 = &q->pl->streams[1];
-		sl_app(str2->alias, strdup("user_output"), NULL);
+		sl_app(str2->alias, TPL_strdup("user_output"), NULL);
 	}
 
 	if (sl_get(str->alias, "user_error", NULL)) {
 		stream *str2 = &q->pl->streams[2];
-		sl_app(str2->alias, strdup("user_error"), NULL);
+		sl_app(str2->alias, TPL_strdup("user_error"), NULL);
 	}
 
 	del_stream_properties(q, n);
 	bool ok = true;
 
 	if (str->is_alias) {
-	} else if (str->is_map) {
-		sl_destroy(str->keyval);
 	} else if (str->is_engine) {
 		query_destroy(str->engine);
+		free_detached_term(str->cur_yield);
+		free_detached_term(str->cur_post);
+		str->cur_yield = str->cur_post = NULL;
 	} else
-		ok = !net_close(str);
+		ok = !tpl_close(str);
 
 	sl_destroy(str->alias);
 	str->alias = NULL;
-	str->fp = NULL;
+	str->fp_in = str->fp_out = NULL;
 	TPL_free(str->mode);
 	str->mode = NULL;
 	TPL_free(str->filename);
 	str->filename = NULL;
+	TPL_free(str->addr);
+	str->addr = NULL;
 	TPL_free(str->data);
 	str->data = NULL;
+	str->data_owner = NULL;
+	TPL_free(str->wbuf);
+	str->wbuf = NULL;
+	str->wbuf_owner = NULL;
+	str->wbuf_len = str->wbuf_pos = 0;
 	str->at_end_of_file = true;
+	str->is_active = false;
 
 	if (!ok)
-		return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
+		return throw_error(q, q->st.instr, q->st.cur_ctx, "system_error", strerror(errno));
 
 	return true;
+}
+
+// There is no io_error class in 7.12.2. An output failure on a stream
+// that has gone away -- the far end of a pipe closing, say -- is a
+// stream that no longer exists, so report it as such, as other systems
+// do (#948).
+
+bool throw_stream_gone(query *q, stream *str)
+{
+	cell tmp;
+	make_int(&tmp, str->idx);
+	tmp.flags |= FLAG_INT_STREAM;
+	return throw_error(q, &tmp, q->st.cur_ctx, "existence_error", "stream");
+}
+
+// An input stream over a copy of the text, read from the stream's own
+// stringbuf. SWI-Prolog's open_string/2.
+
+static bool bif_open_string_2(query *q)
+{
+	GET_FIRST_ARG(p1,any);
+	GET_NEXT_ARG(p2,var);
+	const char *src;
+	size_t len;
+	char *tmp = NULL;
+
+	if (is_nil(p1)) {
+		src = "";
+		len = 0;
+	} else if (is_atom(p1) || is_cstring(p1)) {
+		src = C_STR(q, p1);
+		len = C_STRLEN(q, p1);
+	} else if (scan_is_chars_list(q, p1, p1_ctx, true)) {
+		CHECKED(tmp = chars_list_to_string(q, p1, p1_ctx));
+		src = tmp;
+		len = strlen(tmp);
+	} else
+		return throw_error(q, p1, p1_ctx, "type_error", "string");
+
+	int n = new_stream(q->pl);
+
+	if (n < 0) {
+		TPL_free(tmp);
+		return throw_error(q, p1, p1_ctx, "resource_error", "too_many_streams");
+	}
+
+	stream *str = &q->pl->streams[n];
+	SB_init(str->sb);
+	SB_strcatn(str->sb, src, len);
+	TPL_free(tmp);
+	str->is_string = true;
+	str->str_eof = false;
+	str->str_pos = 0;
+	str->handle = str;					// a live stream has this non-NULL, as an engine's does
+	CHECKED(str->alias = sl_create((void*)fake_strcmp, (void*)keyfree, NULL));
+	CHECKED(str->mode = TPL_strdup("read"));
+	str->eof_action = eof_action_eof_code;
+	str->srclen = 0;
+	cell c;
+	make_int(&c, n);
+	c.flags |= FLAG_INT_STREAM;
+	return unify(q, p2, p2_ctx, &c, q->st.cur_ctx);
 }
 
 bool bif_iso_close_1(query *q)
@@ -1291,10 +1602,10 @@ static bool bif_iso_close_2(query *q)
 {
 	GET_FIRST_ARG(pstr,stream_or_alias);
 	GET_NEXT_ARG(p1,list_or_nil);
-	LIST_HANDLER(p1);
+	PROLOG_LIST_HANDLER(p1);
 
 	while (is_list(p1)) {
-		cell *h = LIST_HEAD(p1);
+		cell *h = PROLOG_LIST_HEAD(p1);
 		h = deref(q, h, p1_ctx);
 
 		if (!is_compound(h)
@@ -1302,7 +1613,7 @@ static bool bif_iso_close_2(query *q)
 			|| CMP_STRING_TO_CSTR(q, h+1, "true"))
 			return throw_error(q, h, q->latest_ctx, "domain_error", "close_option");
 
-		p1 = LIST_TAIL(p1);
+		p1 = PROLOG_LIST_TAIL(p1);
 		p1 = deref(q, p1, p1_ctx);
 		p1_ctx = q->latest_ctx;
 	}
@@ -1328,19 +1639,19 @@ static bool bif_iso_at_end_of_stream_0(query *q)
 		}
 	}
 
-	if (!str->ungetch && isatty(fileno(str->fp)))
+	if (!str->ungetch && stream_is_tty(str, str->fp_in))
 		return false;
 
 	if (!str->is_socket) {
-		int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
+		int ch = str->ungetch ? str->ungetch : xgetc_utf8_lax(tpl_getc, str);
 		str->ungetch = ch;
 	}
 
-	if (!feof(str->fp) && !ferror(str->fp))
+	if (!stream_eof(str) && !stream_error(str))
 		return false;
 
 	if (str->eof_action == eof_action_reset)
-		clearerr(str->fp);
+		stream_clearerr(str);
 
 	return true;
 }
@@ -1361,33 +1672,71 @@ static bool bif_iso_at_end_of_stream_1(query *q)
 		}
 	}
 
-	if (!str->ungetch && isatty(fileno(str->fp)))
+	if (!str->ungetch && stream_is_tty(str, str->fp_in))
 		return false;
 
 	if (!str->is_socket) {
-		int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
+		int ch = str->ungetch ? str->ungetch : xgetc_utf8_lax(tpl_getc, str);
 		str->ungetch = ch;
 	}
 
-	if (!feof(str->fp) && !ferror(str->fp))
+	if (!stream_eof(str) && !stream_error(str))
 		return false;
 
 	if (str->eof_action == eof_action_reset)
-		clearerr(str->fp);
+		stream_clearerr(str);
 
 	return true;
+}
+
+// fflush()es str, throwing existence_error(...) on a real failure - but
+// not on a non-task socket's transient EAGAIN (its fd is non-blocking
+// now, see bif_net.c), which waits for room and retries instead. Without
+// this, flush_output/0,1 and nl/0,1 threw "stream gone" for a peer that
+// was simply slow to drain its receive buffer: fflush() failing here
+// always sets ferror(), and this file could not tell a full send buffer
+// apart from the stream having actually gone away.
+static bool flush_or_throw(query *q, stream *str)
+{
+	for (;;) {
+		int err = fflush(str->fp_out);
+
+		if ((err == EOF) && !str->is_socket)
+			return throw_stream_gone(q, str);
+
+		if (ferror(str->fp_out)) {
+			if (str->is_socket && !q->is_task && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+				clearerr(str->fp_out);
+
+				if (!tpl_wait_fd_writable(q, fileno(str->fp_out)))
+					return throw_timeout(q);
+
+				continue;
+			}
+
+			clearerr(str->fp_out);
+			return throw_stream_gone(q, str);
+		}
+
+		return true;
+	}
+}
+
+static bool write_all(query *q, stream *str, const char *src, size_t len);
+
+// A parked write belongs to the query that parked it, not to the stream
+// it is parked on. Another query writing the same stream meanwhile must
+// leave that buffer alone and send its own bytes - see write_all().
+static bool resuming_write(const query *q, const stream *str)
+{
+	return str->wbuf && (str->wbuf_owner == q);
 }
 
 static bool bif_iso_flush_output_0(query *q)
 {
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-	int err = fflush(str->fp);
-
-	if ((err == EOF) && !str->is_socket)
-		return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-
-	return !ferror(str->fp);
+	return flush_or_throw(q, str);
 }
 
 static bool bif_iso_flush_output_1(query *q)
@@ -1399,12 +1748,7 @@ static bool bif_iso_flush_output_1(query *q)
 	if (!strcmp(str->mode, "read"))
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "output,stream");
 
-	int err = fflush(str->fp);
-
-	if ((err == EOF) && !str->is_socket)
-		return throw_error(q, pstr, pstr_ctx, "io_error", strerror(errno));
-
-	return !ferror(str->fp);
+	return flush_or_throw(q, str);
 }
 
 static bool bif_iso_nl_0(query *q)
@@ -1415,13 +1759,10 @@ static bool bif_iso_nl_0(query *q)
 	if (str->binary)
 		return throw_error(q, q->st.instr, q->st.cur_ctx, "permission_error", "output,binary_stream");
 
-	fputc('\n', str->fp);
-	int err = fflush(str->fp);
+	if (!write_all(q, str, "\n", 1))
+		return throw_stream_gone(q, str);
 
-	if ((err == EOF) && !str->is_socket)
-		return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-
-	return !ferror(str->fp);
+	return flush_or_throw(q, str);
 }
 
 static bool bif_iso_nl_1(query *q)
@@ -1436,18 +1777,15 @@ static bool bif_iso_nl_1(query *q)
 	if (str->binary)
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "output,binary_stream");
 
-	fputc('\n', str->fp);
-	int err = fflush(str->fp);
+	if (!write_all(q, str, "\n", 1))
+		return throw_stream_gone(q, str);
 
-	if ((err == EOF) && !str->is_socket)
-		return throw_error(q, pstr, pstr_ctx, "io_error", strerror(errno));
-
-	return !ferror(str->fp);
+	return flush_or_throw(q, str);
 }
 
 static bool bif_iso_read_1(query *q)
 {
-	CHECKED(check_frame(q, MAX_ARITY));
+	CHECKED(check_frame(q, MAX_VARS));
 	GET_FIRST_ARG(p1,any);
 	int n = q->pl->current_input;
 	stream *str = &q->pl->streams[n];
@@ -1463,13 +1801,13 @@ static bool bif_iso_read_1(query *q)
 
 static bool bif_iso_read_2(query *q)
 {
-	CHECKED(check_frame(q, MAX_ARITY));
+	CHECKED(check_frame(q, MAX_VARS));
 	GET_FIRST_ARG(pstr,stream_or_alias);
 	int n = get_stream(q, pstr);
 	stream *str = &q->pl->streams[n];
 	GET_NEXT_ARG(p1,any);
 
-	if (strcmp(str->mode, "read"))
+	if (strcmp(str->mode, "read") && strcmp(str->mode, "update"))
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "input,stream");
 
 	if (str->binary) {
@@ -1539,9 +1877,9 @@ static bool parse_read_params(query *q, stream *str, cell *c, pl_ctx c_ctx, cell
 			throw_error(q, c, c_ctx, "domain_error", "read_option");
 			return false;
 		}
-	} else if (!CMP_STRING_TO_CSTR(q, c, "positions") && (c->arity == 2) && str->fp) {
-		p->pos_start = ftello(str->fp);
-	} else if (!CMP_STRING_TO_CSTR(q, c, "line_counts") && (c->arity == 2)) {
+	} else if (!CMP_STRING_TO_CSTR(q, c, "positions") && (get_arity(c) == 2) && str->fp_out) {
+		p->pos_start = stream_tell(str);
+	} else if (!CMP_STRING_TO_CSTR(q, c, "line_counts") && (get_arity(c) == 2)) {
 	} else {
 		throw_error(q, c, c_ctx, "domain_error", "read_option");
 		return false;
@@ -1556,10 +1894,17 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 		str->p = parser_create(q->st.m);
 		CHECKED(str->p);
 		str->p->flags = q->st.m->flags;
-		str->p->fp = str->fp;
+		str->p->fp = str->is_string ? NULL : str->fp;
+		str->p->strm = str->is_string ? str : NULL;
+		str->p->is_socket = str->is_socket && !str->ssl;
 		if (q->top) str->p->no_fp = q->top->no_fp;
 	} else
 		parser_reset(str->p);
+
+	// str->p is reused across calls, possibly by a different query on a
+	// long-lived stream, so refresh this every call rather than only
+	// where the parser is first created.
+	str->p->q = q;
 
 	str->p->do_read_term = true;
 	str->p->one_shot = true;
@@ -1568,10 +1913,10 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 	cell *p21 = p2;
 	pl_ctx p21_ctx = p2_ctx;
 
-	LIST_HANDLER(p21);
+	PROLOG_LIST_HANDLER(p21);
 
 	while (is_list(p21)) {
-		cell *h = LIST_HEAD(p21);
+		cell *h = PROLOG_LIST_HEAD(p21);
 		h = deref(q, h, p21_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
@@ -1581,7 +1926,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 		if (!parse_read_params(q, str, h, h_ctx, &vars, &vars_ctx, &varnames, &varnames_ctx, &sings, &sings_ctx))
 			return true;
 
-		p21 = LIST_TAIL(p21);
+		p21 = PROLOG_LIST_TAIL(p21);
 		p21 = deref(q, p21, p21_ctx);
 		p21_ctx = q->latest_ctx;
 	}
@@ -1592,57 +1937,63 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 	if (!is_nil(p21))
 		return throw_error(q, p2, p2_ctx, "type_error", "list");
 
-	if (!src && !str->p->srcptr && str->fp) {
-		if (str->p->no_fp || getline(&str->p->save_line, &str->p->n_line, str->fp) == -1) {
-			if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-				clearerr(str->fp);
-				return do_yield(q, 1);
+	if (!src && !str->p->srcptr && str->fp_in) {
+		if (str->p->no_fp || tpl_getline(&str->p->save_line, &str->p->n_line, q, str) == -1) {
+			if (q->is_task && !stream_eof(str) && stream_error(str)) {
+				stream_clearerr(str);
+				return do_yield_on_stream(q, str, false);
+			}
+
+			if (errno == EINTR) {
+				stream_clearerr(str);
+				return throw_timeout(q);
 			}
 
 			str->p->srcptr = "";
 		} else
 			str->p->srcptr = str->p->save_line;
-
-		if (errno == EINTR)
-			return false;
 	}
 
 	if (str->p->srcptr) {
+		errno = 0;	// FIX: reset before parse read so a stale EINTR isn't misread
 		char *src = (char*)eat_space(str->p);
 
+		if (errno == EINTR) {
+			stream_clearerr(str);
+			return throw_timeout(q);
+		}
+
 		if (str->p->error)
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "syntax_error", str->p->error_desc?str->p->error_desc:"read_term");
+			return throw_error(q, q->st.instr, q->st.cur_ctx,
+				str->p->error_type?str->p->error_type:"syntax_error",
+				str->p->error_desc?str->p->error_desc:"read_term");
 
 		str->p->line_num_start = str->p->line_num;
 		str->p->srcptr = src;
 	}
 
 	for (;;) {
-#if 0
-		if (isatty(fileno(str->fp)) && !src) {
-			fprintf(str->fp, "%s", PROMPT);
-			fflush(str->fp);
-		}
-#endif
-
 		if (!src && (!str->p->srcptr || !*str->p->srcptr || (*str->p->srcptr == '\n'))) {
 			if (str->p->srcptr && (*str->p->srcptr == '\n'))
 				str->p->line_num++;
 
-			if (str->fp && (str->p->no_fp || (getline(&str->p->save_line, &str->p->n_line, str->fp) == -1))) {
-				if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-					clearerr(str->fp);
-					return do_yield(q, 1);
+			if (str->fp && (
+				str->p->no_fp || (tpl_getline(&str->p->save_line, &str->p->n_line, q, str) == -1))) {
+				if (q->is_task && !stream_eof(str) && stream_error(str)) {
+					stream_clearerr(str);
+					return do_yield_on_stream(q, str, false);
 				}
 
-				if (errno == EINTR)
-					return false;
+				if (errno == EINTR) {
+					stream_clearerr(str);
+					return throw_timeout(q);
+				}
 
 				str->p->srcptr = "";
 				str->at_end_of_file = str->eof_action != eof_action_reset;
 
 				if (str->eof_action == eof_action_reset)
-					clearerr(str->fp);
+					stream_clearerr(str);
 
 				if (vars)
 					if (!unify(q, vars, vars_ctx, make_nil(), q->st.cur_ctx))
@@ -1658,17 +2009,17 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 
 				cell *p22 = p2;
 				pl_ctx p22_ctx = p2_ctx;
-				LIST_HANDLER(p22);
+				PROLOG_LIST_HANDLER(p22);
 
 				while (is_list(p22)) {
-					cell *h = LIST_HEAD(p22);
+					cell *h = PROLOG_LIST_HEAD(p22);
 					h = deref(q, h, p22_ctx);
 					pl_ctx h_ctx = q->latest_ctx;
 
 					if (is_var(h))
 						return throw_error(q, p2, p2_ctx, "instantiation_error", "read_option");
 
-					if (!CMP_STRING_TO_CSTR(q, h, "positions") && (h->arity == 2)) {
+					if (!CMP_STRING_TO_CSTR(q, h, "positions") && (get_arity(h) == 2)) {
 						cell *p = h+1;
 						p = deref(q, p, h_ctx);
 						pl_ctx p_ctx = q->latest_ctx;
@@ -1678,9 +2029,9 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 						p = h+2;
 						p = deref(q, p, h_ctx);
 						p_ctx = q->latest_ctx;
-						make_int(&tmp, ftello(str->fp));
+						make_int(&tmp, stream_tell(str));
 						unify(q, p, p_ctx, &tmp, q->st.cur_ctx);
-					} else if (!CMP_STRING_TO_CSTR(q, h, "line_counts") && (h->arity == 2)) {
+					} else if (!CMP_STRING_TO_CSTR(q, h, "line_counts") && (get_arity(h) == 2)) {
 						cell *p = h+1;
 						p = deref(q, p, h_ctx);
 						pl_ctx p_ctx = q->latest_ctx;
@@ -1694,7 +2045,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 						unify(q, p, p_ctx, &tmp, q->st.cur_ctx);
 					}
 
-					p22 = LIST_TAIL(p22);
+					p22 = PROLOG_LIST_TAIL(p22);
 					p22 = deref(q, p22, p22_ctx);
 					p22_ctx = q->latest_ctx;
 				}
@@ -1727,35 +2078,40 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 
 		if (!str->p->fp || !isatty(fileno(str->p->fp))) {
 			void *save_fp = str->p->fp;
+			stream *save_strm = str->p->strm;
 			str->p->fp = NULL;
+			str->p->strm = NULL;
 
 			while (get_token(str->p, false, false)
 				&& SB_strlen(str->p->token) && SB_strcmp(str->p->token, ".")) {
 			}
 
 			str->p->fp = save_fp;
+			str->p->strm = save_strm;
 			str->p->did_getline = false;
 		}
 
 		str->p->do_read_term = false;
-		return throw_error(q, make_nil(), q->st.cur_ctx, "syntax_error", str->p->error_desc?str->p->error_desc:"read_term");
+		return throw_error(q, make_nil(), q->st.cur_ctx,
+			str->p->error_type?str->p->error_type:"syntax_error",
+			str->p->error_desc?str->p->error_desc:"read_term");
 	}
 
 	str->p->do_read_term = false;
 
 	cell *p22 = p2;
 	pl_ctx p22_ctx = p2_ctx;
-	LIST_HANDLER(p22);
+	PROLOG_LIST_HANDLER(p22);
 
 	while (is_list(p22)) {
-		cell *h = LIST_HEAD(p22);
+		cell *h = PROLOG_LIST_HEAD(p22);
 		h = deref(q, h, p22_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
 		if (is_var(h))
 			return throw_error(q, p2, p2_ctx, "instantiation_error", "read_option");
 
-		if (!CMP_STRING_TO_CSTR(q, h, "positions") && (h->arity == 2)) {
+		if (!CMP_STRING_TO_CSTR(q, h, "positions") && (get_arity(h) == 2)) {
 			cell *p = h+1;
 			p = deref(q, p, h_ctx);
 			pl_ctx p_ctx = q->latest_ctx;
@@ -1768,11 +2124,11 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 			p = h+2;
 			p = deref(q, p, h_ctx);
 			p_ctx = q->latest_ctx;
-			make_int(&tmp, ftello(str->fp));
+			make_int(&tmp, stream_tell(str));
 
 			if (!unify(q, p, p_ctx, &tmp, q->st.cur_ctx))
 				return false;
-		} else if (!CMP_STRING_TO_CSTR(q, h, "line_counts") && (h->arity == 2)) {
+		} else if (!CMP_STRING_TO_CSTR(q, h, "line_counts") && (get_arity(h) == 2)) {
 			cell *p = h+1;
 			p = deref(q, p, h_ctx);
 			pl_ctx p_ctx = q->latest_ctx;
@@ -1791,7 +2147,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 				return false;
 		}
 
-		p22 = LIST_TAIL(p22);
+		p22 = PROLOG_LIST_TAIL(p22);
 		p22 = deref(q, p22, p22_ctx);
 		p22_ctx = q->latest_ctx;
 	}
@@ -1802,7 +2158,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 		return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 	}
 
-	process_clause(str->p->m, str->p->cl, NULL);
+	process_clause(str->p->m, str->p->cl);
 
 	if (str->p->num_vars) {
 		if (create_vars(q, str->p->num_vars) < 0)
@@ -1826,7 +2182,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 
 			for (unsigned i = 0; i < q->tab_idx; i++) {
 				make_atom(tmp+idx, g_dot_s);
-				tmp[idx].arity = 2;
+				set_arity(&tmp[idx], 2);
 				tmp[idx++].num_cells = ((cnt-done)*2)+1;
 				cell v;
 				make_ref(&v, q->tabs[i].var_num, q->st.cur_ctx);
@@ -1835,7 +2191,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 			}
 
 			make_atom(tmp+idx++, g_nil_s);
-			tmp[0].arity = 2;
+			set_arity(&tmp[0], 2);
 			tmp[0].num_cells = idx;
 
 			cell *save = tmp;
@@ -1873,7 +2229,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 					continue;
 
 				make_atom(tmp+idx, g_dot_s);
-				tmp[idx].arity = 2;
+				set_arity(&tmp[idx], 2);
 				tmp[idx++].num_cells = ((cnt-done)*4)+1;
 				cell v;
 				make_instr(&v, g_unify_s, bif_iso_unify_2, 2, 2);
@@ -1887,7 +2243,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 			}
 
 			make_atom(tmp+idx++, g_nil_s);
-			tmp[0].arity = 2;
+			set_arity(&tmp[0], 2);
 			tmp[0].num_cells = idx;
 
 			cell *save = tmp;
@@ -1931,7 +2287,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 					continue;
 
 				make_atom(tmp+idx, g_dot_s);
-				tmp[idx].arity = 2;
+				set_arity(&tmp[idx], 2);
 				tmp[idx++].num_cells = ((cnt-done)*4)+1;
 				cell v;
 				make_instr(&v, g_unify_s, bif_iso_unify_2, 2, 2);
@@ -1945,7 +2301,7 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 			}
 
 			make_atom(tmp+idx++, g_nil_s);
-			tmp[0].arity = 2;
+			set_arity(&tmp[0], 2);
 			tmp[0].num_cells = idx;
 
 			cell *save = tmp;
@@ -1964,14 +2320,53 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 	cell *tmp = alloc_heap(q, str->p->cl->cidx-1);
 	CHECKED(tmp);
 	dup_cells(tmp, str->p->cl->cells, str->p->cl->cidx-1);
-	bool ok = unify(q, p1, p1_ctx, tmp, q->st.cur_ctx);
+
+	// A term that is only a variable may be bound by now, by the unifications above.
+
+	cell *t = deref(q, tmp, q->st.cur_ctx);
+	bool ok = unify(q, p1, p1_ctx, t, q->latest_ctx);
 	clear_clause(str->p->cl);
 	return ok;
 }
 
+struct retry_ctx_ { query *q; stream *str; };
+
+// Single-byte source for a non-task query reading a socket stream, which
+// is now always non-blocking (see bif_net.c) - so a plain tpl_getc() can
+// come back EOF/ferror on EAGAIN alone, with more data to come shortly.
+// Waits that out instead of taking it for real EOF or an error, and
+// instead of the caller ever blocking the OS thread inside fgetc() the
+// way a blocking-mode fd would. A task defers to its own existing
+// is_task/ferror check after the call, unchanged, so this returns
+// immediately without waiting when q->is_task. Passed to xgetc_utf8() as
+// its byte source (rather than tpl_getc directly) so a UTF-8 sequence
+// split across two reads gets the same treatment on every continuation
+// byte, not just the first.
+static int retry_getc(void *ctx0)
+{
+	struct retry_ctx_ *ctx = ctx0;
+	stream *str = ctx->str;
+	query *q = ctx->q;
+
+	for (;;) {
+		int ch = tpl_getc(str);
+
+		if ((ch != EOF) || q->is_task || stream_eof(str) || !stream_error(str) || (errno == EINTR))
+			return ch;
+
+		if ((errno != EAGAIN) && (errno != EWOULDBLOCK))
+			return ch;
+
+		stream_clearerr(str);
+
+		if (!tpl_wait_fd_readable(q, stream_fileno(str)))
+			return EOF;	// errno == EINTR, set by tpl_wait_fd_readable()
+	}
+}
+
 static bool bif_iso_read_term_2(query *q)
 {
-	CHECKED(check_frame(q, MAX_ARITY));
+	CHECKED(check_frame(q, MAX_VARS));
 	GET_FIRST_ARG(p1,any);
 	GET_NEXT_ARG(p2,list_or_nil);
 	int n = q->pl->current_input;
@@ -1988,7 +2383,7 @@ static bool bif_iso_read_term_2(query *q)
 
 static bool bif_iso_read_term_3(query *q)
 {
-	CHECKED(check_frame(q, MAX_ARITY));
+	CHECKED(check_frame(q, MAX_VARS));
 	GET_FIRST_ARG(pstr,stream_or_alias);
 	int n = get_stream(q, pstr);
 	stream *str = &q->pl->streams[n];
@@ -2022,13 +2417,7 @@ static bool bif_iso_write_1(query *q)
 	q->numbervars = true;
 	print_term_to_stream(q, str, p1, p1_ctx, 1);
 	q->numbervars = false;
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
-
-	return !ferror(str->fp);
+	return true;
 }
 
 static bool bif_iso_write_2(query *q)
@@ -2050,13 +2439,7 @@ static bool bif_iso_write_2(query *q)
 	q->numbervars = true;
 	print_term_to_stream(q, str, p1, p1_ctx, 1);
 	q->numbervars = false;
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
-
-	return !ferror(str->fp);
+	return true;
 }
 
 static bool bif_iso_writeq_1(query *q)
@@ -2076,13 +2459,7 @@ static bool bif_iso_writeq_1(query *q)
 	print_term_to_stream(q, str, p1, p1_ctx, 1);
 	q->numbervars = false;
 	q->quoted = 0;
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
-
-	return !ferror(str->fp);
+	return true;
 }
 
 static bool bif_iso_writeq_2(query *q)
@@ -2106,13 +2483,7 @@ static bool bif_iso_writeq_2(query *q)
 	print_term_to_stream(q, str, p1, p1_ctx, 1);
 	q->numbervars = false;
 	q->quoted = 0;
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
-
-	return !ferror(str->fp);
+	return true;
 }
 
 static bool bif_iso_write_canonical_1(query *q)
@@ -2127,14 +2498,8 @@ static bool bif_iso_write_canonical_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "output,binary_stream");
 	}
 
-	print_canonical(q, str->fp, p1, p1_ctx, 1);
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
-
-	return !ferror(str->fp);
+	print_canonical_to_stream(q, str, p1, p1_ctx, 1);
+	return true;
 }
 
 static bool bif_iso_write_canonical_2(query *q)
@@ -2153,14 +2518,8 @@ static bool bif_iso_write_canonical_2(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "output,binary_stream");
 	}
 
-	print_canonical(q, str->fp, p1, p1_ctx, 1);
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
-
-	return !ferror(str->fp);
+	print_canonical_to_stream(q, str, p1, p1_ctx, 1);
+	return true;
 }
 
 bool parse_write_params(query *q, cell *c, pl_ctx c_ctx, cell **vnames, pl_ctx *vnames_ctx)
@@ -2304,24 +2663,34 @@ bool parse_write_params(query *q, cell *c, pl_ctx c_ctx, cell **vnames, pl_ctx *
 			return false;
 		}
 
-		if (!is_list_or_nil(c1)) {
+		if (!is_iso_list_or_nil(c1)) {
 			throw_error(q, c, c_ctx, "domain_error", "write_option");
+			return false;
+		}
+
+		bool is_partial = false;
+
+		if (!check_list(q, c1, c1_ctx, &is_partial, NULL)) {
+			// Must return after throw: falling through re-throws from the
+			// element loop (issue #1090 — double error / write-after-error).
+			if (is_partial)
+				throw_error(q, c1, c1_ctx, "instantiation_error", "write_option");
+			else
+				throw_error(q, c, c_ctx, "domain_error", "write_option");
+
 			return false;
 		}
 
 		cell *c1_orig = c1;
 		pl_ctx c1_orig_ctx = c1_ctx;
 		bool any1 = false, any2 = false;
-		LIST_HANDLER(c1);
+		PROLOG_LIST_HANDLER(c1);
 
 		while (is_list(c1)) {
-			cell *h = LIST_HEAD(c1);
+			cell *h = PROLOG_LIST_HEAD(c1);
 			pl_ctx h_ctx = c1_ctx;
-
-			slot *e = NULL;
-			uint32_t save_vgen = 0;
-			int both = 0;
-			DEREF_VAR(any1, both, save_vgen, e, e->vgen, h, h_ctx, q->vgen);
+			h = deref(q, h, h_ctx);
+			h_ctx = q->latest_ctx;
 
 			if (is_var(h)) {
 				throw_error(q, h, h_ctx, "instantiation_error", "write_option");
@@ -2348,36 +2717,11 @@ bool parse_write_params(query *q, cell *c, pl_ctx c_ctx, cell **vnames, pl_ctx *
 					throw_error(q, c, c_ctx, "domain_error", "write_option");
 					return false;
 				}
-
-#if 0
-				cell *h2 = deref(q, h+2, h_ctx);
-
-				if (!is_var(h2)) {
-					throw_error(q, c, c_ctx, "domain_error", "write_option");
-					return false;
-				}
-#endif
 			}
 
-			c1 = LIST_TAIL(c1);
-
-			both = 0;
-			DEREF_VAR(any2, both, save_vgen, e, e->vgen, c1, c1_ctx, q->vgen);
-
-			if (both) {
-				throw_error(q, c, c_ctx, "domain_error", "write_option");
-				return false;
-			}
-		}
-
-		if (is_var(c1)) {
-			throw_error(q, c1_orig, c_ctx, "instantiation_error", "write_option");
-			return false;
-		}
-
-		if (!is_nil(c1)) {
-			throw_error(q, c, c_ctx, "domain_error", "write_option");
-			return false;
+			c1 = PROLOG_LIST_TAIL(c1);
+			c1 = deref(q, c1, h_ctx);
+			c1_ctx = q->latest_ctx;
 		}
 
 		if (vnames) *vnames = c1_orig;
@@ -2407,10 +2751,10 @@ static bool bif_iso_write_term_2(query *q)
 	q->numbervars = false;
 	cell *p2_orig = p2, *vnames = NULL;
 	pl_ctx p2_orig_ctx = p2_ctx, vnames_ctx = 0;
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_iso_list(p2)) {
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		h = deref(q, h, p2_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
@@ -2419,7 +2763,7 @@ static bool bif_iso_write_term_2(query *q)
 			return true;
 		}
 
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q, p2, p2_ctx);
 		p2_ctx = q->latest_ctx;
 	}
@@ -2447,24 +2791,21 @@ static bool bif_iso_write_term_2(query *q)
 		start(q2);
 		query_destroy(q2);
 		clear_write_options(q);
-		return !ferror(str->fp);
+		if (ferror(str->fp_out)) {
+			clearerr(str->fp_out);
+			return throw_stream_gone(q, str);
+		}
+
+		return true;
 	}
 
 	q->variable_names = vnames;
 	q->variable_names_ctx = vnames_ctx;
 
-	if (q->ignore_ops)
-		print_canonical_to_stream(q, str, p1, p1_ctx, 1);
-	else
-		print_term_to_stream(q, str, p1, p1_ctx, 1);
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
+	print_term_to_stream(q, str, p1, p1_ctx, 1);
 
 	clear_write_options(q);
-	return !ferror(str->fp);
+	return true;
 }
 
 static bool bif_iso_write_term_3(query *q)
@@ -2488,10 +2829,10 @@ static bool bif_iso_write_term_3(query *q)
 	q->numbervars = false;
 	cell *p2_orig = p2, *vnames = NULL;
 	pl_ctx p2_orig_ctx = p2_ctx, vnames_ctx;
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_iso_list(p2)) {
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		h = deref(q, h, p2_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
@@ -2500,7 +2841,7 @@ static bool bif_iso_write_term_3(query *q)
 			return true;
 		}
 
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q, p2, p2_ctx);
 		p2_ctx = q->latest_ctx;
 	}
@@ -2529,25 +2870,22 @@ static bool bif_iso_write_term_3(query *q)
 		start(q2);
 		query_destroy(q2);
 		clear_write_options(q);
-		return !ferror(str->fp);
+		if (ferror(str->fp_out)) {
+			clearerr(str->fp_out);
+			return throw_stream_gone(q, str);
+		}
+
+		return true;
 	}
 
 	q->latest_ctx = p1_ctx;
 	q->variable_names = vnames;
 	q->variable_names_ctx = vnames_ctx;
 
-	if (q->ignore_ops)
-		print_canonical_to_stream(q, str, p1, p1_ctx, 1);
-	else
-		print_term_to_stream(q, str, p1, p1_ctx, 1);
-
-	if (isatty(fileno(str->fp))) {
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
-	}
+	print_term_to_stream(q, str, p1, p1_ctx, 1);
 
 	clear_write_options(q);
-	return !ferror(str->fp);
+	return true;
 }
 
 static bool bif_iso_put_char_1(query *q)
@@ -2570,8 +2908,8 @@ static bool bif_iso_put_char_1(query *q)
 	int ch = get_char_utf8(&src);
 	char tmpbuf[MAX_BYTES_PER_CODEPOINT+1];
 	put_char_utf8(tmpbuf, ch);
-	net_write(tmpbuf, strlen(tmpbuf), str);
-	return !ferror(str->fp);
+	tpl_write(tmpbuf, strlen(tmpbuf), str);
+	return true;
 }
 
 static bool bif_iso_put_char_2(query *q)
@@ -2598,8 +2936,8 @@ static bool bif_iso_put_char_2(query *q)
 	int ch = get_char_utf8(&src);
 	char tmpbuf[MAX_BYTES_PER_CODEPOINT+1];
 	put_char_utf8(tmpbuf, ch);
-	net_write(tmpbuf, strlen(tmpbuf), str);
-	return !ferror(str->fp);
+	tpl_write(tmpbuf, strlen(tmpbuf), str);
+	return true;
 }
 
 static bool bif_iso_put_code_1(query *q)
@@ -2626,8 +2964,8 @@ static bool bif_iso_put_code_1(query *q)
 	int ch = (int)get_smallint(p1);
 	char tmpbuf[MAX_BYTES_PER_CODEPOINT+1];
 	put_char_utf8(tmpbuf, ch);
-	net_write(tmpbuf, strlen(tmpbuf), str);
-	return !ferror(str->fp);
+	tpl_write(tmpbuf, strlen(tmpbuf), str);
+	return true;
 }
 
 static bool bif_iso_put_code_2(query *q)
@@ -2658,8 +2996,8 @@ static bool bif_iso_put_code_2(query *q)
 	int ch = (int)get_smallint(p1);
 	char tmpbuf[MAX_BYTES_PER_CODEPOINT+1];
 	put_char_utf8(tmpbuf, ch);
-	net_write(tmpbuf, strlen(tmpbuf), str);
-	return !ferror(str->fp);
+	tpl_write(tmpbuf, strlen(tmpbuf), str);
+	return true;
 }
 
 static bool bif_iso_put_byte_1(query *q)
@@ -2686,8 +3024,8 @@ static bool bif_iso_put_byte_1(query *q)
 	int ch = (int)get_smallint(p1);
 	char tmpbuf[80];
 	snprintf(tmpbuf, sizeof(tmpbuf), "%c", ch);
-	net_write(tmpbuf, 1, str);
-	return !ferror(str->fp);
+	tpl_write(tmpbuf, 1, str);
+	return true;
 }
 
 static bool bif_iso_put_byte_2(query *q)
@@ -2715,9 +3053,90 @@ static bool bif_iso_put_byte_2(query *q)
 	int ch = (int)get_smallint(p1);
 	char tmpbuf[80];
 	snprintf(tmpbuf, sizeof(tmpbuf), "%c", ch);
-	net_write(tmpbuf, 1, str);
-	return !ferror(str->fp);
+	tpl_write(tmpbuf, 1, str);
+	return true;
 }
+
+// ISO 13211-1 8.12.1.3 i (and 8.12.2.3 i): "the entity input from the
+// stream is not a character". The culprit is what was read rather than
+// any argument, so the error context is just the offending goal...
+
+#define CHECK_UTF8_INPUT(q, str, ch)								\
+	if ((ch) == UTF8_INVALID) {										\
+		(str)->did_getc = false;									\
+		(str)->invalid_pending = false;								\
+		stream_clearerr(str);										\
+		return throw_error((q), (q)->st.instr, (q)->st.cur_ctx,		\
+			"representation_error", "character");					\
+	}
+
+// A peek must not consume what it reports on, but by the time the
+// sequence is known to be ill-formed its octets have been taken from
+// the underlying stream, and there is nowhere to put them back: ungetch
+// holds one decoded codepoint, and UTF8_INVALID is not one. Nor would a
+// single slot do, since an ill-formed sequence may be several octets.
+//
+// So the stream remembers instead that the character behind it is not a
+// character. A later peek throws again without reading anything, and
+// the get that finally takes it clears the flag - which is what
+// consuming "an entity that is not a character" amounts to. Repeated
+// peeks are then idempotent, as peeks should be.
+
+#define CHECK_UTF8_PEEK(q, str, ch)									\
+	if ((ch) == UTF8_INVALID) {										\
+		(str)->did_getc = false;									\
+		(str)->invalid_pending = true;								\
+		stream_clearerr(str);										\
+		return throw_error((q), (q)->st.instr, (q)->st.cur_ctx,		\
+			"representation_error", "character");					\
+	}
+
+// Peeking again at a sequence already known to be ill-formed...
+
+#define PEEK_UTF8_PENDING(q, str)									\
+	if ((str)->invalid_pending) {									\
+		return throw_error((q), (q)->st.instr, (q)->st.cur_ctx,		\
+			"representation_error", "character");					\
+	}
+
+// ...and reading it, which consumes it.
+
+#define GET_UTF8_PENDING(q, str)									\
+	if ((str)->invalid_pending) {									\
+		(str)->invalid_pending = false;								\
+		return throw_error((q), (q)->st.instr, (q)->st.cur_ctx,		\
+			"representation_error", "character");					\
+	}
+
+// A character may also come from the line the parser has already read
+// off the stream, and those bytes are the stream's bytes: an
+// ill-formed sequence among them is no more a character there than it
+// is when read directly (issue #1099). The liberal in-memory decoder
+// cannot say so - it decodes 0xff to 0, and the caller then reads on
+// past the buffer and reports the end of the file - so the buffer is
+// decoded strictly here too.
+//
+// Unlike the stream, the buffer can hold an ill-formed sequence back:
+// a peek simply does not advance srcptr, so repeated peeks throw
+// again on their own and there is no invalid_pending to remember.
+
+#define TAKE_BUFFERED_CHAR(q, str)									\
+	if (!(str)->ungetch && (str)->p								\
+		&& (str)->p->srcptr && *(str)->p->srcptr) {					\
+		int _ch = get_char_utf8_strict((const char**)&(str)->p->srcptr);	\
+		CHECK_UTF8_INPUT((q), (str), _ch);							\
+		(str)->ungetch = _ch;										\
+	}
+
+#define PEEK_BUFFERED_CHAR(q, str)									\
+	if (!(str)->ungetch && (str)->p								\
+		&& (str)->p->srcptr && *(str)->p->srcptr) {					\
+		int _ch = peek_char_utf8_strict((const char*)(str)->p->srcptr);	\
+		if (_ch == UTF8_INVALID)									\
+			return throw_error((q), (q)->st.instr, (q)->st.cur_ctx,	\
+				"representation_error", "character");				\
+		(str)->ungetch = _ch;										\
+	}
 
 static bool bif_iso_get_char_1(query *q)
 {
@@ -2737,26 +3156,30 @@ static bool bif_iso_get_char_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = get_char_utf8((const char**)&str->p->srcptr);
-			str->ungetch = ch;
-		}
+	GET_UTF8_PENDING(q, str);
+	TAKE_BUFFERED_CHAR(q, str);
+
+	if (stream_is_tty(str, str->fp_in) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+
+		if (fflush(str->fp_out))
+			return throw_error(q, q->st.instr, q->st.cur_ctx, "system_error", strerror(errno));
 	}
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
 
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
+
+	CHECK_UTF8_INPUT(q, str, ch);
 
 	str->did_getc = true;
 
@@ -2765,7 +3188,7 @@ static bool bif_iso_get_char_1(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_atom(&tmp, g_eof_s);
@@ -2810,26 +3233,30 @@ static bool bif_iso_get_char_2(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = get_char_utf8((const char**)&str->p->srcptr);
-			str->ungetch = ch;
-		}
+	GET_UTF8_PENDING(q, str);
+	TAKE_BUFFERED_CHAR(q, str);
+
+	if (stream_is_tty(str, str->fp) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+
+		if (fflush(str->fp_out))
+			return throw_error(q, q->st.instr, q->st.cur_ctx, "system_error", strerror(errno));
 	}
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
 
-		if (fflush(str->fp))
-			return throw_error(q, q->st.instr, q->st.cur_ctx, "io_error", strerror(errno));
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
+
+	CHECK_UTF8_INPUT(q, str, ch);
 
 	str->did_getc = true;
 
@@ -2838,7 +3265,7 @@ static bool bif_iso_get_char_2(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_atom(&tmp, g_eof_s);
@@ -2885,24 +3312,28 @@ static bool bif_iso_get_code_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = get_char_utf8((const char**)&str->p->srcptr);
-			str->ungetch = ch;
-		}
+	GET_UTF8_PENDING(q, str);
+	TAKE_BUFFERED_CHAR(q, str);
+
+	if (stream_is_tty(str, str->fp) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
+
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
+
+	CHECK_UTF8_INPUT(q, str, ch);
 
 	str->did_getc = true;
 
@@ -2911,7 +3342,7 @@ static bool bif_iso_get_code_1(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_int(&tmp, -1);
@@ -2946,7 +3377,7 @@ static bool bif_iso_get_code_2(query *q)
 	if (is_integer(p1) && (get_smallint(p1) < -1))
 		return throw_error(q, p1, p1_ctx, "representation_error", "in_character_code");
 
-	if (strcmp(str->mode, "read"))
+	if (strcmp(str->mode, "read") && strcmp(str->mode, "update"))
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "input,stream");
 
 	if (str->binary) {
@@ -2961,24 +3392,28 @@ static bool bif_iso_get_code_2(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = get_char_utf8((const char**)&str->p->srcptr);
-			str->ungetch = ch;
-		}
+	GET_UTF8_PENDING(q, str);
+	TAKE_BUFFERED_CHAR(q, str);
+
+	if (stream_is_tty(str, str->fp) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
+
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
+
+	CHECK_UTF8_INPUT(q, str, ch);
 
 	str->did_getc = true;
 
@@ -2987,7 +3422,7 @@ static bool bif_iso_get_code_2(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_int(&tmp, -1);
@@ -3033,16 +3468,22 @@ static bool bif_iso_get_byte_1(query *q)
 		}
 	}
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	int ch = str->ungetch ? str->ungetch : net_getc(str);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : retry_getc(&ctx);
 
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
+
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
 
 	str->did_getc = true;
@@ -3052,7 +3493,7 @@ static bool bif_iso_get_byte_1(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_int(&tmp, -1);
@@ -3095,16 +3536,22 @@ static bool bif_iso_get_byte_2(query *q)
 		}
 	}
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	int ch = str->ungetch ? str->ungetch : net_getc(str);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : retry_getc(&ctx);
 
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
+
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
 
 	str->did_getc = true;
@@ -3114,7 +3561,7 @@ static bool bif_iso_get_byte_2(query *q)
 		str->at_end_of_file = str->eof_action != eof_action_reset;
 
 		if (str->eof_action == eof_action_reset)
-			clearerr(str->fp);
+			stream_clearerr(str);
 
 		cell tmp;
 		make_int(&tmp, -1);
@@ -3125,6 +3572,38 @@ static bool bif_iso_get_byte_2(query *q)
 	cell tmp;
 	make_int(&tmp, ch);
 	return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
+}
+
+// The argument is a character, not its code - the type check is
+// in_character - so the code point comes out of the atom the way
+// put_char/2 takes it. get_smallint() read the val_int arm of the
+// cell's union instead, which for an atom is its offset in the symbol
+// table: unget_char(S, a) pushed back U+6101, wherever 'a' happened to
+// sit.
+//
+// One character can be held back at a time, str->ungetch being a
+// single code point, so ungetting twice without an intervening read
+// keeps only the second.
+
+static bool do_unget_char(query *q, stream *str, cell *p1, pl_ctx p1_ctx)
+{
+	// in_character admits end_of_file, and a get_char/2 that reported
+	// it consumed nothing, so putting it back restores nothing: the
+	// stream is left exactly as it is, rather than having a genuine
+	// end-of-file state cleared under it.
+
+	if (!CMP_STRING_TO_CSTR(q, p1, "end_of_file"))
+		return true;
+
+	const char *src = C_STR(q, p1);
+
+	if (!*src)				// '' passes the type check but is no character
+		return throw_error(q, p1, p1_ctx, "type_error", "in_character");
+
+	str->did_getc = false;
+	str->at_end_of_file = false;
+	str->ungetch = get_char_utf8(&src);
+	return true;
 }
 
 static bool bif_unget_char_1(query *q)
@@ -3145,10 +3624,7 @@ static bool bif_unget_char_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	str->did_getc = false;
-	str->at_end_of_file = false;
-	str->ungetch = get_smallint(p1);
-	return true;
+	return do_unget_char(q, str, p1, p1_ctx);
 }
 
 static bool bif_unget_char_2(query *q)
@@ -3167,22 +3643,12 @@ static bool bif_unget_char_2(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,binary_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = get_char_utf8((const char**)&str->p->srcptr);
-			str->ungetch = ch;
-		}
-	}
+	// Nothing is read here, so there is no character to fetch ahead
+	// into str->ungetch first: the block that did consumed one out of
+	// the parser's line buffer and then had it overwritten below,
+	// losing it.
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
-	}
-
-	str->did_getc = false;
-	str->at_end_of_file = false;
-	str->ungetch = get_smallint(p1);
-	return true;
+	return do_unget_char(q, str, p1, p1_ctx);
 }
 
 static bool bif_unget_code_1(query *q)
@@ -3222,7 +3688,7 @@ static bool bif_unget_code_2(query *q)
 	if (is_integer(p1) && (get_smallint(p1) < -1))
 		return throw_error(q, p1, p1_ctx, "representation_error", "in_character_code");
 
-	if (strcmp(str->mode, "read"))
+	if (strcmp(str->mode, "read") && strcmp(str->mode, "update"))
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "input,stream");
 
 	if (str->binary) {
@@ -3295,26 +3761,27 @@ static bool bif_iso_peek_char_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = peek_char_utf8((const char*)str->p->srcptr);
-			str->ungetch = ch;
-		}
+	PEEK_UTF8_PENDING(q, str);
+	PEEK_BUFFERED_CHAR(q, str);
+
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
+
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
 
-	if (errno == EINTR)
-		return false;
+	CHECK_UTF8_PEEK(q, str, ch);
 
 	if (FEOF(str)) {
 		str->did_getc = false;
-		clearerr(str->fp);
+		stream_clearerr(str);
 		cell tmp;
 		make_atom(&tmp, g_eof_s);
 		return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
@@ -3335,7 +3802,7 @@ static bool bif_iso_peek_char_2(query *q)
 	stream *str = &q->pl->streams[n];
 	GET_NEXT_ARG(p1,in_character_or_var);
 
-	if (strcmp(str->mode, "read"))
+	if (strcmp(str->mode, "read") && strcmp(str->mode, "update"))
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "input,stream");
 
 	if (str->binary) {
@@ -3350,26 +3817,27 @@ static bool bif_iso_peek_char_2(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = peek_char_utf8((const char*)str->p->srcptr);
-			str->ungetch = ch;
-		}
+	PEEK_UTF8_PENDING(q, str);
+	PEEK_BUFFERED_CHAR(q, str);
+
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
+
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (errno == EINTR)
-		return false;
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
+
+	CHECK_UTF8_PEEK(q, str, ch);
 
 	if (FEOF(str)) {
 		str->did_getc = false;
-		clearerr(str->fp);
+		stream_clearerr(str);
 		cell tmp;
 		make_atom(&tmp, g_eof_s);
 		return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
@@ -3407,23 +3875,27 @@ static bool bif_iso_peek_code_1(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = peek_char_utf8((const char*)str->p->srcptr);
-			str->ungetch = ch;
-		}
+	PEEK_UTF8_PENDING(q, str);
+	PEEK_BUFFERED_CHAR(q, str);
+
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
+
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
+
+	CHECK_UTF8_PEEK(q, str, ch);
 
 	if (FEOF(str)) {
 		str->did_getc = false;
-		clearerr(str->fp);
+		stream_clearerr(str);
 		cell tmp;
 		make_int(&tmp, -1);
 		return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
@@ -3448,7 +3920,7 @@ static bool bif_iso_peek_code_2(query *q)
 	if (is_integer(p1) && (get_smallint(p1) < -1))
 		return throw_error(q, p1, p1_ctx, "representation_error", "in_character_code");
 
-	if (strcmp(str->mode, "read"))
+	if (strcmp(str->mode, "read") && strcmp(str->mode, "update"))
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "input,stream");
 
 	if (str->binary) {
@@ -3463,23 +3935,27 @@ static bool bif_iso_peek_code_2(query *q)
 		return throw_error(q, &tmp, q->st.cur_ctx, "permission_error", "input,past_end_of_stream");
 	}
 
-	if (!str->ungetch && str->p) {
-		if (str->p->srcptr && *str->p->srcptr) {
-			int ch = peek_char_utf8((const char*)str->p->srcptr);
-			str->ungetch = ch;
-		}
+	PEEK_UTF8_PENDING(q, str);
+	PEEK_BUFFERED_CHAR(q, str);
+
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : xgetc_utf8(retry_getc, &ctx);
+
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
 	}
 
-	int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
-
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
+
+	CHECK_UTF8_PEEK(q, str, ch);
 
 	if (FEOF(str)) {
 		str->did_getc = false;
-		clearerr(str->fp);
+		stream_clearerr(str);
 		cell tmp;
 		make_int(&tmp, -1);
 		return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
@@ -3516,15 +3992,21 @@ static bool bif_iso_peek_byte_1(query *q)
 		}
 	}
 
-	int ch = str->ungetch ? str->ungetch : net_getc(str);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : retry_getc(&ctx);
 
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
+
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
 
 	if (FEOF(str)) {
-		clearerr(str->fp);
+		stream_clearerr(str);
 		cell tmp;
 		make_int(&tmp, -1);
 		return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
@@ -3543,7 +4025,7 @@ static bool bif_iso_peek_byte_2(query *q)
 	stream *str = &q->pl->streams[n];
 	GET_NEXT_ARG(p1,in_byte_or_var);
 
-	if (strcmp(str->mode, "read"))
+	if (strcmp(str->mode, "read") && strcmp(str->mode, "update"))
 		return throw_error(q, pstr, q->st.cur_ctx, "permission_error", "input,stream");
 
 	if (!str->binary) {
@@ -3565,15 +4047,21 @@ static bool bif_iso_peek_byte_2(query *q)
 		}
 	}
 
-	int ch = str->ungetch ? str->ungetch : net_getc(str);
+	struct retry_ctx_ ctx = { q, str };
+	int ch = str->ungetch ? str->ungetch : retry_getc(&ctx);
 
-	if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-		clearerr(str->fp);
-		return do_yield(q, 1);
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
+
+	if (q->is_task && !stream_eof(str) && stream_error(str)) {
+		stream_clearerr(str);
+		return do_yield_on_stream(q, str, false);
 	}
 
 	if (FEOF(str)) {
-		clearerr(str->fp);
+		stream_clearerr(str);
 		cell tmp;
 		make_int(&tmp, -1);
 		return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
@@ -3680,15 +4168,17 @@ static bool bif_iso_set_stream_position_2(query *q)
 
 	off_t pos = get_smallint(p1);
 
-	if (fseeko(str->fp, pos, SEEK_SET))
+	if (fseeko(str->fp_out, pos, SEEK_SET))
 		return throw_error(q, p1, p1_ctx, "domain_error", "position");
 
+	str->ungetch = 0;
+	str->invalid_pending = false;
 	return true;
 }
 
 static bool bif_sys_read_term_from_chars_4(query *q)
 {
-	CHECKED(check_frame(q, MAX_ARITY));
+	CHECKED(check_frame(q, MAX_VARS));
 	GET_FIRST_ARG(p_term,any);
 	GET_NEXT_ARG(p_opts,list_or_nil);
 	GET_NEXT_ARG(p_chars,any);
@@ -3725,6 +4215,14 @@ static bool bif_sys_read_term_from_chars_4(query *q)
 	}
 
 	str->p = parser_create(q->st.m);
+
+	if (!str->p) {
+		if (!is_string(p_chars))
+			TPL_free(src);
+
+		return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
+	}
+
 	str->p->flags = q->st.m->flags;
 	str->p->fp = str->fp;
 	parser_reset(str->p);
@@ -3748,11 +4246,21 @@ static bool bif_sys_read_term_from_chars_4(query *q)
 		return false;
 	}
 
+	errno = 0;	// FIX: reset before parse read so a stale EINTR isn't misread
 	char *rest = str->p->srcptr = eat_space(str->p);
 
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
+
 	if (str->p->error) {
+		// Note: grab these before the parser (and its strings) go away...
+		const char *error_type = str->p->error_type?str->p->error_type:"syntax_error";
+		const char *error_desc = str->p->error_desc?str->p->error_desc:"read_term";
 		parser_destroy(str->p);
-		return throw_error(q, q->st.instr, q->st.cur_ctx, "syntax_error", str->p->error_desc?str->p->error_desc:"read_term");
+		str->p = NULL;
+		return throw_error(q, q->st.instr, q->st.cur_ctx, error_type, error_desc);
 	}
 
 	cell tmp;
@@ -3782,7 +4290,7 @@ static bool bif_sys_read_term_from_chars_4(query *q)
 
 static bool bif_read_term_from_chars_3(query *q)
 {
-	CHECKED(check_frame(q, MAX_ARITY));
+	CHECKED(check_frame(q, MAX_VARS));
 	GET_FIRST_ARG(p_chars,any);
 	GET_NEXT_ARG(p_term,any);
 	GET_NEXT_ARG(p_opts,list_or_nil);
@@ -3821,6 +4329,12 @@ static bool bif_read_term_from_chars_3(query *q)
 	}
 
 	str->p = parser_create(q->st.m);
+
+	if (!str->p) {
+		TPL_free(src);
+		return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
+	}
+
 	str->p->flags = q->st.m->flags;
 	str->p->fp = str->fp;
 	parser_reset(str->p);
@@ -3837,7 +4351,7 @@ static bool bif_read_term_from_chars_3(query *q)
 
 	const char *end_ptr = src + strlen(src) - 1;
 
-	while (isspace(*end_ptr) && (end_ptr != src))
+	while (isspace((unsigned char)*end_ptr) && (end_ptr != src))
 		end_ptr--;
 
 	if (src[strlen(src)-1] != '.')
@@ -3856,7 +4370,7 @@ static bool bif_read_term_from_chars_3(query *q)
 
 static bool bif_read_term_from_atom_3(query *q)
 {
-	CHECKED(check_frame(q, MAX_ARITY));
+	CHECKED(check_frame(q, MAX_VARS));
 	GET_FIRST_ARG(p_chars,any);
 	GET_NEXT_ARG(p_term,any);
 	GET_NEXT_ARG(p_opts,list_or_nil);
@@ -3880,9 +4394,16 @@ static bool bif_read_term_from_atom_3(query *q)
 	} else
 		return throw_error(q, p_chars, p_chars_ctx, "type_error", "atom");
 
+	if (!src || !*src) {	// FIX: guard empty input like sibling bif_read_term_from_chars_3
+		TPL_free(src);
+		cell tmp;
+		make_atom(&tmp, g_eof_s);
+		return unify(q, p_term, p_term_ctx, &tmp, q->st.cur_ctx);
+	}
+
 	const char *end_ptr = src + strlen(src) - 1;
 
-	while (isspace(*end_ptr) && (end_ptr != src))
+	while (isspace((unsigned char)*end_ptr) && (end_ptr != src))
 		end_ptr--;
 
 	if (src[strlen(src)-1] != '.')
@@ -3902,14 +4423,14 @@ static bool bif_write_term_to_atom_3(query *q)
 	cell *vnames = NULL;
 	pl_ctx vnames_ctx = 0;
 	q->flags = q->st.m->flags;
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_iso_list(p2)) {
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		h = deref(q, h, p2_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 		parse_write_params(q, h, h_ctx, &vnames, &vnames_ctx);
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q, p2, p2_ctx);
 		p2_ctx = q->latest_ctx;
 	}
@@ -3934,14 +4455,14 @@ static bool bif_write_term_to_chars_3(query *q)
 	cell *vnames = NULL;
 	pl_ctx vnames_ctx = 0;
 	q->flags = q->st.m->flags;
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_iso_list(p2)) {
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		h = deref(q, h, p2_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 		parse_write_params(q, h, h_ctx, &vnames, &vnames_ctx);
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q, p2, p2_ctx);
 		p2_ctx = q->latest_ctx;
 	}
@@ -3966,14 +4487,14 @@ static bool bif_write_canonical_to_chars_3(query *q)
 	cell *vnames = NULL;
 	pl_ctx vnames_ctx = 0;
 	q->flags = q->st.m->flags;
-	LIST_HANDLER(p2);
+	PROLOG_LIST_HANDLER(p2);
 
 	while (is_list(p2)) {
-		cell *h = LIST_HEAD(p2);
+		cell *h = PROLOG_LIST_HEAD(p2);
 		h = deref(q, h, p2_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 		parse_write_params(q, h, h_ctx, &vnames, &vnames_ctx);
-		p2 = LIST_TAIL(p2);
+		p2 = PROLOG_LIST_TAIL(p2);
 		p2 = deref(q, p2, p2_ctx);
 		p2_ctx = q->latest_ctx;
 	}
@@ -3997,17 +4518,23 @@ static bool bif_edin_redo_1(query *q)
 	if (is_bigint(p1))
 		return throw_error(q, p1, p1_ctx, "domain_error", "small_integer_range");
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
 	for (;;) {
 		str->did_getc = true;
-		int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
+		struct retry_ctx_ ctx = { q, str };
+		int ch = str->ungetch ? str->ungetch : xgetc_utf8_lax(retry_getc, &ctx);
 		str->ungetch = 0;
 
-		if (feof(str->fp)) {
+		if (errno == EINTR) {
+			stream_clearerr(str);
+			return throw_timeout(q);
+		}
+
+		if (stream_eof(str)) {
 			str->did_getc = false;
 			break;
 		} else if (ch == '\n')
@@ -4030,17 +4557,23 @@ static bool bif_edin_redo_2(query *q)
 	if (is_bigint(p1))
 		return throw_error(q, p1, p1_ctx, "domain_error", "small_integer_range");
 
-	if (isatty(fileno(str->fp)) && !str->did_getc && !str->ungetch) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp) && !str->did_getc && !str->ungetch) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
 	for (;;) {
 		str->did_getc = true;
-		int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
+		struct retry_ctx_ ctx = { q, str };
+		int ch = str->ungetch ? str->ungetch : xgetc_utf8_lax(retry_getc, &ctx);
 		str->ungetch = 0;
 
-		if (feof(str->fp)) {
+		if (errno == EINTR) {
+			stream_clearerr(str);
+			return throw_timeout(q);
+		}
+
+		if (stream_eof(str)) {
 			str->did_getc = false;
 			break;
 		} else if (ch == '\n')
@@ -4064,17 +4597,26 @@ static bool bif_edin_tab_1(query *q)
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
 
-	for (int i = 0; i < get_smallint(&p1); i++)
-		fputc(' ', str->fp);
+	if (resuming_write(q, str))
+		return write_all(q, str, NULL, 0);
 
-	fflush(str->fp);
-	return !ferror(str->fp);
+	int cnt = get_smallint(&p1);
+
+	if (cnt <= 0)
+		return true;
+
+	char *buf = TPL_malloc(cnt);
+	CHECKED(buf);
+	memset(buf, ' ', cnt);
+	bool ok = write_all(q, str, buf, cnt);
+	TPL_free(buf);
+	return ok ? flush_or_throw(q, str) : false;
 }
 
 static bool bif_edin_tab_2(query *q)
 {
 	GET_FIRST_ARG(pstr,stream_or_alias);
-	GET_FIRST_ARG(p1_tmp,any);
+	GET_NEXT_ARG(p1_tmp,any);
 	cell p1 = eval(q, p1_tmp);
 
 	if (!is_integer(&p1))
@@ -4083,11 +4625,20 @@ static bool bif_edin_tab_2(query *q)
 	int n = get_stream(q, pstr);
 	stream *str = &q->pl->streams[n];
 
-	for (int i = 0; i < get_smallint(&p1); i++)
-		fputc(' ', str->fp);
+	if (resuming_write(q, str))
+		return write_all(q, str, NULL, 0);
 
-	fflush(str->fp);
-	return !ferror(str->fp);
+	int cnt = get_smallint(&p1);
+
+	if (cnt <= 0)
+		return true;
+
+	char *buf = TPL_malloc(cnt);
+	CHECKED(buf);
+	memset(buf, ' ', cnt);
+	bool ok = write_all(q, str, buf, cnt);
+	TPL_free(buf);
+	return ok ? flush_or_throw(q, str) : false;
 }
 
 static bool bif_edin_seen_0(query *q)
@@ -4098,10 +4649,16 @@ static bool bif_edin_seen_0(query *q)
 	if (n < 3)
 		return true;
 
-	if ((str->fp != stdin)
+	if (str->is_string) {
+		SB_free(str->sb);
+	} else if ((str->fp != stdin)
 		&& (str->fp != stdout)
-		&& (str->fp != stderr))
-		fclose(str->fp);
+		&& (str->fp != stderr)) {
+		fclose(str->fp_in);
+
+		if (str->fp_out != str->fp_in)
+			fclose(str->fp_out);
+	}
 
 	sl_destroy(str->alias);
 	TPL_free(str->filename);
@@ -4121,8 +4678,12 @@ static bool bif_edin_told_0(query *q)
 
 	if ((str->fp != stdin)
 		&& (str->fp != stdout)
-		&& (str->fp != stderr))
-		fclose(str->fp);
+		&& (str->fp != stderr)) {
+		fclose(str->fp_in);
+
+		if (str->fp_out != str->fp_in)
+			fclose(str->fp_out);
+	}
 
 	sl_destroy(str->alias);
 	TPL_free(str->filename);
@@ -4171,17 +4732,22 @@ static bool bif_read_line_to_string_2(query *q)
 	char *line = NULL;
 	size_t len = 0;
 
-	if (isatty(fileno(str->fp))) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp)) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	if (net_getline(&line, &len, str) == -1) {
+	if (tpl_getline(&line, &len, q, str) == -1) {
 		TPL_free(line);
 
-		if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-			clearerr(str->fp);
-			return do_yield(q, 1);
+		if (q->is_task && !stream_eof(str) && stream_error(str)) {
+			stream_clearerr(str);
+			return do_yield_on_stream(q, str, false);
+		}
+
+		if (errno == EINTR) {
+			stream_clearerr(str);
+			return throw_timeout(q);
 		}
 
 		cell tmp;
@@ -4190,8 +4756,10 @@ static bool bif_read_line_to_string_2(query *q)
 	}
 
 
-	if (errno == EINTR)
-		return false;
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
 
 	len = strlen(line);
 
@@ -4222,17 +4790,22 @@ static bool bif_read_line_to_codes_2(query *q)
 	char *line = NULL;
 	size_t len = 0;
 
-	if (isatty(fileno(str->fp))) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp)) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	if (net_getline(&line, &len, str) == -1) {
+	if (tpl_getline(&line, &len, q, str) == -1) {
 		TPL_free(line);
 
-		if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-			clearerr(str->fp);
-			return do_yield(q, 1);
+		if (q->is_task && !stream_eof(str) && stream_error(str)) {
+			stream_clearerr(str);
+			return do_yield_on_stream(q, str, false);
+		}
+
+		if (errno == EINTR) {
+			stream_clearerr(str);
+			return throw_timeout(q);
 		}
 
 		cell tmp;
@@ -4241,8 +4814,10 @@ static bool bif_read_line_to_codes_2(query *q)
 	}
 
 
-	if (errno == EINTR)
-		return false;
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
 
 	len = strlen(line);
 
@@ -4285,16 +4860,16 @@ static bool bif_read_file_to_string_3(query *q)
 		filename = src = DUP_STRING(q, p1);
 
 	bool bom_specified = false, use_bom = false, is_binary = false;
-	LIST_HANDLER(p3);
+	PROLOG_LIST_HANDLER(p3);
 
 	while (is_list(p3)) {
-		cell *h = LIST_HEAD(p3);
+		cell *h = PROLOG_LIST_HEAD(p3);
 		cell *c = deref(q, h, p3_ctx);
 
 		if (is_var(c))
 			return throw_error(q, c, q->latest_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 
-		if (is_compound(c) && (c->arity == 1)) {
+		if (is_compound(c) && (get_arity(c) == 1)) {
 			cell *name = c + 1;
 			name = deref(q, name, q->latest_ctx);
 
@@ -4316,7 +4891,7 @@ static bool bif_read_file_to_string_3(query *q)
 		} else
 			return throw_error(q, c, q->latest_ctx, "domain_error", "stream_option");
 
-		p3 = LIST_TAIL(p3);
+		p3 = PROLOG_LIST_TAIL(p3);
 		p3 = deref(q, p3, p3_ctx);
 		p3_ctx = q->latest_ctx;
 
@@ -4346,6 +4921,7 @@ static bool bif_read_file_to_string_3(query *q)
 	struct stat st = {0};
 
 	if (fstat(fileno(fp), &st)) {
+		fclose(fp);	// FIX: don't leak fp on fstat failure
 		return false;
 	}
 
@@ -4359,7 +4935,7 @@ static bool bif_read_file_to_string_3(query *q)
 		return throw_error(q, p1, p1_ctx, "domain_error", "cannot_read");
 	}
 
-	s[st.st_size] = '\0';
+	s[len] = '\0';	// FIX: buffer is (st_size-offset)+1; s[st.st_size] overruns by 'offset' bytes when a BOM is present
 	fclose(fp);
 	cell tmp;
 	make_stringn(&tmp, s, len);
@@ -4399,6 +4975,7 @@ bool do_load_file(query *q, cell *p1, pl_ctx p1_ctx)
 		return throw_error(q, p1, p1_ctx, "type_error", "atom");
 
 	module *tmp_m = module_create(q->pl, C_STR(q, mod));
+	CHECKED(tmp_m);
 	char *src = DUP_STRING(q, file);
 	char *filename = relative_to(q->st.m->filename, src);
 	TPL_free(src);
@@ -4453,17 +5030,17 @@ static bool bif_load_files_2(query *q)
 	if (is_atom(p1))
 		return do_load_file(q, p1, p1_ctx);
 
-	LIST_HANDLER(p1);
+	PROLOG_LIST_HANDLER(p1);
 
 	while (is_list(p1)) {
-		cell *h = LIST_HEAD(p1);
+		cell *h = PROLOG_LIST_HEAD(p1);
 		cell *c = deref(q, h, p1_ctx);
 		pl_ctx c_ctx = q->latest_ctx;
 
 		if (!do_load_file(q, c, c_ctx))
 			return false;
 
-		p1 = LIST_TAIL(p1);
+		p1 = PROLOG_LIST_TAIL(p1);
 		p1 = deref(q, p1, p1_ctx);
 		p1_ctx = q->latest_ctx;
 	}
@@ -4478,17 +5055,17 @@ static bool bif_unload_files_1(query *q)
 	if (is_atom(p1))
 		return do_unload_file(q, p1, p1_ctx);
 
-	LIST_HANDLER(p1);
+	PROLOG_LIST_HANDLER(p1);
 
 	while (is_list(p1)) {
-		cell *h = LIST_HEAD(p1);
+		cell *h = PROLOG_LIST_HEAD(p1);
 		cell *c = deref(q, h, p1_ctx);
 		pl_ctx c_ctx = q->latest_ctx;
 
 		if (!do_unload_file(q, c, c_ctx))
 			return false;
 
-		p1 = LIST_TAIL(p1);
+		p1 = PROLOG_LIST_TAIL(p1);
 		p1 = deref(q, p1, p1_ctx);
 		p1_ctx = q->latest_ctx;
 	}
@@ -4523,7 +5100,7 @@ static bool bif_savefile_2(query *q)
 		filename = DUP_STRING(q, p1);
 
 	FILE *fp = fopen(filename, "wb");
-	CHECKED(fp);
+	CHECKED(fp, TPL_free(filename));	// FIX: free filename if open fails
 	fwrite(C_STR(q, p2), 1, C_STRLEN(q, p2), fp);
 	fclose(fp);
 	TPL_free(filename);
@@ -4564,6 +5141,7 @@ static bool bif_loadfile_2(query *q)
 	struct stat st = {0};
 
 	if (fstat(fileno(fp), &st)) {
+		fclose(fp);	// FIX: don't leak fp on fstat failure
 		return false;
 	}
 
@@ -4577,7 +5155,7 @@ static bool bif_loadfile_2(query *q)
 		return throw_error(q, p1, p1_ctx, "domain_error", "cannot_read");
 	}
 
-	s[st.st_size] = '\0';
+	s[len] = '\0';	// FIX: buffer is (st_size-offset)+1; s[st.st_size] overruns by 'offset' bytes when a BOM is present
 	fclose(fp);
 	cell tmp;
 
@@ -4625,7 +5203,7 @@ static bool bif_getfile_2(query *q)
 	size_t len = 0;
 	CHECKED(init_tmp_heap(q));
 
-	while (getline(&line, &len, fp) != -1) {
+	while (tpl_getline_fp(&line, &len, fp) != -1) {
 		int len = strlen(line);
 
 		if (len && (line[len-1] == '\n')) {
@@ -4654,10 +5232,10 @@ static bool bif_getfile_2(query *q)
 static bool get_terminator(query *q, cell *l, pl_ctx l_ctx)
 {
 	bool terminator = false;
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_iso_list(l)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = deref(q, h, l_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
@@ -4671,7 +5249,7 @@ static bool get_terminator(query *q, cell *l, pl_ctx l_ctx)
 			}
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = deref(q, l, l_ctx);
 		l_ctx = q->latest_ctx;
 	}
@@ -4682,10 +5260,10 @@ static bool get_terminator(query *q, cell *l, pl_ctx l_ctx)
 static bool get_empty(query *q, cell *l, pl_ctx l_ctx)
 {
 	bool empty = false;
-	LIST_HANDLER(l);
+	PROLOG_LIST_HANDLER(l);
 
 	while (is_iso_list(l)) {
-		cell *h = LIST_HEAD(l);
+		cell *h = PROLOG_LIST_HEAD(l);
 		h = deref(q, h, l_ctx);
 		pl_ctx h_ctx = q->latest_ctx;
 
@@ -4699,7 +5277,7 @@ static bool get_empty(query *q, cell *l, pl_ctx l_ctx)
 			}
 		}
 
-		l = LIST_TAIL(l);
+		l = PROLOG_LIST_TAIL(l);
 		l = deref(q, l, l_ctx);
 		l_ctx = q->latest_ctx;
 	}
@@ -4742,7 +5320,7 @@ static bool bif_getfile_3(query *q)
 	size_t len = 0;
 	CHECKED(init_tmp_heap(q));
 
-	while (getline(&line, &len, fp) != -1) {
+	while (tpl_getline_fp(&line, &len, fp) != -1) {
 		int len = strlen(line);
 
 		if (!terminator) {
@@ -4779,7 +5357,7 @@ static bool bif_getlines_1(query *q)
 	size_t len = 0;
 	CHECKED(init_tmp_heap(q));
 
-	while (getline(&line, &len, str->fp) != -1) {
+	while (tpl_getline(&line, &len, q, str) != -1) {
 		int len = strlen(line);
 
 		if (len && (line[len-1] == '\n')) {
@@ -4814,7 +5392,7 @@ static bool bif_getlines_2(query *q)
 	size_t len = 0;
 	CHECKED(init_tmp_heap(q));
 
-	while (getline(&line, &len, str->fp) != -1) {
+	while (tpl_getline(&line, &len, q, str) != -1) {
 		int len = strlen(line);
 
 		if (len && (line[len-1] == '\n')) {
@@ -4852,7 +5430,7 @@ static bool bif_getlines_3(query *q)
 	bool empty = get_empty(q, p2, p2_ctx);
 	CHECKED(init_tmp_heap(q));
 
-	while (getline(&line, &len, str->fp) != -1) {
+	while (tpl_getline(&line, &len, q, str) != -1) {
 		int len = strlen(line);
 
 		if (empty) {
@@ -4886,7 +5464,7 @@ static bool bif_getlines_3(query *q)
 
 static char *fixup(const char *srcptr)
 {
-	char *tmpbuf = strdup(srcptr);
+	char *tmpbuf = TPL_strdup(srcptr);
 	const char *src = srcptr;
 	char *dst = tmpbuf;
 
@@ -4934,7 +5512,10 @@ static bool bif_absolute_file_name_3(query *q)
 	bool expand = false;
 	char *filename = NULL;
 	char cwdbuf[1024*4];
-	char *here = strdup(getcwd(cwdbuf, sizeof(cwdbuf)));
+	const char *cwd0 = getcwd(cwdbuf, sizeof(cwdbuf));	// FIX: getcwd may fail; don't TPL_strdup(NULL)
+	if (!cwd0)
+		return throw_error(q, p1, p1_ctx, "system_error", "getcwd");
+	char *here = TPL_strdup(cwd0);
 	CHECKED(here);
 	char *cwd = here;
 
@@ -4950,13 +5531,13 @@ static bool bif_absolute_file_name_3(query *q)
 	} else
 		filename = DUP_STRING(q, p1);
 
-	LIST_HANDLER(p_opts);
+	PROLOG_LIST_HANDLER(p_opts);
 
 	while (is_list(p_opts)) {
-		cell *h = LIST_HEAD(p_opts);
+		cell *h = PROLOG_LIST_HEAD(p_opts);
 		h = deref(q, h, p_opts_ctx);
 
-		if (is_compound(h) && (h->arity == 1)) {
+		if (is_compound(h) && (get_arity(h) == 1)) {
 			if (!CMP_STRING_TO_CSTR(q, h, "expand")) {
 				if (is_interned(h+1)) {
 					if (!CMP_STRING_TO_CSTR(q, h+1, "true"))
@@ -4968,7 +5549,7 @@ static bool bif_absolute_file_name_3(query *q)
 			}
 		}
 
-		p_opts = LIST_TAIL(p_opts);
+		p_opts = PROLOG_LIST_TAIL(p_opts);
 		p_opts = deref(q, p_opts, p_opts_ctx);
 		p_opts_ctx = q->latest_ctx;
 	}
@@ -5002,15 +5583,15 @@ static bool bif_absolute_file_name_3(query *q)
 		snprintf(tmpbuf, buflen, "%s/%s", ptr, s);
 		char *tmpbuf2;
 
-		if ((tmpbuf2 = realpath(tmpbuf, NULL)) == NULL) {
+		if ((tmpbuf2 = tpl_realpath(tmpbuf)) == NULL) {
 		} else {
 			TPL_free(tmpbuf);
 			tmpbuf = tmpbuf2;
 		}
 	} else {
-		if ((tmpbuf = realpath(s, NULL)) == NULL) {
-			if ((tmpbuf = realpath(cwd, NULL)) == NULL)
-				tmpbuf = realpath(".", NULL);
+		if ((tmpbuf = tpl_realpath(s)) == NULL) {
+			if ((tmpbuf = tpl_realpath(cwd)) == NULL)
+				tmpbuf = tpl_realpath(".");
 
 			CHECKED(tmpbuf);
 
@@ -5061,18 +5642,31 @@ static bool bif_getline_1(query *q)
 	char *line = NULL;
 	size_t len = 0;
 
-	if (isatty(fileno(str->fp))) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp)) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	if (net_getline(&line, &len, str) == -1) {
+	if (tpl_getline(&line, &len, q, str) == -1) {
 		TPL_free(line);
+
+		if (q->is_task && !stream_eof(str) && stream_error(str)) {
+			stream_clearerr(str);
+			return do_yield_on_stream(q, str, false);
+		}
+
+		if (errno == EINTR) {
+			stream_clearerr(str);
+			return throw_timeout(q);
+		}
+
 		return false;
 	}
 
-	if (errno == EINTR)
-		return false;
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
 
 	len = strlen(line);
 
@@ -5103,24 +5697,26 @@ static bool bif_getline_2(query *q)
 	char *line = NULL;
 	size_t len = 0;
 
-	if (isatty(fileno(str->fp))) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp)) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	if (net_getline(&line, &len, str) == -1) {
+	if (tpl_getline(&line, &len, q, str) == -1) {
 		TPL_free(line);
 
-		if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-			clearerr(str->fp);
-			return do_yield(q, 1);
+		if (q->is_task && !stream_eof(str) && stream_error(str)) {
+			stream_clearerr(str);
+			return do_yield_on_stream(q, str, false);
 		}
 
 		return false;
 	}
 
-	if (errno == EINTR)
-		return false;
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
 
 	len = strlen(line);
 
@@ -5149,24 +5745,26 @@ static bool bif_getline_3(query *q)
 	size_t len = 0;
 	bool terminator = get_terminator(q, p2, p2_ctx);
 
-	if (isatty(fileno(str->fp))) {
-		fprintf(str->fp, "%s", PROMPT);
-		fflush(str->fp);
+	if (stream_is_tty(str, str->fp)) {
+		fprintf(str->fp_out, "%s", PROMPT);
+		fflush(str->fp_out);
 	}
 
-	if (net_getline(&line, &len, str) == -1) {
+	if (tpl_getline(&line, &len, q, str) == -1) {
 		TPL_free(line);
 
-		if (q->is_task && !feof(str->fp) && ferror(str->fp)) {
-			clearerr(str->fp);
-			return do_yield(q, 1);
+		if (q->is_task && !stream_eof(str) && stream_error(str)) {
+			stream_clearerr(str);
+			return do_yield_on_stream(q, str, false);
 		}
 
 		return false;
 	}
 
-	if (errno == EINTR)
-		return false;
+	if (errno == EINTR) {
+		stream_clearerr(str);
+		return throw_timeout(q);
+	}
 
 	len = strlen(line);
 
@@ -5268,6 +5866,7 @@ static bool bif_exists_file_1(query *q)
 	return true;
 }
 
+#if TPL_FEATURE_FILESYSTEM
 static bool bif_directory_files_2(query *q)
 {
 	GET_FIRST_ARG(p1,source_sink);
@@ -5298,31 +5897,42 @@ static bool bif_directory_files_2(query *q)
 		return throw_error(q, p1, p1_ctx, "existence_error", "directory");
 	}
 
-	struct dirent *dire = readdir(dirp);
+	struct dirent *dire;
+	bool first = true;
 	cell tmp;
 
-	if (is_string(p1))
-		make_string(&tmp, dire->d_name);
-	else
-		make_cstring(&tmp, dire->d_name);
-
-	allocate_list(q, &tmp);
-
-	for (dire = readdir(dirp); dire; dire = readdir(dirp)) {
+	// readdir() can return NULL at once, e.g. EOVERFLOW on 32-bit without large-file offsets
+	while (errno = 0, (dire = readdir(dirp)) != NULL) {
 		if (is_string(p1))
 			make_string(&tmp, dire->d_name);
 		else
 			make_cstring(&tmp, dire->d_name);
 
-		append_list(q, &tmp);
+		if (first)
+			allocate_list(q, &tmp);
+		else
+			append_list(q, &tmp);
+
+		first = false;
 	}
 
+	bool failed = errno != 0;
 	closedir(dirp);
 	TPL_free(filename);
+
+	if (failed)
+		return throw_error(q, p1, p1_ctx, "existence_error", "directory");
+
+	if (first) {
+		make_atom(&tmp, g_nil_s);
+		return unify(q, p2, p2_ctx, &tmp, q->st.cur_ctx);
+	}
+
 	cell *l = end_list(q);
 	bool ok = unify(q, p2, p2_ctx, l, q->st.cur_ctx);
 	return ok;
 }
+#endif
 
 static bool bif_delete_file_1(query *q)
 {
@@ -5632,6 +6242,10 @@ static bool bif_working_directory_2(query *q)
 	GET_NEXT_ARG(p_new,atom_or_list_or_var);
 	char tmpbuf[PATH_MAX], tmpbuf2[PATH_MAX];
 	char *oldpath = getcwd(tmpbuf, sizeof(tmpbuf));
+
+	if (!oldpath)	// FIX: getcwd may fail
+		return throw_error(q, p_old, p_old_ctx, "system_error", "getcwd");
+
 	snprintf(tmpbuf2, sizeof(tmpbuf2), "%s/", oldpath);
 	oldpath = tmpbuf2;
 	cell tmp;
@@ -5653,6 +6267,7 @@ static bool bif_working_directory_2(query *q)
 			filename = DUP_STRING(q, p_new);
 
 		if (chdir(filename)) {
+			TPL_free(filename);	// FIX: free filename on chdir failure
 			unshare_cell(&tmp);
 			return throw_error(q, p_new, p_new_ctx, "existence_error", "path");
 		}
@@ -5697,10 +6312,19 @@ static bool bif_sys_get_chars_3(query *q)
 		unsigned len = 0;
 
 		for (;;) {
-			int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
+			// A binary stream yields octets, not code points.
 
-			if (feof(str->fp)) {
-				clearerr(str->fp);
+			int ch = str->ungetch ? str->ungetch
+				: str->binary ? tpl_getc(str)
+				: xgetc_utf8_lax(tpl_getc, str);
+
+			if (errno == EINTR) {
+				stream_clearerr(str);
+				return throw_timeout(q);
+			}
+
+			if (stream_eof(str)) {
+				stream_clearerr(str);
 				break;
 			}
 
@@ -5713,7 +6337,11 @@ static bool bif_sys_get_chars_3(query *q)
 				dst = data + off;
 			}
 
-			dst += put_char_utf8(dst, ch);
+			if (str->binary)
+				*dst++ = (char)ch;
+			else
+				dst += put_char_utf8(dst, ch);
+
 			len++;
 		}
 
@@ -5726,6 +6354,10 @@ static bool bif_sys_get_chars_3(query *q)
 		}
 
 		make_stringn(&tmp, data, dst-data);
+
+		if (str->binary && is_string(&tmp))
+			tmp.flags |= FLAG_CSTR_BYTES;
+
 		ok = unify(q, p2, p2_ctx, &tmp, q->st.cur_ctx);
 		unshare_cell(&tmp);
 		TPL_free(data);
@@ -5750,18 +6382,33 @@ static bool bif_sys_get_chars_3(query *q)
 	char *dst = data;
 
 	while (len--) {
-		int ch = str->ungetch ? str->ungetch : xgetc_utf8(net_getc, str);
+		int ch = str->ungetch ? str->ungetch
+			: str->binary ? tpl_getc(str)
+			: xgetc_utf8_lax(tpl_getc, str);
+
 		str->ungetch = 0;
 
-		if (feof(str->fp)) {
-			clearerr(str->fp);
+		if (errno == EINTR) {
+			stream_clearerr(str);
+			return throw_timeout(q);
+		}
+
+		if (stream_eof(str)) {
+			stream_clearerr(str);
 			break;
 		}
 
-		dst += put_char_utf8(dst, ch);
+		if (str->binary)
+			*dst++ = (char)ch;
+		else
+			dst += put_char_utf8(dst, ch);
 	}
 
 	make_stringn(&tmp, data, dst-data);
+
+	if (str->binary && is_string(&tmp))
+		tmp.flags |= FLAG_CSTR_BYTES;
+
 	bool ok = unify(q, p2, p2_ctx, &tmp, q->st.cur_ctx);
 	unshare_cell(&tmp);
 	TPL_free(data);
@@ -5780,6 +6427,18 @@ static bool bif_sys_bread_3(query *q)
 	if (is_bigint(p1))
 		return throw_error(q, p1, p1_ctx, "domain_error", "small_integer_range");
 
+	// str->data holds a partial read across a task's yields below, so a
+	// second query arriving mid-read would append to - and mis-size - the
+	// first one's buffer: the `Want - data_len` remaining-length is
+	// unsigned, so a shorter second request underflows it into a huge
+	// read straight past the end of that buffer. Two readers on one
+	// stream have no coherent meaning anyway, so refuse rather than
+	// corrupt. Writers are different, and allowed - see write_all().
+	if (str->data && (str->data_owner != q))
+		return throw_error(q, pstr, pstr_ctx, "permission_error", "input,busy_stream");
+
+	str->data_owner = q;
+
 	if (is_integer(p1) && is_positive(p1)) {
 		if (!str->data) {
 			str->data = TPL_malloc(get_smallint(p1)+1);
@@ -5795,10 +6454,12 @@ static bool bif_sys_bread_3(query *q)
 
 		for (;;) {
 			len = get_smallint(p1) - str->data_len;
-			size_t nbytes = net_read(str->data+str->data_len, len, str);
+			size_t nbytes = tpl_read(str->data+str->data_len, len, str);
 
-			if (errno == EINTR)
-				return false;
+			if (errno == EINTR) {
+				stream_clearerr(str);
+				return throw_timeout(q);
+			}
 
 			str->data_len += nbytes;
 			str->data[str->data_len] = '\0';
@@ -5806,16 +6467,34 @@ static bool bif_sys_bread_3(query *q)
 			if (nbytes == len)
 				break;
 
-			if (feof(str->fp)) {
-				clearerr(str->fp);
+			if (stream_eof(str)) {
+				stream_clearerr(str);
 				TPL_free(str->data);
 				str->data = NULL;
 				return false;
 			}
 
 			if (q->is_task) {
-				clearerr(str->fp);
-				return do_yield(q, 1);
+				stream_clearerr(str);
+				return do_yield_on_stream(q, str, false);
+			}
+
+			// A non-task socket is non-blocking now (see bif_net.c), so a
+			// short, non-EOF read here is routinely just EAGAIN - nothing
+			// more arrived *yet* - not a real error. Without this, the
+			// loop above spins at full CPU re-issuing tpl_read() until
+			// data shows up, instead of waiting for it: this predicate
+			// backs library(http)'s Content-Length and chunked body
+			// reads, both of which pass a real positive Len and hit this
+			// path on every ordinary POST/PUT or chunked response.
+			if (stream_error(str) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+				stream_clearerr(str);
+
+				if (!tpl_wait_fd_readable(q, stream_fileno(str))) {
+					TPL_free(str->data);
+					str->data = NULL;
+					return throw_timeout(q);	// errno == EINTR
+				}
 			}
 		}
 
@@ -5841,7 +6520,7 @@ static bool bif_sys_bread_3(query *q)
 			str->ungetch = 0;
 		}
 
-		size_t nbytes = net_read(str->data, str->alloc_nbytes, str);
+		size_t nbytes = tpl_read(str->data, str->alloc_nbytes, str);
 		str->data[nbytes] = '\0';
 		str->data = TPL_realloc(str->data, nbytes+1);
 		CHECKED(str->data);
@@ -5868,11 +6547,30 @@ static bool bif_sys_bread_3(query *q)
 
 	for (;;) {
 		size_t len = str->alloc_nbytes - str->data_len;
-		size_t nbytes = net_read(str->data+str->data_len, len, str);
+		size_t nbytes = tpl_read(str->data+str->data_len, len, str);
 		str->data_len += nbytes;
 		str->data[str->data_len] = '\0';
 
-		if (!nbytes || feof(str->fp))
+		if (stream_eof(str))
+			break;
+
+		// A non-blocking socket reads zero on EAGAIN long before EOF.
+		if (!nbytes && stream_error(str) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+			stream_clearerr(str);
+
+			if (q->is_task)
+				return do_yield_on_stream(q, str, false);
+
+			if (!tpl_wait_fd_readable(q, stream_fileno(str))) {
+				TPL_free(str->data);
+				str->data = NULL;
+				return throw_timeout(q);
+			}
+
+			continue;
+		}
+
+		if (!nbytes)
 			break;
 
 		if (str->alloc_nbytes == str->data_len) {
@@ -5903,10 +6601,94 @@ static bool bif_sys_bflush_1(query *q)
 	GET_FIRST_ARG(pstr,stream_or_alias);
 	int n = get_stream(q, pstr);
 	stream *str = &q->pl->streams[n];
-	fflush(str->fp);
+	bool ok = flush_or_throw(q, str);
 	TPL_free(str->data);
 	str->data = NULL;
 	str->data_len = 0;
+	return ok;
+}
+
+// Resuming a parked task re-runs this call from scratch with the
+// original arguments, so str->wbuf is the only record of progress.
+static void free_wbuf(stream *str)
+{
+	TPL_free(str->wbuf);
+	str->wbuf = NULL;
+	str->wbuf_owner = NULL;
+	str->wbuf_len = str->wbuf_pos = 0;
+}
+
+// Writes len bytes of src to str, waiting out real backpressure (EAGAIN)
+// rather than dropping the remainder or busy-spinning. A resumed task
+// uses str->wbuf instead of src/len - an expensive-to-derive caller
+// should check str->wbuf first and skip that work too (see put_chars_2).
+static bool write_all(query *q, stream *str, const char *src, size_t len)
+{
+	bool mine = resuming_write(q, str);
+
+	if (mine) {
+		src = str->wbuf + str->wbuf_pos;
+		len = str->wbuf_len - str->wbuf_pos;
+	}
+
+	while (len) {
+		size_t nbytes = tpl_write(src, len, str);
+		FILE *fp_wr = str->fp_out ? str->fp_out : str->fp;
+
+		if (!nbytes) {
+			if (feof(fp_wr) || ferror(fp_wr)) {
+				if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+					clearerr(fp_wr);
+
+					// Park only when this stream's parked write is ours,
+					// or there is none: a task writing a stream another
+					// task is already parked on can neither borrow that
+					// buffer nor overwrite it, so it waits inline below
+					// instead - rare, and correct.
+					if (q->is_task && (mine || !str->wbuf)) {
+						if (!mine) {
+							str->wbuf = TPL_malloc(len);
+
+							if (!str->wbuf)
+								return false;
+
+							memcpy(str->wbuf, src, len);
+							str->wbuf_owner = q;
+							str->wbuf_len = len;
+							str->wbuf_pos = 0;
+						}
+
+						// do_yield_on_stream() re-reads errno to decide
+						// whether it may park on POLLOUT, and the malloc
+						// above is allowed to have clobbered it.
+						errno = EAGAIN;
+						return do_yield_on_stream(q, str, true);
+					}
+
+					if (!tpl_wait_fd_writable(q, fileno(fp_wr))) {
+						if (mine) free_wbuf(str);
+						return false;	// errno == EINTR
+					}
+
+					continue;
+				}
+
+				if (mine) free_wbuf(str);
+				return false; // can feof() happen on writing?
+			}
+		}
+
+		clearerr(fp_wr);
+		len -= nbytes;
+		src += nbytes;
+
+		if (mine)
+			str->wbuf_pos = (size_t)(src - str->wbuf);
+	}
+
+	if (mine)
+		free_wbuf(str);
+
 	return true;
 }
 
@@ -5916,25 +6698,7 @@ static bool bif_sys_bwrite_2(query *q)
 	GET_NEXT_ARG(p1,atom);
 	int n = get_stream(q, pstr);
 	stream *str = &q->pl->streams[n];
-	const char *src = C_STR(q, p1);
-	size_t len = C_STRLEN(q, p1);
-
-	while (len) {
-		size_t nbytes = net_write(src, len, str);
-
-		if (!nbytes) {
-			if (feof(str->fp) || ferror(str->fp))
-				return false; // can feof() happen on writing?
-		}
-
-		// TODO: make this yieldable
-
-		clearerr(str->fp);
-		len -= nbytes;
-		src += nbytes;
-	}
-
-	return true;
+	return write_all(q, str, C_STR(q, p1), C_STRLEN(q, p1));
 }
 
 static bool bif_sys_readline_2(query *q)
@@ -5957,20 +6721,24 @@ static bool bif_sys_put_chars_1(query *q)
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
 
+	if (resuming_write(q, str))
+		return write_all(q, str, NULL, 0);
+
 	if (is_cstring(p1)) {
 		const char *src = C_STR(q, p1);
 		size_t len = C_STRLEN(q, p1);
-		net_write(src, len, str);
+		return write_all(q, str, src, len);
 	} else if ((scan_is_chars_list(q, p1, p1_ctx, true)) > 0) {
 		char *src = chars_list_to_string(q, p1, p1_ctx);
-		net_write(src, strlen(src), str);
+		bool ok = write_all(q, str, src, strlen(src));
 		TPL_free(src);
+		return ok;
 	} else if (is_nil(p1)) {
 		;
 	} else
 		return throw_error(q, p1, p1_ctx, "type_error", "cchars");
 
-	return !ferror(str->fp);
+	return true;
 }
 
 static bool bif_sys_put_chars_2(query *q)
@@ -5980,47 +6748,113 @@ static bool bif_sys_put_chars_2(query *q)
 	stream *str = &q->pl->streams[n];
 	GET_NEXT_ARG(p1,list_or_nil);
 
+	if (resuming_write(q, str))
+		return write_all(q, str, NULL, 0);
+
 	if (is_cstring(p1)) {
 		const char *src = C_STR(q, p1);
 		size_t len = C_STRLEN(q, p1);
-		net_write(src, len, str);
+		return write_all(q, str, src, len);
 	} else if ((scan_is_chars_list(q, p1, p1_ctx, true)) > 0) {
 		char *src = chars_list_to_string(q, p1, p1_ctx);
-		net_write(src, strlen(src), str);
+		bool ok = write_all(q, str, src, strlen(src));
 		TPL_free(src);
+		return ok;
 	} else if (is_nil(p1)) {
 		;
 	} else
 		return throw_error(q, p1, p1_ctx, "type_error", "chars");
 
-	return !ferror(str->fp);
+	return true;
+}
+
+// Begin a capture on a stream. Starting one inside another does not
+// stop the outer one: the two share the buffer, and the inner capture
+// remembers how much of it was already there so it can take only what
+// its own goal writes. Toggling is_memory instead - which is what this
+// did - turned capturing off on the nested call and freed the outer
+// buffer with it, so with_output_to/2 inside with_output_to/2 lost
+// both and let the text through to the real output.
+
+static bool begin_capture(query *q, stream *str)
+{
+	capture *c = TPL_malloc(sizeof(capture));
+
+	if (!c)
+		return throw_error(q, q->st.instr, q->st.cur_ctx, "resource_error", "memory");
+
+	if (!str->captures) {
+		SB_init(str->sb);
+		str->is_memory = true;
+	}
+
+	c->at = SB_strlen(str->sb);
+	c->prev = str->captures;
+	str->captures = c;
+	return true;
+}
+
+// Where the innermost capture's text starts in the buffer.
+
+static size_t capture_start(stream *str)
+{
+	return str->captures ? str->captures->at : 0;
+}
+
+// End it, once its text has been taken: an outer capture carries on
+// with the buffer truncated to where this one began, and the last one
+// out gives the stream back to its file.
+
+static void end_capture(stream *str)
+{
+	capture *c = str->captures;
+
+	if (!c) {							// unpaired, as a toggle-off used to be
+		str->is_memory = false;
+		SB_free(str->sb);
+		return;
+	}
+
+	size_t at = c->at;
+	str->captures = c->prev;
+	TPL_free(c);
+
+	if (str->captures) {
+		SB_setlen(str->sb, at);			// the capture around this must not see it
+	} else {
+		str->is_memory = false;
+		SB_free(str->sb);
+	}
 }
 
 static bool bif_sys_capture_output_0(query *q)
 {
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-
-	if (str->is_memory) {
-		str->is_memory = false;
-		SB_free(str->sb);
-	} else
-		str->is_memory = true;
-
-	return true;
+	return begin_capture(q, str);
 }
+
+// A capture that caught nothing is the empty character list, not the
+// empty atom: make_stringn() maps a zero length to '', which is what
+// the atom and string builtins want but not a list of characters.
 
 static bool bif_sys_capture_output_to_chars_1(query *q)
 {
 	GET_FIRST_ARG(p1,var);
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-	const char *src = SB_cstr(str->sb);
-	size_t len = SB_strlen(str->sb);
+	size_t at = capture_start(str);
+	const char *buf = SB_cstr(str->sb);		// a conditional expression, so bind it first
+	const char *src = buf + at;
+	size_t len = SB_strlen(str->sb) - at;
 	cell tmp;
-	make_stringn(&tmp, src, len);
-	str->is_memory = false;
-	SB_free(str->sb);
+
+	if (len)
+		make_stringn(&tmp, src, len);
+	else
+		make_atom(&tmp, g_nil_s);
+
+	end_capture(str);
 	bool ok = unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 	unshare_cell(&tmp);
 	return ok;
@@ -6031,29 +6865,63 @@ static bool bif_sys_capture_output_to_atom_1(query *q)
 	GET_FIRST_ARG(p1,var);
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
-	const char *src = SB_cstr(str->sb);
-	size_t len = SB_strlen(str->sb);
+	size_t at = capture_start(str);
+	const char *buf = SB_cstr(str->sb);		// a conditional expression, so bind it first
+	const char *src = buf + at;
+	size_t len = SB_strlen(str->sb) - at;
 	cell tmp;
 	make_cstringn(&tmp, src, len);
-	str->is_memory = false;
-	SB_free(str->sb);
+	end_capture(str);
 	bool ok = unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 	unshare_cell(&tmp);
 	return ok;
+}
+
+// Run portray/1 on a term with current output captured, for format/2's ~p.
+
+char *portray_term_to_strbuf(query *q, cell *c, pl_ctx c_ctx)
+{
+	int n = q->pl->current_output;
+	stream *str = &q->pl->streams[n];
+
+	if (!begin_capture(q, str))
+		return NULL;
+
+	cell p1[1+c->num_cells];
+	make_instr(p1+0, new_atom(q->pl, "$portray"), NULL, 1, c->num_cells);
+	dup_cells_by_ref(p1+1, c, c_ctx, c->num_cells);
+	cell *tmp = prepare_call(q, CALL_SKIP, p1, q->st.cur_ctx, 1);
+	query *q2 = NULL;
+
+	if (tmp) {
+		make_end(tmp+p1->num_cells);
+		q2 = query_create_subquery(q, tmp);
+	}
+
+	if (q2) {
+		start(q2);
+		query_destroy(q2);
+	}
+
+	size_t at = capture_start(str);
+	size_t len = SB_strlen(str->sb) - at;
+	char *dst = q2 ? TPL_malloc(len+1) : NULL;
+
+	if (dst) {
+		const char *buf = SB_cstr(str->sb);		// a conditional expression, so bind it first
+		memcpy(dst, buf + at, len);
+		dst[len] = '\0';
+	}
+
+	end_capture(str);
+	return dst;
 }
 
 static bool bif_sys_capture_error_0(query *q)
 {
 	int n = q->pl->current_error;
 	stream *str = &q->pl->streams[n];
-
-	if (str->is_memory) {
-		str->is_memory = false;
-		SB_free(str->sb);
-	} else
-		str->is_memory = true;
-
-	return true;
+	return begin_capture(q, str);
 }
 
 static bool bif_sys_capture_error_to_chars_1(query *q)
@@ -6061,12 +6929,18 @@ static bool bif_sys_capture_error_to_chars_1(query *q)
 	GET_FIRST_ARG(p1,var);
 	int n = q->pl->current_error;
 	stream *str = &q->pl->streams[n];
-	const char *src = SB_cstr(str->sb);
-	size_t len = SB_strlen(str->sb);
+	size_t at = capture_start(str);
+	const char *buf = SB_cstr(str->sb);		// a conditional expression, so bind it first
+	const char *src = buf + at;
+	size_t len = SB_strlen(str->sb) - at;
 	cell tmp;
-	make_stringn(&tmp, src, len);
-	str->is_memory = false;
-	SB_free(str->sb);
+
+	if (len)
+		make_stringn(&tmp, src, len);
+	else
+		make_atom(&tmp, g_nil_s);
+
+	end_capture(str);
 	bool ok = unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 	unshare_cell(&tmp);
 	return ok;
@@ -6077,12 +6951,13 @@ static bool bif_sys_capture_error_to_atom_1(query *q)
 	GET_FIRST_ARG(p1,var);
 	int n = q->pl->current_error;
 	stream *str = &q->pl->streams[n];
-	const char *src = SB_cstr(str->sb);
-	size_t len = SB_strlen(str->sb);
+	size_t at = capture_start(str);
+	const char *buf = SB_cstr(str->sb);		// a conditional expression, so bind it first
+	const char *src = buf + at;
+	size_t len = SB_strlen(str->sb) - at;
 	cell tmp;
 	make_cstringn(&tmp, src, len);
-	str->is_memory = false;
-	SB_free(str->sb);
+	end_capture(str);
 	bool ok = unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 	unshare_cell(&tmp);
 	return ok;
@@ -6103,7 +6978,7 @@ static bool bif_sys_gsl_vector_write_2(query *q)
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
 
-	fprintf(str->fp, "#%llu,%ux1,%.1f\n",
+	fprintf(str->fp_out, "#%llu,%ux1,%.1f\n",
 		(unsigned long long)v->size1,
 		(unsigned)v->size1,
 		0.0);
@@ -6112,12 +6987,12 @@ static bool bif_sys_gsl_vector_write_2(query *q)
 		double val = v->data[i * v->stride];
 
 		if (i != 0)
-			fprintf(str->fp, ",");
+			fprintf(str->fp_out, ",");
 
-		fprintf(str->fp, "%g", val);
+		fprintf(str->fp_out, "%g", val);
 	}
 
-	fprintf(str->fp, "\n");
+	fprintf(str->fp_out, "\n");
 	return true;
 }
 
@@ -6127,6 +7002,9 @@ static bool bif_sys_gsl_vector_alloc_2(query *q)
 	int n = get_stream(q, p1);
 	stream *str = &q->pl->streams[n];
 	GET_NEXT_ARG(p2,var);
+
+	if (str->is_string)
+		return throw_error(q, p1, p1_ctx, "permission_error", "input,string_stream");
 
 	unsigned long long tot = 0;
 	unsigned rows = 0, cols = 0;
@@ -6194,7 +7072,7 @@ static bool bif_sys_gsl_matrix_write_2(query *q)
 	int n = q->pl->current_output;
 	stream *str = &q->pl->streams[n];
 
-	fprintf(str->fp, "#%llu,%ux%u,%.1f\n",
+	fprintf(str->fp_out, "#%llu,%ux%u,%.1f\n",
 		(unsigned long long)m->size1*m->size2,
 		(unsigned)m->size1,
 		(unsigned)m->size2,
@@ -6203,13 +7081,13 @@ static bool bif_sys_gsl_matrix_write_2(query *q)
 	for (unsigned i = 0; i < m->size1; i++) {
 		for (unsigned j = 0; j < m->size2; j++) {
 			if (j != 0)
-				fprintf(str->fp, ",");
+				fprintf(str->fp_out, ",");
 
 			double val = m->data[i * m->tda + j];
-			fprintf(str->fp, "%g", val);
+			fprintf(str->fp_out, "%g", val);
 		}
 
-		fprintf(str->fp, "\n");
+		fprintf(str->fp_out, "\n");
 	}
 
 	return true;
@@ -6222,6 +7100,9 @@ static bool bif_sys_gsl_matrix_alloc_3(query *q)
 	stream *str = &q->pl->streams[n];
 	GET_NEXT_ARG(p2,var);
 	GET_NEXT_ARG(p3,var);
+
+	if (str->is_string)
+		return throw_error(q, p1, p1_ctx, "permission_error", "input,string_stream");
 
 	unsigned long long tot = 0;
 	long rows = 0, cols = 0;
@@ -6290,95 +7171,30 @@ static bool bif_sys_gsl_matrix_size_3(query *q)
 	return unify(q, p3, p3_ctx, &tmp, q->st.cur_ctx);
 }
 
-static bool bif_set_stream_2(query *q)
+// One set_stream/2 property, for the single and the list form alike: two copies had drifted, and only the list form refused another stream's alias.
+
+static bool set_stream_property(query *q, int n, cell *c, pl_ctx c_ctx)
 {
-	GET_FIRST_ARG(pstr,stream_or_alias);
-	int n = get_stream(q, pstr);
 	stream *str = &q->pl->streams[n];
-	GET_NEXT_ARG(p1,any);
 
-	if (is_nil(p1))
-		return true;
+	if (is_var(c))
+		return throw_error(q, c, c_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 
-	if (is_iso_list(p1)) {
-		LIST_HANDLER(p1);
+	// Every property is name(Arg): anything else has no argument to read.
 
-		while (is_iso_list(p1)) {
-			cell *h = LIST_HEAD(p1);
-			cell *c = deref(q, h, p1_ctx);
-			pl_ctx c_ctx = q->latest_ctx;
-			cell *name = c + 1;
-			name = deref(q, name, c_ctx);
+	if (!is_compound(c) || (get_arity(c) != 1))
+		return throw_error(q, c, c_ctx, "domain_error", "stream_property");
 
-			if (is_var(c))
-				return throw_error(q, c, c_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
+	cell *name = c + 1;
+	name = deref(q, name, c_ctx);
+	pl_ctx name_ctx = q->latest_ctx;
 
-			if (!CMP_STRING_TO_CSTR(q, c, "alias")) {
-				if (is_var(name))
-					return throw_error(q, name, c_ctx, "instantiation_error", "stream_option");
-
-				if (!is_atom(name))
-					return throw_error(q, c, c_ctx, "domain_error", "stream_property");
-
-				if (!CMP_STRING_TO_CSTR(q, name, "current_input")) {
-					q->pl->current_input = n;
-				} else if (!CMP_STRING_TO_CSTR(q, name, "current_output")) {
-					q->pl->current_output = n;
-				} else if (!CMP_STRING_TO_CSTR(q, name, "current_error")) {
-					q->pl->current_error = n;
-				} else {
-					int n2 = get_named_stream(q->pl, C_STR(q, name), C_STRLEN(q, name));
-
-					if (n2 >= 0) {
-						stream *str2 = &q->pl->streams[n2];
-						sl_del(str2->alias, C_STR(q, name));
-					}
-
-					sl_app(str->alias, DUP_STRING(q, name), NULL);
-				}
-
-				return true;
-			}
-
-			if (!CMP_STRING_TO_CSTR(q, c, "type")) {
-				if (is_var(name))
-					return throw_error(q, name, c_ctx, "instantiation_error", "stream_option");
-
-				if (!is_atom(name))
-					return throw_error(q, c, c_ctx, "domain_error", "stream_property");
-
-				if (!CMP_STRING_TO_CSTR(q, name, "binary")) {
-					str->binary = true;
-				} else if (!CMP_STRING_TO_CSTR(q, name, "text")) {
-					str->binary = false;
-				}
-
-				return true;
-			}
-
-			p1 = LIST_TAIL(p1);
-			p1 = deref(q, p1, p1_ctx);
-			p1_ctx = q->latest_ctx;
-
-			if (is_var(p1))
-				return throw_error(q, p1, p1_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
-		}
-
-		return true;
-	}
-
-	if (!is_structure(p1))
-		return throw_error(q, p1, p1_ctx, "domain_error", "stream_property");
-
-	cell *name = p1 + 1;
-	name = deref(q, name, p1_ctx);
-
-	if (!CMP_STRING_TO_CSTR(q, p1, "alias")) {
+	if (!CMP_STRING_TO_CSTR(q, c, "alias")) {
 		if (is_var(name))
-			return throw_error(q, name, q->latest_ctx, "instantiation_error", "stream_option");
+			return throw_error(q, name, name_ctx, "instantiation_error", "stream_option");
 
 		if (!is_atom(name))
-			return throw_error(q, p1, p1_ctx, "domain_error", "stream_property");
+			return throw_error(q, c, c_ctx, "domain_error", "stream_property");
 
 		if (!CMP_STRING_TO_CSTR(q, name, "current_input")) {
 			q->pl->current_input = n;
@@ -6389,31 +7205,84 @@ static bool bif_set_stream_2(query *q)
 		} else {
 			int n2 = get_named_stream(q->pl, C_STR(q, name), C_STRLEN(q, name));
 
+			// An alias already held by a DIFFERENT stream used
+			// to be sl_del()'d from that stream and handed
+			// over silently, so the original lost its name
+			// with no indication - a typo'd alias would
+			// quietly steal an open stream's identity.
+			// open/4 refuses the same situation with a
+			// permission_error; do the same here.
+			//
+			// n2 == n is re-aliasing a stream to a name it
+			// already holds: a no-op, not an error, and not a
+			// second skiplist entry either.
+
 			if (n2 >= 0) {
-				stream *str2 = &q->pl->streams[n2];
-				sl_del(str2->alias, C_STR(q, name));
-			}
-
-			sl_app(str->alias, DUP_STRING(q, name), NULL);
+				if (n2 != n)
+					return throw_error(q, c, c_ctx, "permission_error", "modify,stream_alias");
+			} else
+				sl_app(str->alias, DUP_STRING(q, name), NULL);
 		}
-
-		return true;
-	}
-
-	if (!CMP_STRING_TO_CSTR(q, p1, "type")) {
+	} else if (!CMP_STRING_TO_CSTR(q, c, "type")) {
 		if (is_var(name))
-			return throw_error(q, name, q->latest_ctx, "instantiation_error", "stream_option");
+			return throw_error(q, name, name_ctx, "instantiation_error", "stream_option");
 
 		if (!is_atom(name))
-			return throw_error(q, p1, p1_ctx, "domain_error", "stream_property");
+			return throw_error(q, c, c_ctx, "domain_error", "stream_property");
 
 		if (!CMP_STRING_TO_CSTR(q, name, "binary")) {
 			str->binary = true;
 		} else if (!CMP_STRING_TO_CSTR(q, name, "text")) {
 			str->binary = false;
 		}
+	} else if (!CMP_STRING_TO_CSTR(q, c, "timeout")) {
+		if (is_var(name))
+			return throw_error(q, name, name_ctx, "instantiation_error", "stream_option");
 
+		if (!is_number(name))
+			return throw_error(q, c, c_ctx, "domain_error", "stream_property");
+
+		if (is_float(name))
+			str->timeout_ms = get_float(name) * 1000;
+		else
+			str->timeout_ms = get_smallint(name) * 1000;
+	}
+
+	return true;
+}
+
+static bool bif_set_stream_2(query *q)
+{
+	GET_FIRST_ARG(pstr,stream_or_alias);
+	int n = get_stream(q, pstr);
+	GET_NEXT_ARG(p1,any);
+
+	if (is_nil(p1))
 		return true;
+
+	if (!is_iso_list(p1))
+		return set_stream_property(q, n, p1, p1_ctx);
+
+	PROLOG_LIST_HANDLER(p1);
+
+	while (is_iso_list(p1)) {
+		cell *h = PROLOG_LIST_HEAD(p1);
+		cell *c = deref(q, h, p1_ctx);
+		pl_ctx c_ctx = q->latest_ctx;
+
+		// On to the next property unless this one threw: an alias or a type used to end the list.
+
+		bool ok = set_stream_property(q, n, c, c_ctx);
+
+		if (q->did_throw)
+			return ok;
+
+		p1 = PROLOG_LIST_TAIL(p1);
+		p1 = deref(q, p1, p1_ctx);
+		p1_ctx = q->latest_ctx;
+
+		if (is_var(p1))
+			return throw_error(q, p1, p1_ctx, "instantiation_error", "args_not_sufficiently_instantiated");
 	}
 
 	return true;
@@ -6426,11 +7295,11 @@ static bool bif_portray_clause_1(query *q)
 	stream *str = &q->pl->streams[n];
 	q->quoted = 1;
 	q->portray_vars = true;
-	q->print_idx = 0;
+	q->print_idx = q->name_idx = 0;
 	q->double_quotes = true;
 	q->max_depth = 0;
 	q->fullstop = q->nl = true;
-	print_term(q, str->fp, p1, p1_ctx, 1);
+	print_term_to_stream(q, str, p1, p1_ctx, 1);
 	q->quoted = 0;
 	q->portray_vars = false;
 	clear_write_options(q);
@@ -6445,10 +7314,10 @@ static bool bif_portray_clause_2(query *q)
 	GET_NEXT_ARG(p1,any);
 	q->quoted = 1;
 	q->portray_vars = true;
-	q->print_idx = 0;
+	q->print_idx = q->name_idx = 0;
 	q->max_depth = 0;
 	q->fullstop = q->nl = true;
-	print_term(q, str->fp, p1, p1_ctx, 1);
+	print_term_to_stream(q, str, p1, p1_ctx, 1);
 	q->quoted = 0;
 	q->portray_vars = false;
 	clear_write_options(q);
@@ -6486,9 +7355,7 @@ static bool bif_alias_2(query *q)
 	cell tmp;
 	make_uint(&tmp, (size_t)str->handle);
 
-	if (str->is_map)
-		tmp.flags |= FLAG_INT_STREAM | FLAG_INT_MAP;
-	else if (str->is_alias)
+	if (str->is_alias)
 		tmp.flags |= FLAG_INT_ALIAS;
 	else
 		tmp.flags |= FLAG_INT_STREAM;
@@ -6511,7 +7378,10 @@ builtins g_streams_bifs[] =
 {
 	// ISO...
 
+#if TPL_FEATURE_FILESYSTEM
 	{"open", 4, bif_iso_open_4, "+source_sink,+mode,--stream,+list", true, false, BLAH},
+	{"open_string", 2, bif_open_string_2, "+string,--stream", false, false, BLAH},
+#endif
 	{"close", 1, bif_iso_close_1, "+stream", true, false, BLAH},
 	{"close", 2, bif_iso_close_2, "+stream,+opts", true, false, BLAH},
 	{"read_term", 2, bif_iso_read_term_2, "+stream,-term", true, false, BLAH},
@@ -6557,15 +7427,17 @@ builtins g_streams_bifs[] =
 	{"set_input", 1, bif_iso_set_input_1, "+stream", true, false, BLAH},
 	{"set_output", 1, bif_iso_set_output_1, "+stream", true, false, BLAH},
 	{"set_error", 1, bif_iso_set_output_1, "+stream", true, false, BLAH},
-	{"stream_property", 2, bif_iso_stream_property_2, "+stream,+compound", true, false, BLAH},
+	{"stream_property", 2, bif_iso_stream_property_2, "+stream,-compound", true, false, BLAH},
 
 
 	// Edinburgh...
 
+#if TPL_FEATURE_FILESYSTEM
 	{"seeing", 1, bif_edin_seeing_1, "-atom", false, false, BLAH},
 	{"telling", 1, bif_edin_telling_1, "-atom", false, false, BLAH},
 	{"seen", 0, bif_edin_seen_0, NULL, false, false, BLAH},
 	{"told", 0, bif_edin_told_0, NULL, false, false, BLAH},
+#endif
 	{"redo", 1, bif_edin_redo_1, "+integer", false, false, BLAH},
 	{"redo", 2, bif_edin_redo_2, "+stream,+integer", false, false, BLAH},
 	{"tab", 1, bif_edin_tab_1, "+integer", false, false, BLAH},
@@ -6576,8 +7448,8 @@ builtins g_streams_bifs[] =
 	// Other...
 
 	{"is_stream", 1, bif_is_stream_1, "+term", false, false, BLAH},
-	{"unget_char", 1, bif_unget_char_1, "+integer", true, false, BLAH},
-	{"unget_char", 2, bif_unget_char_2, "+stream,+integer", true, false, BLAH},
+	{"unget_char", 1, bif_unget_char_1, "+character", true, false, BLAH},
+	{"unget_char", 2, bif_unget_char_2, "+stream,+character", true, false, BLAH},
 	{"unget_code", 1, bif_unget_code_1, "+integer", true, false, BLAH},
 	{"unget_code", 2, bif_unget_code_2, "+stream,+integer", true, false, BLAH},
 	{"unget_byte", 1, bif_unget_byte_1, "+integer", true, false, BLAH},
@@ -6589,6 +7461,7 @@ builtins g_streams_bifs[] =
 	{"getlines", 1, bif_getlines_1, "-list", false, false, BLAH},
 	{"getlines", 2, bif_getlines_2, "+stream,-list", false, false, BLAH},
 	{"getlines", 3, bif_getlines_3, "+stream,-list,+list", false, false, BLAH},
+#if TPL_FEATURE_FILESYSTEM
 	{"load_files", 2, bif_load_files_2, "+atom,+list", false, false, BLAH},
 	{"unload_files", 1, bif_unload_files_1, "+atom", false, false, BLAH},
 	{"make", 0, bif_make_0, NULL, false, false, BLAH},
@@ -6611,6 +7484,7 @@ builtins g_streams_bifs[] =
 	{"absolute_file_name", 3, bif_absolute_file_name_3, "+source_sink,-atom,+list", false, false, BLAH},
 	{"is_absolute_file_name", 1, bif_is_absolute_file_name_1, "+source_sink", false, false, BLAH},
 	{"chdir", 1, bif_chdir_1, "+source_sink", false, false, BLAH},
+#endif
 	{"$put_chars", 1, bif_sys_put_chars_1, "+string", false, false, BLAH},
 	{"$put_chars", 2, bif_sys_put_chars_2, "+stream,+string", false, false, BLAH},
 	{"read_term_from_atom", 3, bif_read_term_from_atom_3, "+atom,?term,+list", false, false, BLAH},
@@ -6622,10 +7496,14 @@ builtins g_streams_bifs[] =
 	{"write_canonical_to_chars", 3, bif_write_canonical_to_chars_3, "?string,?term,+list", false, false, BLAH},
 	{"read_line_to_codes", 2, bif_read_line_to_codes_2, "+stream,-list", false, false, BLAH},
 	{"read_line_to_string", 2, bif_read_line_to_string_2, "+stream,-string", false, false, BLAH},
+#if TPL_FEATURE_FILESYSTEM
 	{"read_file_to_string", 3, bif_read_file_to_string_3, "+source_sink,-string,+options", false, false, BLAH},
+#endif
 	{"alias", 2, bif_alias_2, "+blob,+atom", false, false, BLAH},
 
+#if TPL_FEATURE_FILESYSTEM
 	{"$stream_to_file", 2, bif_sys_stream_to_file_2, "+stream,-integer", false, false, BLAH},
+#endif
 	{"$capture_output", 0, bif_sys_capture_output_0, NULL, false, false, BLAH},
 	{"$capture_output_to_chars", 1, bif_sys_capture_output_to_chars_1, "-string", false, false, BLAH},
 	{"$capture_output_to_atom", 1, bif_sys_capture_output_to_atom_1, "-atom", false, false, BLAH},
@@ -6650,4 +7528,3 @@ builtins g_streams_bifs[] =
 
 	{0}
 };
-

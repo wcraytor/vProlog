@@ -1,6 +1,8 @@
-// This code follows the "be liberal in what you accept, be strict
-// in what you emit" rule. It decodes deprecated  6-byte UTF-8
-// but will not encode them.
+// The in-memory decoders follow the "be liberal in what you accept, be
+// strict in what you emit" rule, and decode deprecated 6-byte UTF-8 but
+// will not encode them. Note xgetc_utf8() is deliberately *not* liberal:
+// it reads external data, where an ill-formed sequence must be rejected
+// rather than silently consumed (ISO 13211-1 8.12.1.3 i).
 
 #include <ctype.h>
 #include <wctype.h>
@@ -165,6 +167,13 @@ int get_char_utf8(const char **_src)
 		if (cnt++ > MAX_BYTES_PER_CODEPOINT)
 			return EOF;
 
+		// A lead byte may announce more continuation bytes than the
+		// buffer holds. Being liberal means accepting what is there,
+		// not reading whatever follows the terminator.
+
+		if ((cnt > 1) && !*src)
+			break;
+
 		unsigned char ch = *src++;
 
 		if ((ch & 0b11111100) == 0b11111100) {
@@ -199,44 +208,93 @@ int get_char_utf8(const char **_src)
 int xgetc_utf8(void* p0, void *p1)
 {
 	int(*fn)(void*) = p0;
-	unsigned int n = 0;
-	int expect = 1, cnt = 0;
+	int _ch = fn(p1);
 
-	while (expect--) {
-		if (cnt++ > MAX_BYTES_PER_CODEPOINT)
-			return EOF;
+	if (_ch == EOF)
+		return EOF;
 
-		int _ch = fn(p1);
+	unsigned char ch = (unsigned char)_ch;
+	unsigned int n;
+	int expect;
 
-		if (_ch == EOF)
-			return EOF;
+	if (ch < 0x80)								// 0xxxxxxx
+		return ch;
+	else if ((ch & 0b11100000) == 0b11000000) {	// 110xxxxx
+		n = ch & 0b00011111;
+		expect = 1;
+	} else if ((ch & 0b11110000) == 0b11100000) {	// 1110xxxx
+		n = ch & 0b00001111;
+		expect = 2;
+	} else if ((ch & 0b11111000) == 0b11110000) {	// 11110xxx
+		n = ch & 0b00000111;
+		expect = 3;
+	} else {
+		// A continuation byte out of sequence, or 0xF8-0xFF which can
+		// never begin one. The deprecated 5 and 6 byte forms were
+		// removed by RFC 3629...
 
-		unsigned char ch = (unsigned char)_ch;
-
-		if ((ch & 0b11111100) == 0b11111100) {
-			n = ch & 0b00000001;
-			expect = 5;
-		} else if ((ch & 0b11111000) == 0b11111000) {
-			n = ch & 0b00000011;
-			expect = 4;
-		} else if ((ch & 0b11110000) == 0b11110000) {
-			n = ch & 0b00000111;
-			expect = 3;
-		} else if ((ch & 0b11100000) == 0b11100000) {
-			n = ch & 0b00001111;
-			expect = 2;
-		} else if ((ch & 0b11000000) == 0b11000000) {
-			n = ch & 0b00011111;
-			expect = 1;
-		} else if ((ch & 0b10000000) == 0b10000000) {
-			n <<= 6;
-			n |= ch & 0b00111111;
-		} else {
-			n = ch;
-		}
+		return UTF8_INVALID;
 	}
 
+	const int len = expect + 1;
+
+	while (expect--) {
+		_ch = fn(p1);
+
+		if (_ch == EOF)							// truncated sequence
+			return UTF8_INVALID;
+
+		ch = (unsigned char)_ch;
+
+		if ((ch & 0b11000000) != 0b10000000)	// bad continuation
+			return UTF8_INVALID;
+
+		n <<= 6;
+		n |= ch & 0b00111111;
+	}
+
+	// Reject overlong encodings, UTF-16 surrogates, and anything past
+	// the last codepoint...
+
+	if ((len == 2) && (n < 0x80))
+		return UTF8_INVALID;
+
+	if ((len == 3) && (n < 0x800))
+		return UTF8_INVALID;
+
+	if ((len == 4) && (n < 0x10000))
+		return UTF8_INVALID;
+
+	if ((n >= 0xD800) && (n <= 0xDFFF))
+		return UTF8_INVALID;
+
+	if (n > MAX_CODEPOINT)
+		return UTF8_INVALID;
+
 	return (int)n;
+}
+
+// The strict decoder over a NUL-terminated buffer: the in-memory
+// counterpart of xgetc_utf8(), for a buffer holding data that came
+// from outside - a line the parser read from a stream - rather than
+// text the system built itself. get_char_utf8() is liberal and so can
+// never say "not a character"; these can, and neither reads past the
+// terminator.
+
+static int getc_str(void *p)
+{
+	const char **src = (const char**)p;
+	return **src ? (unsigned char)*(*src)++ : EOF;
+}
+
+int get_char_utf8_strict(const char **src)
+{
+	return xgetc_utf8(getc_str, src);
+}
+
+int peek_char_utf8_strict(const char *src)
+{
+	return xgetc_utf8(getc_str, &src);
 }
 
 int character_at_pos(const char *buffer, size_t buflen, size_t i)

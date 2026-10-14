@@ -15,6 +15,8 @@ cell *copy_term_to_tmp(query *q, cell *c, pl_ctx c_ctx, bool copy_attrs);
 #define tmp_heap_used(q) (q)->tmphp
 
 void trim_heap(query *q);
+bool is_heap_since(const query *q, const frame *f, const cell *c);
+bool is_on_heap(const query *q, const cell *c);
 
 cell *alloc_queuen(query *q, unsigned qnum, const cell *c);
 
@@ -41,4 +43,6 @@ cell *clone_term_to_heap(query *q, cell *c, pl_ctx c_ctx);
 cell *copy_term_to_heap(query *q, cell *c, pl_ctx c_ctx, bool copy_attrs);
 cell *copy_term_to_heap_with_replacement(query *q, cell *c, pl_ctx c_ctx, bool copy_attrs, cell *from, pl_ctx from_ctx, cell *to, pl_ctx to_ctx);
 cell *import_term(query *q, cell *c, pl_ctx c_ctx);
+void free_detached_term(cell *c);
+void abandon_clone_cycles(query *q);
 

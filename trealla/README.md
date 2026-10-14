@@ -5,27 +5,37 @@ A compact, efficient ISO Prolog interpreter. Written in plain old C
 and using a plain old Makefile.
 
 	MIT licensed
+	Runs on Linux, Android, MacOS, *BSD, Windows, FreeRTOS, RISC/OS, Haiku, OpenIndiana, Solaris & Tribblix
+	Runs on many bare boards eg. RISC-V, ESP-32 (using FreeRTOS)
 	Integers & Rationals are unbounded
-	Atoms are UTF-8 of unlimited length
+	Atoms and strings are UTF-8 of unlimited length
 	The default double-quoted representation is *chars* list
-	Strings & slices are super-efficient (especially with mmap'd files)
+	Strings & slices are efficient (especially with mmap'd files)
+	Effectively unlimited arity for compounds
 	REPL with history
-	Runs on Linux, Android, BSD, macOS, and WebAssembly (WASI) & Go
-	Windows build is of indeterminate state and is unsupported
+	Builds for Cosmopolitan, WebAssembly (WASI) & Go
+	Cosmopolitan builds can also boot with no host OS (bare-metal)
 	API for calling from C (or by using WASM from Go & JS)
 	Foreign function interface (FFI) for calling out to user code
 	Access SQLITE databases using builtin module (uses FFI)
-	Concurrency via tasks / linda / futures / engines (generators)
-	Pre-emptive multi-threading
-	Attributed variables: freeze/2 dif/2, when/2
-	Constraint libraries: CLP(B), CLP(Z)
-	Blackboarding primitives: bb_put, bb_b_put/2, bb_get/2
-	Sockets library
+	FFIs for Raylib & Raymath
+	Concurrency via threads / tasks / futures / engines (aka. generators) & actors
+	Definite Clause Grammar (DCGs)
+	Attributed variables with freeze/2, dif/2 & when/2
+	Constraints: CLP(B) & CLP(Z)
+	Blackboarding primitives
+	Delimited continuations
+	Tabling
+	Socket(s) library
 	...
-	FFIs for GNU Scientific Library (GSL), SQLite, Raylib ##EXPERIMENTAL##
-	Delimited continuations ##EXPERIMENTAL##
 	Rational trees ##EXPERIMENTAL##
+	FFIs for GNU Scientific Library (GSL) ##EXPERIMENTAL##
+	FFIs for PLplot ##EXPERIMENTAL##
+	Bi-directional Python interface (Janus) ##EXPERIMENTAL##
 
+Trealla Prolog has reached a stable state and is feature-complete as
+much as is planned. Only bug fixes and incremental improvements are to
+remain ongoing.
 
 Available from: [https://github.com/trealla-prolog/trealla](https://github.com/trealla-prolog/trealla).
 
@@ -60,6 +70,7 @@ where options can be:
 	--autofail         - autofail queries at the toplevel
 	--consult          - consult from STDIN
 	--nolimit          - no memory limit
+	--index-check      - verify indexed lookups against a linear scan (debug, slow)
 
 For example:
 
@@ -76,52 +87,25 @@ of the filename is always preferred (if not specified) when looking for a
 file.
 
 
-A note on UTF-8
-===============
+Installing
+==========
 
-Trealla uses UTF-8 internally and this works well with modern operating
-systems that are already [[1](https://www.utf8everywhere.org/)], or moving to
-[[2](https://en.wikipedia.org/wiki/Unicode_in_Microsoft_Windows#UTF-8)],
-native UTF-8.
+On macOS and Linux, Trealla is in Homebrew core:
 
-It aligns well with standard C as functions like strcmp/memcmp that
-require no special handling to respect codepoint order. This also works
-seamlessly with the implementation of double-quoted *strings* (ie.
-chars-list), DCGs, and mmap'd files. Any code-point specific
-requirements, like *get_char*, *get_code*, *sub_atom*, *atom_length*,
-*atom_codes*, *atom_chars* & *_upper/*_lower are handled on the fly.
+	brew install trealla-prolog
 
-UTF-8 atoms do not need to be quoted unless they contain breaking
-characters...
+That puts `tpl` on the path, the library under `share/trealla`, and
+`trealla.1` in the man pages. The C embedding API comes with it, as
+`libtrealla.a` and `trealla.h`, so `samples/embed.c` builds against it
+directly.
 
-```console
-	?- [user].
-	是.            % be: means, approximately, "True".
-	不是 :- \+ 是.  % not be: means, approximately, "False".
-	<CTRL-D>
-	   true.
-	?- 是.
-	   true.
-	?- 不是.
-	   false.
-	```
+Bottles are prebuilt for Apple Silicon and for Linux on both
+architectures, so those need no compiler. An Intel Mac has no bottle and
+builds from source, which wants the packages below.
 
-	```console
-	?- X = 国字.
-	   X = 国字.
-	?-
-```
-
-Trealla accepts as a var any atom beginning with an uppercase
-character...
-
-```console
-	?- atom_upper(δ,C).
-	   C = Δ.
-	?- Δ is 123456-123455.
-	   Δ = 1.
-	?-
-```
+Build it from source instead if you want a configuration the bottle does
+not carry - no FFI, no SSL, ISOCLINE in place of EDITLINE - or if you are
+targeting anything freestanding.
 
 
 Building
@@ -153,8 +137,8 @@ To build without pre-emptive multi-threading support:
 
 	make NOTHREADS=1
 
-To build (as a last resort) with the included ISOCLINE sources (default is to use EDITLINE,
-except with WASI & Windows):
+To build (as a last resort) with the included ISOCLINE sources (most native builds default
+to EDITLINE; WASI uses its own simple line reader).
 
 	make ISOCLINE=1
 
@@ -176,24 +160,122 @@ Optionally...
 
 and there should be no errors.
 
-Further to test with `valgrind` (on Linux):
+The tests want a UTF-8 locale, and `make test` picks one rather than leaving
+it to chance: a UTF-8 locale you have already set is kept, and otherwise
+`C.UTF-8` or `en_US.UTF-8` is used if the system has either. So there is
+normally nothing to do. On a system with no UTF-8 locale at all it says so and
+runs under C, where a handful of tests on accented text differ - `writeq`
+quotes a non-ASCII atom only when the C library calls its characters
+alphabetic, and that is the locale's decision, not Trealla's. The choice is
+made in `tests/locale.sh`, which the CI workflow sources too.
 
-	make clean && make debug && make valgrind
-
-or  more thoroughly (on MacOS):
+Further, to check for memory errors (out-of-bounds, use-after-free,
+null-pointer):
 
 	make clean && make sanitize && make test
 
-Should ideally show no memory out-of-bounds, null-pointer, use after
-free or memory leaks (there may a few spurious errors).
+Should ideally show none (there may a few spurious errors). Note this
+does not check for leaks on macOS - AddressSanitizer's LeakSanitizer
+is Linux-only.
+
+To check for leaks, on either platform:
+
+	make clean && make leakcheck && make leaks
+
+`make leaks` picks the right tool for the platform it's run on:
+`valgrind` on Linux, macOS's own `leaks` command elsewhere (valgrind
+has no current Apple Silicon support). Either way it needs the
+`leakcheck` build, not `debug` or `sanitize` - neither tool can inspect
+a sanitizer-instrumented binary.
 
 
 On macOS:
 
 	brew install libffi openssl coreutils
 
-By default `editline` is used on `'nix` systems, however if using GNU
-readline instead (make READLINE=1) install the BREW version of readline.
+
+Building with Cosmopolitan
+==========================
+
+Cosmopolitan uses the included ISOCLINE.
+
+	make cosmo
+
+Cosmopolitan can also boot bare-metal or Qemu via boot-sector.
+
+
+Freestanding and bare-metal ports
+=================================
+
+Trealla also has a freestanding profile, a QEMU RV32 reference firmware and a
+generic board adapter template. See the
+[freestanding porting guide](docs/freestanding-porting.md) for the service
+contract, build shape and validation checklist.
+
+	make freestanding
+	make port-template-smoke
+	make qemu-riscv32-smoke
+
+Raspberry Pi 4
+--------------
+
+The [Pi 4 adapter](ports/rpi4/README.md) boots the BCM2711 bare metal, with no
+operating system: it parks the spare cores, drops to EL1, brings up the MMU and
+caches, drives PL011 UART0 as the console, and sleeps the core between looks on
+the generic timer's event stream rather than spinning. It needs the Arm GNU
+bare-metal toolchain for `aarch64-none-elf`.
+
+It is a proof of concept rather than something to build a product on: no
+interrupts, one core with the other three parked, no filesystem, no memory
+protection, a static-address network stack with no authentication anywhere,
+an Ethernet driver for hardware with no public datasheet, and every driver
+here exercised on a single board.
+
+	make rpi4                 # ports/rpi4/kernel8.img, for the boot partition
+	make rpi4-smoke           # build and boot it under QEMU
+	make rpi4-screen          # boot it and read the console back out of the pixels
+
+An image can boot straight into a program of your own, which is the bare-metal
+counterpart of `make compile main=...`:
+
+	make rpi4-app main=ports/rpi4/hello.pl
+
+The board is reached from Prolog: GPIO (see the [GPIO notes](docs/gpio.md)), an
+HDMI console and drawing over the VideoCore framebuffer (`fb_size/2`,
+`fb_clear/1`, `fb_pixel/3`, `fb_rect/5` and `fb_text/4`), and Gigabit Ethernet -
+opt-in, because QEMU has no GENET to emulate and CI boots what it builds:
+
+	make rpi4-app main=ports/rpi4/readings.pl RPI4_NET=1
+
+A network image carries an IPv4/ARP/ICMP/UDP stack, the UDP subset of
+`library(socket)` and `library(tftp)` itself, so a board answers ping, serves
+readings over TFTP as though they were files, and can fetch files in turn. See
+the [freestanding networking notes](docs/freestanding-networking.md).
+
+All of this has run on a physical Pi 4 as well as under QEMU, which matters
+because the interesting failures are the ones emulation cannot show: cache
+maintenance against a GPU that reads RAM directly, an Ethernet port whose reset
+values route every frame nowhere, and a core that really does stop between
+looks. The port's own README lists what hardware proved. A Raspberry Pi 5 port
+is researched but not started - see the [Pi 5 notes](docs/freestanding-rpi5.md).
+
+Arduino Nano ESP32
+------------------
+
+The `freestanding` profile also includes an ESP-IDF adapter for the Arduino
+Nano ESP32. It targets the board's ESP32-S3, places Trealla's static BSS and
+owned heap in the 8 MB PSRAM, embeds a Prolog smoke program in flash and uses
+the native USB Serial/JTAG console.
+
+	source ~/.espressif/tools/activate_idf_v6.0.2.sh
+	make arduino-nano-esp32
+	cd ports/arduino-nano-esp32
+	idf.py -p /dev/cu.<board-port> flash monitor
+
+The run is successful when the serial console ends with
+`TREALLA NANO ESP32 COMPLETE`. See the
+[Nano ESP32 port notes](ports/arduino-nano-esp32/README.md) for memory figures,
+configuration details and the full validation procedure.
 
 
 Building with MUSL
@@ -301,22 +383,148 @@ Both strings and atoms make use of low-overhead reflist-counted byte slices
 where appropriate.
 
 
+Tabling
+=======
+
+A predicate declared *:- table p/2* is memoized: each distinct call
+variant is computed once, its answers stored, and later calls read them
+back. That makes left-recursive definitions terminate where ordinary
+SLD resolution loops forever, and collapses exponential recomputation
+into lookup. Tables are keyed by *variant* — *p(X,Y)* and *p(A,B)*
+share one, *p(X,X)* does not — and are private to the thread that built
+them unless declared otherwise.
+
+```console
+	:- use_module(library(tabling)).
+	:- table path/2.
+
+	path(X,Y) :- path(X,Z), edge(Z,Y).		% left-recursive
+	path(X,Y) :- edge(X,Y).
+
+	edge(a,b). edge(b,c). edge(c,a).
+
+	?- findall(Y, path(a,Y), Ys).
+	Ys = [b,c,a]
+```
+
+Such a table is frozen once complete: it will not notice later changes
+to *edge/2*, and each thread builds its own. Declaring it *incremental*
+lifts the first restriction. Both halves opt in — the table, and each
+dynamic predicate it consults — after which an assert or retract
+invalidates the table and the next call recomputes it, rather than
+quietly serving stale answers.
+
+```console
+	:- use_module(library(tabling)).
+	:- dynamic(edge/2).
+	:- incremental(edge/2).
+	:- table path/2 as incremental.
+
+	path(X,Y) :- path(X,Z), edge(Z,Y).
+	path(X,Y) :- edge(X,Y).
+
+	edge(a,b). edge(b,c).
+
+	?- findall(Y, path(a,Y), Ys).
+	Ys = [b,c]
+	?- assertz(edge(c,d)), findall(Y, path(a,Y), Ys).
+	Ys = [b,c,d]
+```
+
+Two other declarations are available. A *mode-directed* spec such as
+*:- table cost(_,_,min)* aggregates at insert instead of storing every
+answer: the argument written as *min* or *max* is combined rather than
+distinguished, so the table keeps one best answer per key made from the
+remaining arguments — turning "all paths" into "shortest path" with no
+separate minimisation pass. And *:- table p/1 as shared* publishes a
+table once complete so other threads reuse it instead of each building
+their own. Shared and incremental are mutually exclusive: invalidation
+rewrites a table, which is exactly what publication promises never
+happens.
+
+Tables are listed with *current_table/2* and dropped with
+*abolish_table/1* for one predicate or *abolish_all_tables/0* for all. *set_prolog_flag(tabling,false)* runs
+tabled predicates as plain calls, making an A/B comparison a one-liner.
+The flags *max_table_answer_size*, *max_table_subgoal_size* and
+*max_answers_for_subgoal* (all *infinite* by default) bound a runaway
+table with a *resource_error* instead of letting it exhaust memory.
+
+
 Non-standard predicates
 =======================
 
 	help/0
 	help/1						# help(+functor) or help(+PI)
-	help/2						# help(+PI,+atom) where *atom* can be *swi* or *tau*
+	help/2						# help(+PI,+atom) where *atom* can be *trealla*, *swi* or *tau*
 
 	module_help/1				# help(+module)
 	module_help/2				# help(+module,+functor) or help(+module,+PI)
-	module_help/3				# help(+module,+PI,+atom) where *atom* can bw *swi* or *tau*
+	module_help/3				# help(+module,+PI,+atom) where *atom* can bw *trrealla*, *swi* or *tau*
 
 	source_info/2				# source_info(+PI, -list)
 	module_info/2				# module_info(+atom, -list)
 
 	module/1					# module(?atom)
 	modules/1					# modules(-list)
+	compound_name_arity/3		# compound_name_arity(?compound,?atomic,?integer)
+	compound_name_arguments/3	# compound_name_arguments(?compound,?atomic,?list)
+	=@=/2						# A =@= B, true if A and B are variants
+	\=@=/2						# A \=@= B
+	expand_goal/2				# expand_goal(+callable,-callable)
+	format_types/2				# format_types(+format,-list), library(prolog_format)
+	format_spec/2				# format_spec(+format,-list), library(prolog_format)
+
+*library(sandbox)* is *SWI-Prolog*'s, to check a goal before running
+code from someone not trusted:
+
+	safe_goal/1					# safe_goal(:callable)
+	safe_call/1					# safe_call(:callable)
+	safe_call/[2-8]				# safe_call(:callable,?term...)
+	safe_guard/2				# safe_guard(:callable,-callable)
+	safe_load/[2,3]				# safe_load(+atom,+source[,+opts])
+
+*safe_goal/1* walks the goal, the clauses of the user and library
+predicates it reaches, and the goals given to meta-predicates, and throws
+*permission_error(call, sandboxed, G)* at the first predicate that is not
+whitelisted, or an instantiation error where it can't tell what is called.
+An application declares more, as in *SWI-Prolog*, with clauses for the
+multifile *sandbox:safe_primitive/1*, *sandbox:safe_meta/2*,
+*sandbox:safe_meta_predicate/1* and *sandbox:safe_global_variable/1*. A
+bare goal there names the system predicate, as system predicates can't be
+redefined, and a qualified one the library's, as in *lists:member(_,_)*.
+
+Unlike *SWI-Prolog*'s, *safe_call/1* doesn't refuse a goal position that is
+still a variable, as in *(member(G, Gs), call(G))*: *safe_guard/2* first
+puts each one through *sandbox:safe_call/N*, which checks the goal when it
+is called, a closure with its arguments added. *safe_goal/1* still throws
+an instantiation error for one.
+
+*safe_load/2* loads untrusted source into a module, as *SWI-Prolog*'s
+*load_files/2* does with *sandboxed(true)*: the source is *string(Text)*,
+*stream(S)* or *terms(List)*. A clause must be for that module and not a
+system predicate or an expansion hook (*term_expansion/2*,
+*goal_expansion/2*), and has its body guarded. A directive may declare the
+module's own predicates dynamic, discontiguous, multifile and so on,
+declare an operator, which stays the module's own, set a flag
+*sandbox:safe_prolog_flag/2* allows, load a library by a relative path,
+or be a goal *safe_call/1* runs; *sandbox:safe_directive/1* allows more.
+*initialization/1* goals run once the rest is loaded, and then each clause
+body must pass *safe_goal/1* unless the options have *check(false)*. A
+refusal throws, leaving what was loaded so far, so load into a module of
+its own, as with *in_temporary_module/3*.
+
+As in *SWI-Prolog*, *predicate_property/2* also answers *defined*,
+*interpreted*, *number_of_clauses(N)* and *number_of_rules(N)*.
+
+	in_temporary_module/3		# in_temporary_module(?atom,:callable,:callable)
+	destroy_module/1			# destroy_module(+atom)
+
+As in *SWI-Prolog*, *in_temporary_module/3* runs its setup goal then its
+goal in a fresh module (named if the first argument is unbound) and
+destroys it after, as *destroy_module/1* does. A module named for it must
+not exist yet, or be empty, and a module loaded from a file can't be
+destroyed. A goal still holding one of its predicates afterwards gets an
+existence error.
 
 	load_text/2					# load_text(+atom,+opts)
 
@@ -335,7 +543,7 @@ Non-standard predicates
 	evaluable_property/2
 	numbervars/[1,3-4]
 	e/0
-	name/2
+	name/2						# name(?atomic,?list), for SWI-Prolog compatibility
 	tab/[1,2]
 
 	get_unbuffered_code/1		# read a single unbuffered code
@@ -344,6 +552,7 @@ Non-standard predicates
 	read_from_atom/2            # read_from_atom(+atom,?term)
 	read_from_chars/2	        # read_from_chars(+chars,?term)
 	read_term_from_atom/3       # read_term_from_atom(+atom,?term,+optlist)
+	atom_to_term/3				# atom_to_term(+atomic,-term,-bindings)
 	read_term_from_chars/3	    # read_term_from_chars(+chars,?term,+optlist)
 
 	read_from_chars_/3	        # read_from_chars+(?term,+chars,-rest)
@@ -380,11 +589,10 @@ Non-standard predicates
 	chars_urlenc/3              # currently options are ignored
 	hex_chars/2                 # as number_chars, but in hex
 	octal_chars/2               # as number_chars, but in octal
-	partial_string/2            # partial_string(+string,-String)
-	partial_string/3            # partial_string(+string,-String,-Var)
 	if/3, (*->)/2               # soft-cut
 	call_det/2					# call_det(+call,?boolean)
 	copy_term_nat/2             # doesn't copy attrs (same as copy_term/2)
+	copy_term_with_attributes/2 # does copy attrs (opposite to copy_term/2)
 	unifiable/3                 # unifiable(+term1,+term2,-Goals)
 	?=/2                        # ?=(+term1,+term2)
 	term_expansion/2
@@ -424,6 +632,7 @@ Non-standard predicates
 	with_output_to(chars(Cs), Goal)		# *SWI-Prolog* compatible
 	with_output_to(string(Cs), Goal)	# *SWI-Prolog* compatible
 	with_output_to(atom(Atom), Goal)	# *SWI-Prolog* compatible
+	open_string(+Text, -Stream)		# *SWI-Prolog* compatible
 
 	divmod/4                    # *SWI-Prolog* compatible
 	read_line_to_codes/2	   	# *SWI-Prolog* compatible
@@ -440,6 +649,7 @@ Non-standard predicates
 	offset/2					# *SWI-Prolog* compatible
 	limit/2						# *SWI-Prolog* compatible
 	call_with_time_limit/2		# *SWI-Prolog* compatible
+	call_with_inference_limit/3	# *SWI-Prolog* compatible
 	time_out/3					# *SICStus Prolog* compatible
 
 	getenv/2
@@ -531,13 +741,14 @@ support loading into modules eg. *consult(MOD:FILE-SPEC)*.
 Use these *POSIX* system calls for interprocess creation and
 communication...
 
-	popen/3                     # popen(+cmd,+mode,-stream)
-	popen/4                     # popen(+cmd,+mode,-stream,+opts)
+	popen/3                     # popen(+cmd,+mode,--stream)
+	popen/4                     # popen(+cmd,+mode,--stream,+opts)
+	pclose/1                    # pclose(+stream)
 
 For example...
 
 ```console
-tpl -g "popen('ps -a',read,S,[]),getlines(S,Ls),close(S),maplist(println,Ls),halt"
+tpl -g "popen('ps -a',read,S,[]),getlines(S,Ls),pclose(S),maplist(println,Ls),halt"
 	PID   TTY      TIME     CMD
 	2806  tty2     00:00:00 gnome-session-b
 	31645 pts/0    00:00:00 tpl
@@ -548,15 +759,15 @@ tpl -g "popen('ps -a',read,S,[]),getlines(S,Ls),close(S),maplist(println,Ls),hal
 For general *POSIX* process creation use these *SWI-Prolog* compatible calls...
 
 	process_create/3			# process_create(+cmd,+args,+opts)
-	process_wait/2				# process_wait(+pid,+opts)
-	process_wait/1				# process_wait(+pid)
-	process_kill/2				# process_kill(+pid,+sigint)
+	process_wait/3				# process_wait(+pid,-status,+opts)
+	process_wait/2				# process_wait(+pid,-status)
+	process_kill/2				# process_kill(+pid,+signal)
 	process_kill/1				# process_kill(+pid)
 
 For example...
 
 ```console
-	?- process_create('ls',['-l'],[process(Pid)]),process_wait(Pid).
+	?- process_create('ls',['-l'],[process(Pid)]),process_wait(Pid,_).
 	total 2552
 	   4 -rw-rw-r-- 1 andrew andrew    1813 Aug 25 10:18 ATTRIBUTION
 	   4 -rw-rw-r-- 1 andrew andrew    1093 Aug 25 10:18 LICENSE
@@ -576,6 +787,16 @@ For example...
 	?-
 ```
 
+process_create/3's +opts accepts stdin(Std), stdout(Std) and stderr(Std),
+where Std is one of std (share the OS-level stream, the default), null,
+stream(Stream) (an already-open stream), pipe(Stream), or
+pipe(Stream, StreamOptions) - a new Prolog stream connected to the
+child's stream, which the caller must close/1 itself. StreamOptions
+accepts type(text/binary) and encoding(+Encoding), matching what
+*SWI-Prolog* documents for *SICStus* compatibility (Trealla is UTF-8
+throughout, so encoding(_) is accepted but otherwise has no effect, the
+same as open/4's own encoding option).
+
 Note: read_term/[2,3] supports the positions(Start,End) and the
 line_counts(Start,End) property options to report file information.
 This is analogous to stream_property/2 use of position(Pos) and
@@ -586,18 +807,894 @@ option to make more sympathetic support for JSON using the builtin
 parsing and printing mechanisms.
 
 
-Definite Clause Grammars
-========================
+<!-- BEGIN GENERATED PREDICATE REFERENCE -->
 
-Uses Ulrich Neumerkel's standard reference library.
+Predicate reference
+===================
 
-	:- use_module(library(dcgs)).
+610 predicates — 182 ISO, 62 evaluable. Generated by
+`util/gen_reference.py` from `help/0` in the built binary, so it cannot
+drift from the build. Regenerate on release rather than editing by hand.
+
+Jump to: [Core & terms](#core--terms) · [Control](#control) · [Arithmetic](#arithmetic) · [Streams & I/O](#streams--io) · [Formatting](#formatting) · [Database](#database) · [Sorting](#sorting) · [Engines](#engines) · [Attributed variables](#attributed-variables) · [Threads](#threads) · [Coroutining](#coroutining) · [Operating system](#operating-system) · [POSIX time](#posix-time) · [Regular expressions](#regular-expressions) · [CSV](#csv) · [Foreign function interface](#foreign-function-interface) · [library(arithmetic)](#libraryarithmetic) · [library(builtins)](#librarybuiltins) · [library(concurrent)](#libraryconcurrent) · [library(freeze)](#libraryfreeze) · [library(iso_ext)](#libraryisoext) · [library(lists)](#librarylists) · [library(sandbox)](#librarysandbox) · [library(sqlite3)](#librarysqlite3) · [library(tty)](#librarytty) · [Other](#other)
+
+### Core & terms
+
+<details markdown="1">
+<summary>98 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `=/2` | `=(+term,+term)` | ISO |
+| `=../2` | `=..(+term,?list)` | ISO |
+| `acyclic_term/1` | `acyclic_term(+term)` | ISO |
+| `arg/3` | `arg(+integer,+term,?term)` | ISO |
+| `atom/1` | `atom(+term)` | ISO |
+| `atom_chars/2` | `atom_chars(?atom,?list)` | ISO |
+| `atom_codes/2` | `atom_codes(?atom,?list)` | ISO |
+| `atom_concat/3` | `atom_concat(+atom,+atom,?atom)` | ISO |
+| `atom_length/2` | `atom_length(?list,?integer)` | ISO |
+| `atom_lower/2` | `atom_lower(?atom,?atom)` |  |
+| `atom_upper/2` | `atom_upper(?atom,?atom)` |  |
+| `atomic/1` | `atomic(+term)` | ISO |
+| `atomic_concat/3` | `atomic_concat(+atomic,+atomic,?atomic)` |  |
+| `atomic_list_concat/2` | `atomic_list_concat(+list,?atom)` |  |
+| `atomic_list_concat/3` | `atomic_list_concat(?list,+atomic,?atom)` |  |
+| `base64/3` | `base64(?string,?string,+list)` |  |
+| `between/3` | `between(+integer,+integer,?integer)` |  |
+| `call_nth/2` | `call_nth(:callable,+integer)` |  |
+| `callable/1` | `callable(+term)` | ISO |
+| `can_be/2` | `can_be(+atom,+term,)` |  |
+| `can_be/4` | `can_be(+term,+atom,+term,?any)` |  |
+| `char_code/2` | `char_code(?atom,?integer)` | ISO |
+| `compare/3` | `compare(+atom,+term,+term)` | ISO |
+| `compound/1` | `compound(+term)` | ISO |
+| `copy_term/2` | `copy_term(+term,?term)` | ISO |
+| `copy_term_nat/2` | `copy_term_nat(+term,?term)` |  |
+| `copy_term_with_attributes/2` | `copy_term_with_attributes(+term,?term)` |  |
+| `crypto_data_hash/3` | `crypto_data_hash(?string,?string,?list)` |  |
+| `crypto_n_random_bytes/2` | `crypto_n_random_bytes(+integer,-codes)` |  |
+| `current_module/1` | `current_module(-atom)` |  |
+| `current_predicate/1` | `current_predicate(+predicate_indicator)` | ISO |
+| `current_rule/1` | `current_rule(-term)` | ISO |
+| `cyclic_term/1` | `cyclic_term(+term)` |  |
+| `duplicate_term/2` | `duplicate_term(+term,?term)` |  |
+| `end_of_file/0` | `end_of_file` | ISO |
+| `findall/3` | `findall(+term,:callable,-list)` | ISO |
+| `findnsols/4` | `findnsols(+integer,+term,:callable,?list)` |  |
+| `functor/3` | `functor(?term,?atom,?integer)` | ISO |
+| `ground/1` | `ground(+term)` | ISO |
+| `help/0` | `help` |  |
+| `help/1` | `help(+predicate_indicator)` |  |
+| `help/2` | `help(+predicate_indicator,+atom)` |  |
+| `hex_bytes/2` | `hex_bytes(?string,?list)` |  |
+| `hex_chars/2` | `hex_chars(?integer,?string)` |  |
+| `is_bigint/1` | `is_bigint(+term)` |  |
+| `is_list/1` | `is_list(+term)` |  |
+| `is_list_or_partial_list/1` | `is_list_or_partial_list(+term)` |  |
+| `is_partial_list/1` | `is_partial_list(+term)` |  |
+| `limit/2` | `limit(+integer,:callable)` |  |
+| `list/1` | `list(+term)` |  |
+| `load_text/2` | `load_text(+string,+list)` |  |
+| `meta_predicate/1` | `meta_predicate(+term)` |  |
+| `module_help/1` | `module_help(+atom)` |  |
+| `module_help/2` | `module_help(+atom,+predicate_indicator)` |  |
+| `module_help/3` | `module_help(+atom,+predicate_indicator,+atom)` |  |
+| `module_info/2` | `module_info(+atom,-list)` |  |
+| `multifile/1` | `multifile(+term)` |  |
+| `must_be/2` | `must_be(+atom,+term)` |  |
+| `must_be/4` | `must_be(+term,+atom,+term,?any)` |  |
+| `nb_setarg/3` | `nb_setarg(+integer,+term,+integer)` |  |
+| `nonvar/1` | `nonvar(+term)` | ISO |
+| `number/1` | `number(+term)` | ISO |
+| `number_chars/2` | `number_chars(?number,?list)` | ISO |
+| `number_codes/2` | `number_codes(?number,?list)` | ISO |
+| `numlist/3` | `numlist(+integer,+integer,-list)` |  |
+| `octal_chars/2` | `octal_chars(?integer,?string)` |  |
+| `offset/2` | `offset(+integer,+callable)` |  |
+| `op/3` | `op(?integer,?atom,+atom)` | ISO |
+| `prolog_load_context/2` | `prolog_load_context(+atom,?term)` |  |
+| `repeat/0` | `repeat` | ISO |
+| `replace/4` | `replace(+string,+integer,+integer,-string)` |  |
+| `set_prolog_flag/2` | `set_prolog_flag(+atom,+term)` | ISO |
+| `source_info/2` | `source_info(+predicate_indicator,-list)` |  |
+| `split/4` | `split(+string,+string,?string,?string)` |  |
+| `split_string/4` | `split_string(+string,+atom,+atom,-list)` |  |
+| `statistics/0` | `statistics` |  |
+| `statistics/2` | `statistics(+atom,-term)` |  |
+| `string/1` | `string(+term)` |  |
+| `string_codes/2` | `string_codes(+string,-list)` |  |
+| `string_concat/3` | `string_concat(+string,+string,?string)` |  |
+| `string_length/2` | `string_length(+string,?integer)` |  |
+| `string_lower/2` | `string_lower(?string,?string)` |  |
+| `string_upper/2` | `string_upper(?string,?string)` |  |
+| `strip_module/3` | `strip_module(+callable,?atom,?callable)` |  |
+| `sub_atom/5` | `sub_atom(+atom,?before,?length,?after,?atom)` | ISO |
+| `sub_string/5` | `sub_string(+character_list,?before,?length,?after,?character_list)` | ISO |
+| `term_hash/2` | `term_hash(+term,?integer)` |  |
+| `term_singletons/2` | `term_singletons(+term,-list)` |  |
+| `term_variables/2` | `term_variables(+term,-list)` | ISO |
+| `trace/0` | `trace` |  |
+| `unifiable/3` | `unifiable(+term,+term,-list)` |  |
+| `unify_with_occurs_check/2` | `unify_with_occurs_check(+term,+term)` | ISO |
+| `urlenc/3` | `urlenc(?string,?string,+list)` |  |
+| `use_module/1` | `use_module(+term)` |  |
+| `use_module/2` | `use_module(+term,+list)` |  |
+| `using/0` | `using` |  |
+| `uuid/1` | `uuid(-string)` |  |
+| `var/1` | `var(+term)` | ISO |
+
+</details>
+
+### Control
+
+<details markdown="1">
+<summary>25 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `!/0` | `!` | ISO |
+| `*->/2` | `*->(:callable,:callable)` |  |
+| `,/2` | `,(:callable,:callable)` | ISO |
+| `->/2` | `->(:callable,:callable)` | ISO |
+| `;/2` | `;(:callable,:callable)` | ISO |
+| `abort/0` | `abort` |  |
+| `call/1` | `call(:callable)` | ISO |
+| `call/2` | `call(:callable,?term)` | ISO |
+| `call/3` | `call(:callable,?term,term)` | ISO |
+| `call/4` | `call(:callable,?term,?term,?term)` | ISO |
+| `call/5` | `call(:callable,?term,?term,?term,?term)` | ISO |
+| `call/6` | `call(:callable,?term,?term,?term,?term,?term)` | ISO |
+| `call/7` | `call(:callable,?term,?term,?term,?term,?term,?term)` | ISO |
+| `call/8` | `call(:callable,?term,?term,?term,?term,?term,?term,?term)` | ISO |
+| `catch/3` | `catch(:callable,?term,:callable)` | ISO |
+| `fail/0` | `fail` | ISO |
+| `false/0` | `false` | ISO |
+| `forall/2` | `forall(:callable,:callable)` |  |
+| `if/3` | `if(:callable,:callable,:callable)` |  |
+| `ignore/1` | `ignore(:callable)` |  |
+| `once/1` | `once(:callable)` | ISO |
+| `reset/3` | `reset(:callable,?term,-term)` |  |
+| `shift/1` | `shift(+term)` |  |
+| `throw/1` | `throw(+term)` | ISO |
+| `true/0` | `true` | ISO |
+
+</details>
+
+### Arithmetic
+
+<details markdown="1">
+<summary>80 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `///2` | `//(+integer,+integer,-integer)` | ISO evaluable |
+| `//2` | `/(+number,+number,-float)` | ISO evaluable |
+| `*/2` | `*(+number,+number,-number)` | ISO evaluable |
+| `**/2` | `**(+number,+number,-float)` | ISO evaluable |
+| `+/1` | `+(+number,-number)` | ISO evaluable |
+| `+/2` | `+(+number,+number,-number)` | ISO evaluable |
+| `-/1` | `-(+number,-number)` | ISO evaluable |
+| `-/2` | `-(+number,+number,-number)` | ISO evaluable |
+| `</2` | `<(+number,+number)` | ISO |
+| `<</2` | `<<(+integer,-integer)` | ISO evaluable |
+| `=</2` | `=<(+number,+number)` | ISO |
+| `==/2` | `==(+term,+term)` | ISO |
+| `>/2` | `>(+number,+number)` | ISO |
+| `>=/2` | `>=(+number,+number)` | ISO |
+| `>>/2` | `>>(+integer,-integer)` | ISO evaluable |
+| `@</2` | `@<(+term,+term)` | ISO |
+| `@=</2` | `@=<(+term,+term)` | ISO |
+| `@>/2` | `@>(+term,+term)` | ISO |
+| `@>=/2` | `@>=(+term,+term)` | ISO |
+| `^/2` | `^(+number,+number,-integer)` | ISO evaluable |
+| `abs/1` | `abs(+number,-number)` | ISO evaluable |
+| `acos/1` | `acos(+number,-float)` | ISO evaluable |
+| `acosh/1` | `acosh(+number,-float)` | evaluable |
+| `asin/1` | `asin(+number,-float)` | ISO evaluable |
+| `asinh/1` | `asinh(+number,-float)` | evaluable |
+| `atan/1` | `atan(+number,-float)` | ISO evaluable |
+| `atan2/2` | `atan2(+number,+number,-float)` | ISO evaluable |
+| `atanh/1` | `atanh(+number,-float)` | evaluable |
+| `ceiling/1` | `ceiling(+float,-integer)` | ISO evaluable |
+| `copysign/2` | `copysign(+number,-number)` | evaluable |
+| `cos/1` | `cos(+number,-float)` | ISO evaluable |
+| `cosh/1` | `cosh(+number,-float)` | evaluable |
+| `denominator/1` | `denominator(+rational,-integer)` | evaluable |
+| `div/2` | `div(+integer,+integer,-integer)` | ISO evaluable |
+| `divmod/4` | `divmod(+integer,+integer,?integer,?integer)` |  |
+| `e/0` | `e` | ISO evaluable |
+| `epsilon/0` | `epsilon` | ISO evaluable |
+| `erf/1` | `erf(+number,-float)` | evaluable |
+| `erfc/1` | `erfc(+number,-float)` | evaluable |
+| `exp/1` | `exp(+number,-float)` | ISO evaluable |
+| `float/1` | `float(+number)` | ISO |
+| `float_fractional_part/1` | `float_fractional_part(+float,-float)` | ISO evaluable |
+| `float_integer_part/1` | `float_integer_part(+float,-integer)` | ISO evaluable |
+| `floor/1` | `floor(+float,-integer)` | ISO evaluable |
+| `gcd/2` | `gcd(+integer,+integer,-integer)` | evaluable |
+| `get_seed/1` | `get_seed(-integer)` |  |
+| `integer/1` | `integer(+number)` | ISO |
+| `is/2` | `is(?number,+number)` | ISO |
+| `log/1` | `log(+number,-float)` | ISO evaluable |
+| `log/2` | `log(+number,+number,-float)` | evaluable |
+| `log10/1` | `log10(+number,-float)` | evaluable |
+| `lsb/1` | `lsb(+integer,-integer)` | evaluable |
+| `max/2` | `max(+number,+number,-number)` | ISO evaluable |
+| `min/2` | `min(+number,+number,-number)` | ISO evaluable |
+| `mod/2` | `mod(+integer,+integer,-integer)` | ISO evaluable |
+| `msb/1` | `msb(+integer,-integer)` | evaluable |
+| `numerator/1` | `numerator(+rational,-integer)` | evaluable |
+| `pi/0` | `pi` | ISO evaluable |
+| `popcount/1` | `popcount(+integer,-integer)` | evaluable |
+| `rand/0` | `rand` | evaluable |
+| `rand/1` | `rand(?integer)` |  |
+| `random/1` | `random(?integer)` |  |
+| `random_between/3` | `random_between(?integer,?integer,-integer)` |  |
+| `random_float/0` | `random_float` | evaluable |
+| `random_integer/0` | `random_integer` | evaluable |
+| `rational/1` | `rational(+term)` |  |
+| `rdiv/2` | `rdiv(+integer,+integer,-rational)` | evaluable |
+| `rem/2` | `rem(+integer,+integer,-integer)` | ISO evaluable |
+| `round/1` | `round(+float,-integer)` | ISO evaluable |
+| `set_seed/1` | `set_seed(+integer)` |  |
+| `setrand/1` | `setrand(+integer)` |  |
+| `sign/1` | `sign(+number,-number)` | ISO evaluable |
+| `sin/1` | `sin(+number,-float)` | ISO evaluable |
+| `sinh/1` | `sinh(+number,-float)` | evaluable |
+| `sqrt/1` | `sqrt(+number,-float)` | ISO evaluable |
+| `srandom/1` | `srandom(+integer)` |  |
+| `tan/1` | `tan(+number,-float)` | ISO evaluable |
+| `tanh/1` | `tanh(+number,-float)` | evaluable |
+| `truncate/1` | `truncate(+float,-integer)` | ISO evaluable |
+| `xor/2` | `xor(+integer,+integer,-integer)` | ISO evaluable |
+
+</details>
+
+### Streams & I/O
+
+<details markdown="1">
+<summary>104 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `absolute_file_name/3` | `absolute_file_name(+source_sink,-atom,+list)` |  |
+| `access_file/2` | `access_file(+source_sink,+atom)` |  |
+| `alias/2` | `alias(+blob,+atom)` |  |
+| `at_end_of_stream/0` | `at_end_of_stream` | ISO |
+| `at_end_of_stream/1` | `at_end_of_stream(+stream)` | ISO |
+| `chdir/1` | `chdir(+source_sink)` |  |
+| `close/1` | `close(+stream)` | ISO |
+| `close/2` | `close(+stream,+opts)` | ISO |
+| `copy_file/2` | `copy_file(+source_sink,+source_sink)` |  |
+| `current_error/1` | `current_error(--stream)` | ISO |
+| `current_input/1` | `current_input(--stream)` | ISO |
+| `current_output/1` | `current_output(--stream)` | ISO |
+| `delete_file/1` | `delete_file(+source_sink)` |  |
+| `directory_files/2` | `directory_files(+source_sink,-list)` |  |
+| `exists_directory/1` | `exists_directory(+source_sink)` |  |
+| `exists_file/1` | `exists_file(+source_sink)` |  |
+| `flush_output/0` | `flush_output` | ISO |
+| `flush_output/1` | `flush_output(+stream)` | ISO |
+| `get_byte/1` | `get_byte(-integer)` | ISO |
+| `get_byte/2` | `get_byte(+stream,-integer)` | ISO |
+| `get_char/1` | `get_char(-integer)` | ISO |
+| `get_char/2` | `get_char(+stream,-integer)` | ISO |
+| `get_code/1` | `get_code(-integer)` | ISO |
+| `get_code/2` | `get_code(+stream,-integer)` | ISO |
+| `getfile/2` | `getfile(+source_sink,-list)` |  |
+| `getfile/3` | `getfile(+source_sink,-list,+list)` |  |
+| `getline/1` | `getline(-atom)` |  |
+| `getline/2` | `getline(+stream,-string)` |  |
+| `getline/3` | `getline(+stream,-string,+list)` |  |
+| `getlines/1` | `getlines(-list)` |  |
+| `getlines/2` | `getlines(+stream,-list)` |  |
+| `getlines/3` | `getlines(+stream,-list,+list)` |  |
+| `is_absolute_file_name/1` | `is_absolute_file_name(+source_sink)` |  |
+| `is_stream/1` | `is_stream(+term)` |  |
+| `load_files/2` | `load_files(+atom,+list)` |  |
+| `loadfile/2` | `loadfile(+source_sink,-atom)` |  |
+| `make/0` | `make` |  |
+| `make_directory/1` | `make_directory(+source_sink)` |  |
+| `make_directory_path/1` | `make_directory_path(+source_sink)` |  |
+| `nl/0` | `nl` | ISO |
+| `nl/1` | `nl(+stream)` | ISO |
+| `open/4` | `open(+source_sink,+mode,--stream,+list)` | ISO |
+| `open_string/2` | `open_string(+string,--stream)` |  |
+| `peek_byte/1` | `peek_byte(-integer)` | ISO |
+| `peek_byte/2` | `peek_byte(+stream,-integer)` | ISO |
+| `peek_char/1` | `peek_char(-integer)` | ISO |
+| `peek_char/2` | `peek_char(+stream,-integer)` | ISO |
+| `peek_code/1` | `peek_code(-integer)` | ISO |
+| `peek_code/2` | `peek_code(+stream,-integer)` | ISO |
+| `portray_clause/1` | `portray_clause(+term)` |  |
+| `portray_clause/2` | `portray_clause(+stream,+term)` |  |
+| `put_byte/1` | `put_byte(+integer)` | ISO |
+| `put_byte/2` | `put_byte(+stream,+integer)` | ISO |
+| `put_char/1` | `put_char(+integer)` | ISO |
+| `put_char/2` | `put_char(+stream,+integer)` | ISO |
+| `put_code/1` | `put_code(+integer)` | ISO |
+| `put_code/2` | `put_code(+stream,+integer)` | ISO |
+| `read/1` | `read(-term)` | ISO |
+| `read/2` | `read(+stream,-term)` | ISO |
+| `read_file_to_string/3` | `read_file_to_string(+source_sink,-string,+options)` |  |
+| `read_line_to_codes/2` | `read_line_to_codes(+stream,-list)` |  |
+| `read_line_to_string/2` | `read_line_to_string(+stream,-string)` |  |
+| `read_term/2` | `read_term(+stream,-term)` | ISO |
+| `read_term/3` | `read_term(+stream,-term,+list)` | ISO |
+| `read_term_from_atom/3` | `read_term_from_atom(+atom,?term,+list)` |  |
+| `read_term_from_chars/3` | `read_term_from_chars(+string,?term,+list)` |  |
+| `redo/1` | `redo(+integer)` |  |
+| `redo/2` | `redo(+stream,+integer)` |  |
+| `rename_file/2` | `rename_file(+source_sink,+source_sink)` |  |
+| `savefile/2` | `savefile(+source_sink,+source_sink)` |  |
+| `seeing/1` | `seeing(-atom)` |  |
+| `seen/0` | `seen` |  |
+| `set_error/1` | `set_error(+stream)` | ISO |
+| `set_input/1` | `set_input(+stream)` | ISO |
+| `set_output/1` | `set_output(+stream)` | ISO |
+| `set_stream/2` | `set_stream(+stream,+term)` | ISO |
+| `set_stream_position/2` | `set_stream_position(+stream,+integer)` | ISO |
+| `size_file/2` | `size_file(+source_sink,-integer)` |  |
+| `stream_property/2` | `stream_property(+stream,-compound)` | ISO |
+| `tab/1` | `tab(+integer)` |  |
+| `tab/2` | `tab(+stream,+integer)` |  |
+| `telling/1` | `telling(-atom)` |  |
+| `time_file/2` | `time_file(+source_sink,-float)` |  |
+| `told/0` | `told` |  |
+| `unget_byte/1` | `unget_byte(+integer)` | ISO |
+| `unget_byte/2` | `unget_byte(+stream,+integer)` | ISO |
+| `unget_char/1` | `unget_char(+character)` | ISO |
+| `unget_char/2` | `unget_char(+stream,+character)` | ISO |
+| `unget_code/1` | `unget_code(+integer)` | ISO |
+| `unget_code/2` | `unget_code(+stream,+integer)` | ISO |
+| `unload_files/1` | `unload_files(+atom)` |  |
+| `working_directory/2` | `working_directory(-atom,+source_sink)` |  |
+| `write/1` | `write(+term)` | ISO |
+| `write/2` | `write(+stream,+term)` | ISO |
+| `write_canonical/1` | `write_canonical(+term)` | ISO |
+| `write_canonical/2` | `write_canonical(+stream,+term)` | ISO |
+| `write_canonical_to_atom/3` | `write_canonical_to_atom(?atom,?term,+list)` |  |
+| `write_canonical_to_chars/3` | `write_canonical_to_chars(?string,?term,+list)` |  |
+| `write_term/2` | `write_term(+stream,+term)` | ISO |
+| `write_term/3` | `write_term(+stream,+term,+list)` | ISO |
+| `write_term_to_atom/3` | `write_term_to_atom(?atom,?term,+list)` |  |
+| `write_term_to_chars/3` | `write_term_to_chars(?term,+list,?string)` |  |
+| `writeq/1` | `writeq(+term)` | ISO |
+| `writeq/2` | `writeq(+stream,+term)` | ISO |
+
+</details>
+
+### Formatting
+
+<details markdown="1">
+<summary>3 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `format/1` | `format(+string)` |  |
+| `format/2` | `format(+string,+list)` |  |
+| `format/3` | `format(+stream,+string,+list)` |  |
+
+</details>
+
+### Database
+
+<details markdown="1">
+<summary>15 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `abolish/1` | `abolish(+predicate_indicator)` | ISO |
+| `abolish/2` | `abolish(+term,+list)` |  |
+| `asserta/1` | `asserta(+term)` | ISO |
+| `asserta/2` | `asserta(+term,-string)` |  |
+| `assertz/1` | `assertz(+term)` | ISO |
+| `assertz/2` | `assertz(+term,-string)` |  |
+| `clause/2` | `clause(+term,?term)` | ISO |
+| `clause/3` | `clause(?term,?term,-string)` |  |
+| `erase/1` | `erase(+string)` |  |
+| `instance/2` | `instance(+string,?term)` |  |
+| `listing/0` | `listing` |  |
+| `listing/1` | `listing(+predicate_indicator)` |  |
+| `retract/1` | `retract(+term)` | ISO |
+| `retractall/1` | `retractall(+term)` | ISO |
+| `thread_local/1` | `thread_local(+term)` |  |
+
+</details>
+
+### Sorting
+
+<details markdown="1">
+<summary>4 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `keysort/2` | `keysort(+list,?list)` | ISO |
+| `msort/2` | `msort(+list,?list)` |  |
+| `sort/2` | `sort(+list,?list)` | ISO |
+| `sort/4` | `sort(+integer,+atom,+list,?list)` |  |
+
+</details>
+
+### Engines
+
+<details markdown="1">
+<summary>7 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `engine_destroy/1` | `engine_destroy(+stream)` |  |
+| `engine_fetch/1` | `engine_fetch(-term)` |  |
+| `engine_next/2` | `engine_next(+stream,-term)` |  |
+| `engine_post/2` | `engine_post(+stream,+term)` |  |
+| `engine_self/1` | `engine_self(--stream)` |  |
+| `engine_yield/1` | `engine_yield(+term)` |  |
+| `is_engine/1` | `is_engine(+term)` |  |
+
+</details>
+
+### Attributed variables
+
+<details markdown="1">
+<summary>3 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `attribute/3` | `attribute(?atom,+atom,+integer)` |  |
+| `get_atts/2` | `get_atts(@variable,-term)` |  |
+| `put_atts/2` | `put_atts(@variable,+term)` |  |
+
+</details>
+
+### Threads
+
+<details markdown="1">
+<summary>24 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `is_thread/1` | `is_thread(+term)` |  |
+| `message_queue_create/2` | `message_queue_create(-queue,+list)` |  |
+| `message_queue_destroy/1` | `message_queue_destroy(+queue)` |  |
+| `message_queue_property/2` | `message_queue_property(?queue,?term)` |  |
+| `mutex_create/2` | `mutex_create(-mutex,+list)` |  |
+| `mutex_destroy/1` | `mutex_destroy(+mutex)` |  |
+| `mutex_lock/1` | `mutex_lock(+mutex)` |  |
+| `mutex_property/2` | `mutex_property(?mutex,?term)` |  |
+| `mutex_trylock/1` | `mutex_trylock(+mutex)` |  |
+| `mutex_unlock/1` | `mutex_unlock(+mutex)` |  |
+| `mutex_unlock_all/0` | `mutex_unlock_all` |  |
+| `thread_cancel/1` | `thread_cancel(+thread)` |  |
+| `thread_create/3` | `thread_create(:callable,--thread,+list)` |  |
+| `thread_detach/1` | `thread_detach(+thread)` |  |
+| `thread_exit/1` | `thread_exit(+term)` |  |
+| `thread_get_message/2` | `thread_get_message(+queue,?term)` |  |
+| `thread_get_message/3` | `thread_get_message(+queue,?term,+list)` |  |
+| `thread_peek_message/2` | `thread_peek_message(+queue,?term)` |  |
+| `thread_property/2` | `thread_property(?thread,?term)` |  |
+| `thread_self/1` | `thread_self(-integer)` |  |
+| `thread_send_message/2` | `thread_send_message(+queue,+term)` |  |
+| `thread_signal/2` | `thread_signal(+thread,:callable)` |  |
+| `thread_sleep/1` | `thread_sleep(+integer)` |  |
+| `thread_yield/0` | `thread_yield` |  |
+
+</details>
+
+### Coroutining
+
+<details markdown="1">
+<summary>18 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `task_call/1` | `task_call(:callable)` |  |
+| `task_call/2` | `task_call(:callable,?term)` |  |
+| `task_call/3` | `task_call(:callable,?term,?term)` |  |
+| `task_call/4` | `task_call(:callable,?term,?term,?term)` |  |
+| `task_call/5` | `task_call(:callable,?term,?term,?term,?term)` |  |
+| `task_call/6` | `task_call(:callable,?term,?term,?term,?term,?term)` |  |
+| `task_call/7` | `task_call(:callable,?term,?term,?term,?term,?term,?term)` |  |
+| `task_call/8` | `task_call(:callable,?term,?term,?term,?term,?term,?term,?term)` |  |
+| `task_cancel/1` | `task_cancel(+integer)` |  |
+| `task_create/2` | `task_create(:callable,-integer)` |  |
+| `task_end_wait/0` | `task_end_wait` |  |
+| `task_fork/0` | `task_fork` |  |
+| `task_recv/1` | `task_recv(?term)` |  |
+| `task_recv/2` | `task_recv(?term,+list)` |  |
+| `task_self/1` | `task_self(-integer)` |  |
+| `task_send/2` | `task_send(+integer,+term)` |  |
+| `task_wait/0` | `task_wait` |  |
+| `task_yield/0` | `task_yield` |  |
+
+</details>
+
+### Operating system
+
+<details markdown="1">
+<summary>22 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `busy/1` | `busy(+integer)` |  |
+| `cpu_time/1` | `cpu_time(-integer)` |  |
+| `date_time/6` | `date_time(-integer,-integer,-integer,-integer,-integer,-integer)` |  |
+| `date_time/7` | `date_time(-integer,-integer,-integer,-integer,-integer,-integer,-integer)` |  |
+| `get_time/1` | `get_time(-float)` |  |
+| `get_unbuffered_char/1` | `get_unbuffered_char(?character)` |  |
+| `get_unbuffered_code/1` | `get_unbuffered_code(?integer)` |  |
+| `getenv/2` | `getenv(+atom,-atom)` |  |
+| `now/0` | `now` |  |
+| `now/1` | `now(-integer)` |  |
+| `pclose/1` | `pclose(+stream)` |  |
+| `popen/4` | `popen(+source_sink,+atom,--stream,+list)` |  |
+| `process_create/3` | `process_create(+atom,+list,+list)` |  |
+| `process_kill/1` | `process_kill(+integer)` |  |
+| `process_kill/2` | `process_kill(+integer,+integer)` |  |
+| `setenv/2` | `setenv(+atom,+atom)` |  |
+| `shell/1` | `shell(+atom)` |  |
+| `shell/2` | `shell(+atom,-integer)` |  |
+| `sleep/1` | `sleep(+number)` |  |
+| `time/1` | `time(:callable)` |  |
+| `unsetenv/1` | `unsetenv(+atom)` |  |
+| `wall_time/1` | `wall_time(-integer)` |  |
+
+</details>
+
+### POSIX time
+
+<details markdown="1">
+<summary>22 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `pid/1` | `pid(-integer)` |  |
+| `posix_chmod/2` | `posix_chmod(+atom,+integer)` |  |
+| `posix_ctime/2` | `posix_ctime(+integer,-atom)` |  |
+| `posix_file_mode/2` | `posix_file_mode(+atom,-integer)` |  |
+| `posix_file_times/4` | `posix_file_times(+atom,-float,-float,-float)` |  |
+| `posix_file_type/2` | `posix_file_type(+atom,-atom)` |  |
+| `posix_fork/1` | `posix_fork(-integer)` |  |
+| `posix_getpid/1` | `posix_getpid(-integer)` |  |
+| `posix_getppid/1` | `posix_getppid(-integer)` |  |
+| `posix_gmtime/2` | `posix_gmtime(+integer,-compound)` |  |
+| `posix_link/2` | `posix_link(+atom,+atom)` |  |
+| `posix_localtime/2` | `posix_localtime(+integer,-compound)` |  |
+| `posix_mktime/2` | `posix_mktime(+compound,-integer)` |  |
+| `posix_readlink/2` | `posix_readlink(+atom,-atom)` |  |
+| `posix_realpath/2` | `posix_realpath(+atom,-atom)` |  |
+| `posix_rmdir/1` | `posix_rmdir(+atom)` |  |
+| `posix_set_file_times/3` | `posix_set_file_times(+atom,+number,+number)` |  |
+| `posix_strftime/3` | `posix_strftime(+atom,-atom,+compound)` |  |
+| `posix_strptime/3` | `posix_strptime(+atom,+atom,-compound)` |  |
+| `posix_symlink/2` | `posix_symlink(+atom,+atom)` |  |
+| `posix_time/1` | `posix_time(-integer)` |  |
+| `posix_unlink/1` | `posix_unlink(+atom)` |  |
+
+</details>
+
+### Regular expressions
+
+<details markdown="1">
+<summary>5 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `sre_compile/2` | `sre_compile(+string,-string,)` |  |
+| `sre_match/4` | `sre_match(+string,+string,-string,-string,)` |  |
+| `sre_matchp/4` | `sre_matchp(+string,+string,-string,-string,)` |  |
+| `sre_subst/4` | `sre_subst(+string,+string,-string,-string,)` |  |
+| `sre_substp/4` | `sre_substp(+string,+string,-string,-string,)` |  |
+
+</details>
+
+### CSV
+
+<details markdown="1">
+<summary>4 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `parse_csv_file/2` | `parse_csv_file(+atom,+list)` |  |
+| `parse_csv_line/2` | `parse_csv_line(+atom,-list)` |  |
+| `parse_csv_line/3` | `parse_csv_line(+atom,-compound,+options)` |  |
+| `write_csv_file/3` | `write_csv_file(+atom,+list,+options)` |  |
+
+</details>
+
+### Foreign function interface
+
+<details markdown="1">
+<summary>2 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `foreign_struct/2` | `foreign_struct(+atom,+list)` |  |
+| `use_foreign_module/2` | `use_foreign_module(+atom,+list)` |  |
+
+</details>
+
+### library(arithmetic)
+
+<details markdown="1">
+<summary>5 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `lsb/2` | `lsb(+integer,?integer)` |  |
+| `msb/2` | `msb(+integer,?integer)` |  |
+| `number_to_rational/2` | `number_to_rational(+number,-rational)` |  |
+| `popcount/2` | `popcount(+integer,?integer)` |  |
+| `rational_numerator_denominator/3` | `rational_numerator_denominator(+rational,-integer,-integer)` |  |
+
+</details>
+
+### library(builtins)
+
+<details markdown="1">
+<summary>66 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `absolute_filename/2` | `absolute_filename(+atom,?atom)` |  |
+| `append/1` | `append(+filename)` |  |
+| `argv/1` | `argv(-list)` |  |
+| `atom_number/2` | `atom_number(?atom,?number)` |  |
+| `atom_to_term/3` | `atom_to_term(+atomic,-term,-list)` |  |
+| `b_getval/2` | `b_getval(+atom,?term)` |  |
+| `b_setval/2` | `b_setval(+atom,+term)` |  |
+| `bagof/3` | `bagof(+term,:callable,?list)` | ISO |
+| `call_residue_vars/2` | `call_residue_vars(@goal,-list)` |  |
+| `call_with_inference_limit/3` | `call_with_inference_limit(:callable,+integer,-term)` |  |
+| `chars_base64/3` | `chars_base64(+atom,?atom,+list)` |  |
+| `chars_urlenc/3` | `chars_urlenc(+atom,?atom,+list)` |  |
+| `compound_name_arguments/3` | `compound_name_arguments(?compound,?atomic,?list)` |  |
+| `compound_name_arity/3` | `compound_name_arity(?compound,?atomic,?integer)` |  |
+| `current_op/3` | `current_op(?integer,?atom,?atom)` | ISO |
+| `current_prolog_flag/2` | `current_prolog_flag(+callable,+term)` | ISO |
+| `deconsult/1` | `deconsult(+list)` |  |
+| `destroy_module/1` | `destroy_module(+atom)` |  |
+| `engine_create/3` | `engine_create(+term,+callable,?stream)` |  |
+| `engine_create/4` | `engine_create(+term,+callable,?stream,+list)` |  |
+| `evaluable_property/2` | `evaluable_property(+callable,+term)` | ISO |
+| `flag/3` | `flag(+term,?term,+term)` |  |
+| `flatten/2` | `flatten(?list,?list)` |  |
+| `get0/1` | `get0(?integer)` |  |
+| `get0/1` | `get0(+term)` |  |
+| `get0/2` | `get0(+stream,?integer)` |  |
+| `get0/2` | `get0(+stream,+term)` |  |
+| `halt/0` | `halt` | ISO |
+| `halt/1` | `halt(+integer)` | ISO |
+| `in_temporary_module/3` | `in_temporary_module(?atom,:callable,:callable)` |  |
+| `length/2` | `length(?term,?integer)` |  |
+| `load_files/1` | `load_files(+list)` |  |
+| `name/2` | `name(?atomic,?list)` |  |
+| `nb_current/2` | `nb_current(?atom,?term)` |  |
+| `nb_delete/1` | `nb_delete(+atom)` |  |
+| `nb_getval/2` | `nb_getval(+atom,?term)` |  |
+| `nb_setval/2` | `nb_setval(+atom,+term)` |  |
+| `numbervars/3` | `numbervars(+term,+integer,?integer)` |  |
+| `open/3` | `open(+atom,+atom,--stream)` | ISO |
+| `predicate_property/2` | `predicate_property(+callable,+term)` | ISO |
+| `pretty/1` | `pretty(+predicateindicator)` |  |
+| `print/1` | `print(+term)` |  |
+| `print/2` | `print(+stream,+term)` |  |
+| `process_wait/2` | `process_wait(+integer,-term)` |  |
+| `process_wait/3` | `process_wait(+integer,-term,?list)` |  |
+| `put/1` | `put(+integer)` |  |
+| `put/2` | `put(+stream,+integer)` |  |
+| `raw_argv/1` | `raw_argv(-list)` |  |
+| `read_from_atom/2` | `read_from_atom(+atom,?term)` |  |
+| `read_from_chars/2` | `read_from_chars(+chars,?term)` |  |
+| `reconsult/1` | `reconsult(+list)` |  |
+| `see/1` | `see(+filename)` |  |
+| `setof/3` | `setof(+term,+callable,?list)` | ISO |
+| `sre_match_all/3` | `sre_match_all(+pattern,+text,-list)` |  |
+| `sre_match_all_in_file/3` | `sre_match_all_in_file(+pattern,+filename,-list)` |  |
+| `sre_match_all_pos/3` | `sre_match_all_pos(+pattern,+subst,-list)` |  |
+| `sre_match_all_pos_in_file/3` | `sre_match_all_pos_in_file(+pattern,+filename,-list)` |  |
+| `sre_subst_all/4` | `sre_subst_all(+pattern,+text,+subst,-text)` |  |
+| `sre_subst_all_in_file/4` | `sre_subst_all_in_file(+pattern,+filename,+subst,-list)` |  |
+| `tell/1` | `tell(+filename)` |  |
+| `term_hash/3` | `term_hash(+term,+list,-integer)` |  |
+| `term_to_atom/2` | `term_to_atom(?term,?atom)` |  |
+| `term_variables/3` | `term_variables(+term,-list,?tail)` |  |
+| `thread_join/2` | `thread_join(+thread,-term)` |  |
+| `writeln/1` | `writeln(+term)` |  |
+| `writeln/2` | `writeln(+stream,+term)` |  |
+
+</details>
+
+### library(concurrent)
+
+<details markdown="1">
+<summary>4 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `await/2` | `await(+term,?term)` |  |
+| `future/3` | `future(+term,+callable,?list)` |  |
+| `future_all/2` | `future_all(+list,-term)` |  |
+| `future_any/2` | `future_any(+list,-term)` |  |
+
+</details>
+
+### library(freeze)
+
+<details markdown="1">
+<summary>3 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `freeze/2` | `freeze(-var,+goal)` |  |
+| `frozen/2` | `frozen(@term,-goal)` |  |
+| `list_to_conjunction/2` | `list_to_conjunction(?list,?list)` |  |
+
+</details>
+
+### library(iso_ext)
+
+<details markdown="1">
+<summary>13 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `call_cleanup/2` | `call_cleanup(:callable,:callable)` |  |
+| `call_det/2` | `call_det(:callable,?boolean)` |  |
+| `call_with_time_limit/2` | `call_with_time_limit(+number,:callable)` |  |
+| `cfor/3` | `cfor(+evaluable,+evaluable,-var)` |  |
+| `countall/2` | `countall(:callable,?integer)` | ISO |
+| `expand_goal/2` | `expand_goal(+callable,-callable)` |  |
+| `findall/4` | `findall(+term,:callable,-list,+list)` |  |
+| `setup_call_cleanup/3` | `setup_call_cleanup(:callable,:callable,:callable)` |  |
+| `subsumes_term/2` | `subsumes_term(+term,+term)` | ISO |
+| `succ/2` | `succ(?integer,+integer)` |  |
+| `succ/2` | `succ(+integer,-integer)` |  |
+| `time_out/3` | `time_out(:callable,+integer,?atom)` |  |
+| `variant/2` | `variant(+term,+term)` |  |
+
+</details>
+
+### library(lists)
+
+<details markdown="1">
+<summary>44 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `append/2` | `append(?list,?list)` |  |
+| `append/3` | `append(?term,?term,?term)` |  |
+| `exclude/2` | `exclude(:callable,?list)` |  |
+| `foldl/4` | `foldl(:callable,+list,+var,-var)` |  |
+| `foldl/5` | `foldl(:callable,+list,+list,+var,-var)` |  |
+| `foldl/6` | `foldl(:callable,+list,+list,+list,+var,-var)` |  |
+| `include/2` | `include(:callable,?list)` |  |
+| `intersection/3` | `intersection(+list,+list,-list)` |  |
+| `is_set/1` | `is_set(+list)` |  |
+| `last/2` | `last(+list,-term)` |  |
+| `list_max/2` | `list_max(+list,?integer)` |  |
+| `list_min/2` | `list_min(+list,?integer)` |  |
+| `list_sum/2` | `list_sum(+list,?integer)` |  |
+| `maplist/2` | `maplist(:callable,+list)` |  |
+| `maplist/3` | `maplist(:callable,+list,+list)` |  |
+| `maplist/4` | `maplist(:callable,+list,+list,+list)` |  |
+| `maplist/5` | `maplist(:callable,+list,+list,+list,+list)` |  |
+| `maplist/6` | `maplist(:callable,+list,+list,+list,+list,+list)` |  |
+| `maplist/7` | `maplist(:callable,+list,+list,+list,+list,+list,+list)` |  |
+| `maplist/8` | `maplist(:callable,+list,+list,+list,+list,+list,+list,+list)` |  |
+| `max_list/2` | `max_list(+list,?integer)` |  |
+| `member/2` | `member(?term,?term)` |  |
+| `memberchk/2` | `memberchk(?term,?term)` |  |
+| `min_list/2` | `min_list(+list,?integer)` |  |
+| `nth0/3` | `nth0(?integer,?term,?term)` |  |
+| `nth0/4` | `nth0(?integer,?term,?term,?term)` |  |
+| `nth1/3` | `nth1(?integer,?term,?term)` |  |
+| `nth1/4` | `nth1(?integer,+term,?term,?term)` |  |
+| `permutation/2` | `permutation(?list,?list)` |  |
+| `reverse/2` | `reverse(?list,?list)` |  |
+| `same_length/2` | `same_length(?list,?list)` |  |
+| `select/3` | `select(+term,+term,?term)` |  |
+| `selectchk/3` | `selectchk(+term,?term,?term)` |  |
+| `subtract/3` | `subtract(+list,+list,-list)` |  |
+| `sum_list/2` | `sum_list(+list,?integer)` |  |
+| `tasklist/2` | `tasklist(:callable,+list)` |  |
+| `tasklist/3` | `tasklist(:callable,+list,+list)` |  |
+| `tasklist/4` | `tasklist(:callable,+list,+list,+list)` |  |
+| `tasklist/5` | `tasklist(:callable,+list,+list,+list,+list)` |  |
+| `tasklist/6` | `tasklist(:callable,+list,+list,+list,+list,+list)` |  |
+| `tasklist/7` | `tasklist(:callable,+list,+list,+list,+list,+list,+list)` |  |
+| `tasklist/8` | `tasklist(:callable,+list,+list,+list,+list,+list,+list,+list)` |  |
+| `transpose/2` | `transpose(?list,?list)` |  |
+| `union/3` | `union(+list,+list,-list)` |  |
+
+</details>
+
+### library(sandbox)
+
+<details markdown="1">
+<summary>6 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `safe_call/1` | `safe_call(:callable)` |  |
+| `safe_call/2` | `safe_call(:callable,?term)` |  |
+| `safe_goal/1` | `safe_goal(:callable)` |  |
+| `safe_guard/2` | `safe_guard(:callable,-callable)` |  |
+| `safe_load/2` | `safe_load(+atom,+term)` |  |
+| `safe_load/3` | `safe_load(+atom,+term,+list)` |  |
+
+</details>
+
+### library(sqlite3)
+
+<details markdown="1">
+<summary>14 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `sqlite3_close/2` | `sqlite3_close(+stream,-integer)` |  |
+| `sqlite3_column_count/2` | `sqlite3_column_count(+stream,-integer)` |  |
+| `sqlite3_column_double/3` | `sqlite3_column_double(+stream,+integer,-float)` |  |
+| `sqlite3_column_int64/3` | `sqlite3_column_int64(+stream,+integer,-integer)` |  |
+| `sqlite3_column_name/3` | `sqlite3_column_name(+stream,+integer,-atom)` |  |
+| `sqlite3_column_text/3` | `sqlite3_column_text(+stream,+integer,-string)` |  |
+| `sqlite3_column_type/3` | `sqlite3_column_type(+stream,+integer,-integer)` |  |
+| `sqlite3_exec/6` | `sqlite3_exec(+stream,+atom,+integer,+integer,-integer,-integer)` |  |
+| `sqlite3_finalize/2` | `sqlite3_finalize(+stream,-integer)` |  |
+| `sqlite3_open/3` | `sqlite3_open(+atom,--stream,-integer)` |  |
+| `sqlite3_prepare_v2/6` | `sqlite3_prepare_v2(+stream,+atom,+integer,-integer,-integer,-integer)` |  |
+| `sqlite3_query/4` | `sqlite3_query(+stream,+string,-list,-list)` |  |
+| `sqlite3_step/2` | `sqlite3_step(+stream,-integer)` |  |
+| `sqlite_flag/2` | `sqlite_flag(+atom,-integer)` |  |
+
+</details>
+
+### library(tty)
+
+<details markdown="1">
+<summary>8 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `menu/3` | `menu(+term,+list,-term)` |  |
+| `tty_action/1` | `tty_action(+term)` |  |
+| `tty_clear/0` | `tty_clear` |  |
+| `tty_flash/0` | `tty_flash` |  |
+| `tty_goto/2` | `tty_goto(+integer,+integer)` |  |
+| `tty_nl/1` | `tty_nl(+integer)` |  |
+| `tty_size/2` | `tty_size(-integer,-integer)` |  |
+| `ttyflush/0` | `ttyflush` |  |
+
+</details>
+
+### Other
+
+<details markdown="1">
+<summary>11 predicates</summary>
+
+| Predicate | Template | |
+|---|---|---|
+| `/\/2` | `/\(+integer,+integer,-integer)` | ISO evaluable |
+| `=` | `=/2: =:=(+number,+number)` | ISO |
+| `=@=/2` | `=@=(+term,+term)` |  |
+| `=\=/2` | `=\=(+number,+number)` | ISO |
+| `?=/2` | `?=(+term,+term)` |  |
+| `\//2` | `\/(+integer,+integer,-integer)` | ISO evaluable |
+| `\/1` | `\(+integer,-integer)` | ISO evaluable |
+| `\+/1` | `\+(:callable)` | ISO |
+| `\=/2` | `\=(+term,+term)` | ISO |
+| `\==/2` | `\==(+term,+term)` | ISO |
+| `\=@=/2` | `\=@=(+term,+term)` |  |
+
+</details>
+
+<!-- END GENERATED PREDICATE REFERENCE -->
 
 
 Blackboard functions
 ====================
 
-The blackboard is module specific and shared among threads. The
+The blackboard is global in scope and shared among threads. The
 following are *SICStus Prolog* & *SWI-Prolog* (if `expects_dialect(sicstus)`)
 compatible:
 
@@ -610,6 +1707,38 @@ The following is undone on backtracking and is a *Scryer Prolog*
 extension:
 
 	bb_b_put/2					# bb_b_put(:atom, +term)
+
+For state a thread keeps to itself, the *SWI-Prolog* global variables
+are each thread's own, and *b_setval/2* is undone on backtracking:
+
+	b_setval/2					# b_setval(+atom, +term)
+	b_getval/2					# b_getval(+atom, ?term)
+	nb_setval/2					# nb_setval(+atom, +term)
+	nb_getval/2					# nb_getval(+atom, ?term)
+	nb_current/2				# nb_current(?atom, ?term)
+	nb_delete/1					# nb_delete(+atom)
+
+A *SWI-Prolog* compatible global counter, atomic across threads:
+
+	flag/3						# flag(+key, ?old, +new)
+
+The key is an atom, an integer or a compound (by name/arity), a flag
+never set is 0, and *new* is stored as is if an atom, else evaluated.
+
+Note: attributes are preserved across bb_put/bb_get like Scryer
+and SWI Prologs. But note: *bb_put/2* ensures copies of attributed
+variables, *bb_b_put/2* ensures live references:
+```console
+	✗ tpl -q
+	?- freeze(V1,writeln(hello(V1))), bb_put(key,V1), bb_get(key,V2), V1=99, V2=98.
+	hello(99)
+	hello(98)
+	   V1 = 99, V2 = 98.
+	?- freeze(V1,writeln(hello(V1))), bb_b_put(key,V1), bb_get(key,V2), V2=99.
+	hello(99)
+	   V1 = 99, V2 = 99.
+	?-
+```
 
 
 Crypto functions
@@ -714,104 +1843,108 @@ Examples...
 ```
 
 
-Application maps (dictionaries)
-===============================
-
-Maps use atomic key/value pairs only and are represented as
-pseudo-streams:
-
-	map_create/2					# map_create(-skiplist,+opts)
-	map_create/1					# map_create(-skiplist)
-	map_set/3						# map_set(+skiplist,+key,+value)
-	map_get/3						# map_get(+skiplist,+key,?value)
-	map_del/2						# map_del(+skiplist,+key)
-	map_count/2						# map_count(+skiplist,-count)
-	map_list/2						# map_list(+skiplist,?list)
-	map_close/1						# map_close(+skiplist)
-
-```console
-	$ tpl
-	?- map_create(S,[alias(foo)]).
-	   S = <$stream>(4).
-	?- map_set(foo,1,111), map_set(foo,two,222), map_set(foo,3,333).
-	   true.
-	?- map_get(foo,3,V).
-	   V = 333.
-	?- map_del(foo,3).
-	   true.
-	?- map_list(foo,L).
-	   L = [1=111,two=222].
-	?- map_close(foo).
-	   true.
-```
-
-Maps can store virtually unlimited amounts of volatile data in
-an efficient indexed manner.
-
-Maps don't require syntactic extensions to Prolog as found in
-other non-standard systems.
-
-A possible future extension would be to load a CSV file directly
-in a very efficient manner.
-
-
 HTTP 1.1
 ========
 
-	:- use_module(library(http)).
+After SWI-Prolog's libraries of the same names. Text comes back as
+strings, not atoms, unless asked for with *to(atom)*. The server serves
+one request at a time and returns only when stopped.
 
-	http_get/3				# http_get(Url, Data, Opts)
-	http_post/4				# http_post(Url, Data, Opts)
-	http_patch/4			# http_patch(Url, Data, Opts)
-	http_put/4				# http_put(Url, Data, Opts)
-	http_delete/3			# http_delete(Url, Data, Opts)
-	http_server/2			# http_server(Goal,Opts),
-	http_request/5			# http_request(S, Method, Path, Ver, Hdrs)
+	:- use_module(library(http/http_open)).
+	:- use_module(library(http/http_client)).
+	:- use_module(library(http/thread_httpd)).
+	:- use_module(library(http/http_dispatch)).
+	:- use_module(library(http/http_server)).	# the server and dispatch in one
+	:- use_module(library(http)).				# all of the above
+
+	http_open/3				# http_open(+Url, -Stream, +Opts)
+	http_get/3				# http_get(+Url, -Data, +Opts)
+	http_post/4				# http_post(+Url, +Data, -Reply, +Opts)
+	http_put/4				# http_put(+Url, +Data, -Reply, +Opts)
+	http_patch/4			# http_patch(+Url, +Data, -Reply, +Opts)
+	http_delete/3			# http_delete(+Url, -Data, +Opts)
+	http_read_data/3		# http_read_data(+Request, -Data, +Opts)
+	http_server/2			# http_server(:Goal, +Opts)
+	http_stop_server/2		# http_stop_server(+Port, +Opts)
+	http_handler/3			# http_handler(+Path, :Closure, +Opts)
+	http_dispatch/1			# http_dispatch(+Request)
+	http_redirect/3			# http_redirect(+How, +To, +Request)
+	http_404/2				# http_404(+Opts, +Request)
+	http_switch_protocol/2	# http_switch_protocol(:Goal, +Opts)
 
 ```console
 	?- http_get("https://github.com/trealla-prolog/trealla", Data, [status_code(Code)]).
 	   Data = "\n\n\n\n\n\n<!DOCTYPE html>\n<html\n"||... , Code = 200.
 ```
 
-A server *Goal* takes a single arg, the connection stream.
+A handler writes a CGI-style reply to current output: header lines, a
+blank line, then the body.
+
+```prolog
+	:- use_module(library(http/http_server)).
+	:- http_handler(root(hello), say_hi, []).
+
+	say_hi(_Request) :-
+		format("Content-type: text/plain~n~n"),
+		format("Hello World!~n").
+
+	main :- http_server(http_dispatch, [port(8080)]).
+```
+
+A handler can instead take the connection over, to go on in another
+protocol such as WebSocket on the same port. *http_switch_protocol/2*
+replies 101 Switching Protocols, with any *headers([Name(Value), ...])*
+given and no *Content-Length* or *Connection: close*, then calls
+*call(Goal, In, Out)* on the raw connection. In and Out are the one
+socket stream, to close once. If Goal succeeds the connection is its
+own, to keep or pass to a thread; if it fails or throws, the server
+closes it. As the server takes one request at a time, a long-lived
+protocol belongs in a thread Goal creates.
 
 
-Networking					##EXPERIMENTAL##
-==========
+URIs
+====
 
-	'$http_location'/2         # '$http_location'(?list,?url)
-	'$parse_url'/2             # '$parse_url'(?url,?list)
+	:- use_module(library(uri)).
+
+	uri_components/2			# uri_components(?Uri, ?Components)
+	uri_data/3					# uri_data(?Field, +Components, ?Data)
+	uri_data/4					# uri_data(+Field, +Components, +Data, -New)
+	uri_normalized/2			# uri_normalized(+Uri, -Normalized)
+	uri_normalized/3			# uri_normalized(+Uri, +Base, -Normalized)
+	iri_normalized/2			# iri_normalized(+Iri, -Normalized)
+	iri_normalized/3			# iri_normalized(+Iri, +Base, -Normalized)
+	uri_normalized_iri/2		# uri_normalized_iri(+Uri, -Normalized)
+	uri_normalized_iri/3		# uri_normalized_iri(+Uri, +Base, -Normalized)
+	uri_is_global/1				# uri_is_global(+Uri)
+	uri_resolve/3				# uri_resolve(+Uri, +Base, -Global)
+	uri_query_components/2		# uri_query_components(?String, ?Query)
+	uri_authority_components/2	# uri_authority_components(?Auth, ?Components)
+	uri_authority_data/3		# uri_authority_data(?Field, ?Components, ?Data)
+	uri_encoded/3				# uri_encoded(+Component, ?Value, ?Encoded)
+	uri_iri/2					# uri_iri(?Uri, ?Iri)
+	uri_file_name/2				# uri_file_name(?Uri, ?FileName)
+	uri_edit/3					# uri_edit(+Actions, +Uri, -NewUri)
+
+RFC-3986 syntax, resolution and normalization, after SWI-Prolog's
+*library(uri)*. Components come back as they appear in the URI, still
+percent-encoded: only the caller knows which component it is holding,
+and so which character set applies to it.
 
 ```console
 	$ tpl
-	?- '$parse_url'('http://www.xyz.org:81/hello?msg=Hello+World%21&foo=bar#xyz',P).
-	   P = [search([msg='Hello World!',foo=bar]),protocol(http),host('www.xyz.org'),port(81),path('/hello'),fragment(xyz)].
-	?- '$parse_url'(U,[search([msg='Hello World!',foo=bar]),protocol(http),host('www.xyz.org'),port(81),path('/hello'),fragment(xyz)]).
-	   U = 'http://www.xyz.org:81/hello?msg=Hello+World%21&foo=bar#xyz'.
+	?- use_module(library(uri)).
+	   true.
+	?- uri_components('http://www.xyz.org:81/hello?msg=Hello+World%21&foo=bar#xyz',C).
+	   C = uri_components(http,'www.xyz.org:81','/hello','msg=Hello+World%21&foo=bar',xyz).
+	?- uri_query_components('msg=Hello+World%21&foo=bar',Q).
+	   Q = [msg='Hello World!',foo=bar].
+	?- uri_resolve('../g','http://a/b/c/d;p?q',U).
+	   U = 'http://a/b/g'.
+	?- uri_normalized('HTTP://Example.COM/a/../b',N).
+	   N = 'http://example.com/b'.
 	?-
 ```
-
-	'$server'/2                # '$server'(+host,-stream)
-	'$server'/3                # '$server'(+host,-stream,+list)
-	'$accept'/2                # '$accept'(+stream,-stream)
-	'$client'/2                # '$client'(+url,-stream)
-	'$client'/4                # '$client'(+url,-host,-path,-stream)
-	'$client'/5                # '$client'(+url,-host,-path,-stream,+list)
-
-The options list can include *udp(bool)* (default is false),
-*nodelay(bool)* (default is true), *ssl(bool)* (default is false)
-and *certfile(filespec)*.
-
-Additional server options can include *keyfile(filespec)*. If just
-one concatenated file (keyfile+certfiles) is supplied, use
-*keyfile(filespec)* only.
-
-Optional schemes 'unix://', 'http://' (the default) and 'https://'
-can be provided in the client URL.
-
-With *'$bread'/3* the 'len' arg can be an integer > 0 meaning return that
-many bytes, = 0 meaning return whatever is there (if non-blocking) or
-a var meaning return all bytes until end end of file,
 
 
 Simple regular expressions
@@ -1000,11 +2133,14 @@ For example...
 	]).
 ```
 
-See the *library/raylib.pl* and *samples/test_raylib.pl* for an example
+See the *library/raylib.pl* and *samples/test_raylib1.pl* for an example
 usage including passing and returning structs by value.
 
 See the *library/curl.pl* and *samples/test_curl.pl* for an example
 usage downloading a file.
+
+See the *library/plplot.pl* and *samples/test_plplot.pl* for an example
+usage passing lists as C arrays to draw plots with PLplot.
 
 This is an example using SQLITE. Given the code in *samples/sqlite3.pl*...
 
@@ -1039,8 +2175,8 @@ support* standards proposal (ISO/IEC DTR 13211–5:2007), now lapsed.
 Note: a thread is also a queue and a mutex. Note this is an expired
 ISO standards proposal but is commonly supported.
 
-	thread_create/3				# thread_create(:callable,-thread,+opts)
-	thread_create/2				# thread_create(:callable,-thread)
+	thread_create/3				# thread_create(:callable,--thread,+opts)
+	thread_create/2				# thread_create(:callable,--thread)
 	thread_signal/2				# thread_signal(+thread,:callable)
 	thread_join/2				# thread_join(+thread,-term)
 	thread_cancel/1				# thread_cancel(+thread)
@@ -1051,6 +2187,7 @@ ISO standards proposal but is commonly supported.
 	thread_yield/0				# thread_yield
 	thread_property/2			# thread_property(+thread,+term)
 	thread_property/1			# thread_property(+term)
+	thread_local/1				# thread_local(+predicate_indicator)
 
 	thread_send_message/2		# thread_send_message(+queue,+term)
 	thread_send_message/1		# thread_send_message(+term)
@@ -1059,24 +2196,40 @@ ISO standards proposal but is commonly supported.
 	thread_peek_message/2		# thread_peek_message(+queue,?term)
 	thread_peek_message/1		# thread_peek_message(?term)
 
-Where 'opts' can be *alias(+atom)*, *at_exit(:term)* and/or *detached(+boolean)*
-(the default is *NOT* detached, ie. joinable).
-Note: `thread_cancel/1` is dangerous and should be avoided, it does
-not exist in some other Prologs and does not rightly belong in any standards
-proposal.
+A *thread_local/1* predicate, as in *SWI-Prolog*, is dynamic with the
+clauses each thread asserts kept to itself: a thread starts with none of
+them, and they go when it ends.
+
+Where 'opts' can be *alias(+atom)*, *at_exit(:term)*, *detached(+boolean)*
+(the default is *NOT* detached, ie. joinable) and/or *stack_limit(+integer)*,
+a cap in bytes on what the thread's query may have in use, past which it
+gets *resource_error(stack)*, as in *SWI-Prolog*.
+Note: `thread_cancel/1` does not exist in some other Prologs and does not
+rightly belong in any standards proposal. It asks the thread to stop, as
+if it had been signalled with `thread_exit(cancelled)`: the thread stops
+at its next goal even if busy or blocked, can't catch it, and runs its
+`at_exit` goal. It is also detached, so it goes away without a join,
+unless one is already waiting, which then gets `exited(cancelled)`.
+
+As in *SWI-Prolog*, a *thread_signal/2* reaches a thread blocked reading a
+stream or in a socket accept: the read is interrupted (by SIGUSR2, with
+a handler that does nothing), the signal's goal runs, and the read or
+accept carries on unless the goal threw.
 
 These are non-standard but *SWI-Prolog* compatible:
 
 	thread_join/1				# thread_join(+thread)
 	thread_get_message/3		# thread_get_message(+queue,?term,+opts)
 
-Where 'opts' can be *timeout(+float)* to specify a timeout in seconds.
+Where 'opts' can be *timeout(+float)* to specify a timeout in seconds,
+or *deadline(+float)* to give up at that time on *get_time/1*'s clock.
+With both, the earlier wins.
 
 Create a stand-alone message queue.
 Note: a queue is also a mutex.
 
-	message_queue_create/2		# message_queue_create(-queue,+opts)
-	message_queue_create/1		# message_queue_create(-queue)
+	message_queue_create/2		# message_queue_create(--queue,+opts)
+	message_queue_create/1		# message_queue_create(--queue)
 	message_queue_destroy/1		# message_queue_destroy(+queue)
 	message_queue_property/2	# message_queue_property(+queue,+term)
 
@@ -1084,8 +2237,8 @@ Where 'opts' can be *alias(+atom)*.
 
 Create a stand-alone mutex...
 
-	mutex_create/2				# mutex_create(-mutex,+opts)
-	mutex_create/1				# mutex_create(-mutex)
+	mutex_create/2				# mutex_create(--mutex,+opts)
+	mutex_create/1				# mutex_create(--mutex)
 	mutex_destroy/1				# mutex_destroy(+mutex)
 	mutex_property/2			# mutex_property(+mutex,+term)
 	with_mutex/2				# with_mutex(+mutex,:callable)
@@ -1110,59 +2263,24 @@ For example...
 	?-
 	```
 
-Prolog instances			##EXPERIMENTAL##
-================
-
-Start independent (no shared state) Prolog instances as dedicated
-pre-emptive threads and communicate via message queues. Each thread
-has it's own message queue associated with it. Note: the database
-is *not* shared. For shared state consider using the blackboard.
-
-	pl_thread/3				# pl_thread(-thread,+filename,+options)
-	pl_thread/2				# pl_thread(-thread,+filename)
-
-Where 'options' can be (currently just) *alias(+atom)*.
-
-	pl_msg_send/2			# pl_msg_send(+thread,+term)
-	pl_msg_recv/2			# pl_msg_recv(-thread,-term)
-
-
-For example...
-
-```console
-	$ cat samples/thread_calc.pl
-	:- initialization(main).
-
-	% At the moment we only do sqrt here...
-
-	main :-
-		write('Calculator running...'), nl,
-		repeat,
-			pl_msg_recv(Tid, Term),
-			Term = sqrt(X, Y),
-			Y is sqrt(X),
-			pl_msg_send(Tid, Term),
-			fail.
-
-	$ tpl
-	?- pl_thread(_, 'samples/thread_calc.pl', [alias(calc)]).
-	Calculator running...
-	?- Term = sqrt(2, V),
-		pl_msg_send(calc, Term),
-		pl_msg_recv(_, Term).
-	   Term = sqrt(2,1.4142135623731), V = 1.4142135623731.
-	?-
-```
-
 Concurrent Tasks						##EXPERIMENTAL##
 ================
 
 Co-operative multitasking is available in the form of light-weight
 coroutines that run until they yield either explicitly or implicitly
-(when waiting on an event of some kind). They are called a `task` here.
+(when waiting on an event of some kind using pol() where available).
 
-	call_task/[1-n]	        # concurrent form of call/1-n
+	task_call/[1-8]	        # concurrent form of call/1-n
 	tasklist/[2-8]          # concurrent form of maplist/1-n
+	task_wait/0             # run tasks until this one's own are done
+	task_end_wait/0         # release the owner from task_wait/0 early
+	task_yield/0            # let the other tasks have a turn
+	task_fork/0             # run the rest of the clause as a new task
+
+These, with *task_send/2* and *task_recv/1,2* below, were *call_task/N*,
+*wait/0*, *end_wait/0*, *yield/0*, *fork/0*, *send/2* and *recv/1,2*
+before taking the *task_* prefix. That leaves the plain names free for
+programs and libraries to define, an actor library's *send/2* for one.
 
 An example:
 
@@ -1202,68 +2320,57 @@ An example:
 	Time elapsed 0.33 secs
 ```
 
-Linda Co-ordination Language			##EXPERIMENTAL##
-============================
+GUSTTO: unifying threads and tasks					##EXPERIMENTAL##
+===================================
 
-Implements a toy (local-only) version of Linda using tasks. See:
-[swi-prolog](https://www.swi-prolog.org/pldoc/man?section=tipc-linda-clients).
+GUSTTO gave a thread its own scheduler and gave tasks the same
+suspend/resume, timer and mailbox machinery threads already had, so a
+cooperative task and a real thread can address and message each other
+the same way. Full design history is in `docs/DESIGN-GUSTTO.md`.
 
-	linda_eval/1                    # linda_eval(:goal)
-	out/1                           # out(+tuple)
-	in/1                            # in(?tuple)
-	rd/1                            # rd(?tuple)
-	inp/1                           # inp(?tuple)
-	rdp/1                           # rdp(?tuple)
-	bagof_in_noblock/3              # bagof_in_noblock(+term,+tuple,?list)
-	bagof_rd_noblock/3              # bagof_rd_noblock(+term,+tuple,?list)
-	wait/0
-	end_wait/0
+Every query - task, thread, or plain top-level - has a *qid*, usable
+as an address once it calls `task_self/1` to learn its own:
 
-For example:
+	task_self/1				# task_self(-integer)
+	task_create/2			# task_create(:callable,-integer)
+	task_send/2				# task_send(+integer,+term)
+	task_recv/1				# task_recv(?term)
+	task_recv/2				# task_recv(?term,+opts)
+	task_cancel/1			# task_cancel(+integer)
+
+`task_recv/1` never blocks; `task_recv/2` does, with *timeout(+float)* in opts
+for a bound or none for indefinite. Selective receive scans the
+mailbox in place - a message that does not match stays where it is.
+`task_create/2` hands back the new task's qid immediately, unlike
+`task_self/1`, which only the task itself can call. `task_cancel/1`
+works across threads; being cooperative, it lands at the task's next
+scheduling checkpoint, not mid-instruction.
+
+Two actor libraries sit on top, same shape, different backend:
+
+	library(actors/threads)	# actors are real OS threads
+	library(actors/tasks)		# actors are cooperative tasks
+
+`library(actors/threads)` gives real parallelism, at whatever ceiling
+the platform puts on live threads. `library(actors/tasks)` trades that
+for scale - tasks are heap-allocated query structs, not OS threads, so
+an actor count the thread version cannot reach is fine. There can be millions
+of tasks. Neither replaces the other. Both export `_spawn/2,3`, `_self/1`, `_send/2`,
+`_recv/1,2`, `_link/1`, `_unlink/1`, and a minimal one-for-one
+`_supervisor_start/2,3` / `_supervisor_stop/1`, under their own
+`actor_` / `task_actor_` prefix.
 
 ```prolog
-	:- use_module(library(linda)).
-	:- initialization(main).
+:- use_module(library(actors/tasks)).
 
-	main :-
-		linda_eval(consumer('A')),
-		linda_eval(consumer('B')),
-		linda_eval(producer),
-		wait,
-		in(producer),               % verify it finished normally
-		writeq(done), nl,
-		halt.
+pong(Parent) :- task_actor_recv(ping), task_actor_send(Parent, pong).
 
-	producer :-
-		between(1, 10, I),
-			out({msg:I}),
-			sleep(0.25),
-			fail.
-	producer :-
-		forall(rdp({msg:_}), sleep(0.001)),
-		end_wait.
-
-	consumer(N) :-
-		in({msg:I}),
-		write(['consumer',N,'got=',I]), nl,
-		random(R),
-		sleep(R),
-		fail.
-```
-
-```console
-	$ tpl samples/test_linda.pl
-	[consumer,B,got=,1]
-	[consumer,B,got=,2]
-	[consumer,B,got=,3]
-	[consumer,A,got=,4]
-	[consumer,B,got=,5]
-	[consumer,A,got=,6]
-	[consumer,B,got=,7]
-	[consumer,A,got=,8]
-	[consumer,A,got=,9]
-	[consumer,B,got=,10]
-	done
+:- task_actor_self(Me),
+   task_actor_spawn(pong(Me), Pid),
+   task_actor_send(Pid, ping),
+   task_wait,
+   task_actor_recv(pong),
+   writeln(got_pong).
 ```
 
 Concurrent Futures						##EXPERIMENTAL##
@@ -1335,7 +2442,177 @@ For example:
 	?- ^D%
 ```
 
-Compile to standalone		##EXPERIMENTAL##
+Embedding in C
+==============
+
+A normal `make` builds `libtrealla.a` alongside `tpl`, from every object
+except the one carrying `main()`. Link against it and include
+`src/trealla.h`; `make install` installs both.
+
+	#include "trealla.h"
+
+	prolog *pl = pl_create();
+	set_dump_vars(pl, 0);			// don't also print answers
+	pl_consult(pl, "facts.pl");
+
+	pl_sub_query *q = NULL;
+	pl_query(pl, "likes(john, X)", &q, 0);
+
+	if (get_status(pl)) {			// was there a first solution?
+		do {
+			pl_term *x = pl_binding(q, "X");
+			printf("%s\n", pl_atom_text(x));
+		} while (pl_redo(q));
+	}
+
+	pl_destroy(pl);
+
+The return value of `pl_eval` and `pl_query` says only that no *error*
+occurred. Success or failure is `get_status()`, errors are `get_error()`:
+
+| Call | Returns | Success/failure |
+|---|---|---|
+| `pl_eval` | `!error` | `get_status()` |
+| `pl_query` | `!error` | `get_status()` — whether a first solution was found |
+| `pl_redo` | another solution exists | destroys the query itself on false |
+| `pl_done` | released | only on a query `pl_redo` has not exhausted |
+
+Answers can be inspected rather than printed. A `pl_term` is a view onto
+part of the current answer, owned by the query and valid until the next
+`pl_redo()` or `pl_done()`:
+
+| Call | |
+|---|---|
+| `pl_num_bindings/pl_binding_name/pl_binding_value` | enumerate the goal's variables |
+| `pl_binding(q, "X")` | the value bound to a named variable, or NULL if unbound |
+| `pl_term_type` | `PL_TYPE_VAR`, `_INTEGER`, `_FLOAT`, `_ATOM`, `_STRING`, `_COMPOUND` |
+| `pl_atom_text`, `pl_atom_len` | an atom or string |
+| `pl_get_int64`, `pl_get_float` | false if it does not fit — integers are unbounded |
+| `pl_term_text` | canonical text of any term, caller frees — this is how a bignum is read |
+| `pl_functor`, `pl_arity`, `pl_arg` | walking a compound |
+
+`pl_query` prints each answer the way the toplevel does, which an
+embedder reading them itself will not want: `set_dump_vars(pl, 0)` turns
+that off. It is on by default, so existing hosts are unaffected.
+
+`samples/embed.c` is a worked example and a smoke test: it links exactly
+the way an embedder would, and `make misc` runs it.
+
+
+Python interface (Janus)			##EXPERIMENTAL##
+========================
+
+`library(janus)` presents the Janus interface that SWI-Prolog and XSB
+have agreed on. It is **not** in a default build and a stock `make`
+references Python in no form at all — no header, no library, no embedded
+module. Build it explicitly:
+
+	make janus
+
+libpython is then found by `dlopen` at run time, so nothing about the
+build depends on Python being installed. Set `PROLOG_PYTHON_LIB` to
+override the search.
+
+	:- use_module(library(janus)).
+
+	?- py_call(math:factorial(30), X).
+	   X = 265252859812191058636308480000000
+
+	?- py_func(builtins, sorted([3,1,2], reverse = @true), X).
+	   X = [3,2,1]
+
+	?- forall(py_iter(builtins:range(4), X), (write(X), nl)).
+
+Values are translated both ways: integers (unbounded, both sides),
+floats, atoms as `str`, lists, `-/N` compounds as tuples, `{k:v}` as
+dicts, `py_set/1` as sets, rationals as `fractions.Fraction`, and
+`@true`/`@false`/`@none`. Anything else becomes an opaque handle
+released with `py_free/1`.
+
+Implemented: `py_call/2,3`, `py_func/3,4`, `py_dot/3,4`, `py_iter/2,3`,
+`py_setattr/3`, `py_free/1`, `py_is_object/1`, `py_add_lib_dir/1,2`,
+`py_lib_dirs/1`, `keys/2`, `key/2`, `values/3`, `items/2`, plus the XSB
+spellings `add_py_lib_dir/1`, `obj_dir/2`, `obj_dict/2`, `value/3`,
+`janus_python_version/1`, `py_next/2`, and `py_version/0`, `py_type/2`,
+`py_pp/1`.
+
+Translation follows subclasses, so a `fractions.Fraction`, a
+`collections.Counter` and a namedtuple all arrive as the right Prolog
+term without being named anywhere. What a library declares is up to the
+library, though, and numpy is not consistent with itself: `np.float64`
+and `np.str_` are subclasses of `float` and `str` and cross cleanly,
+while `np.int64`, `np.bool_` and `ndarray` are not subclasses of
+anything and arrive as opaque handles. Call `.item()` on a scalar and
+`.tolist()` on an array at the boundary:
+
+	?- py_call(numpy:mean([1,2,3]), M).       % a float
+	   M = 2.0
+	?- py_call(numpy:sum([1,2,3]), S).        % np.int64 - a handle
+	   S = '$py_obj'(...)
+	?- py_call(numpy:sum([1,2,3]), H), py_dot(H, item(), S), py_free(H).
+	   S = 6
+
+A zero-argument method call is written `f()` in both reference systems.
+ISO has no such term, so it is off by default and enabled per file:
+
+	:- set_prolog_flag(empty_args, true).
+
+	?- py_call(builtins:dict(), X).
+	   X = {}
+
+With the flag set, `f()` reads as the ordinary compound `'()'(f)` and
+writes back as `f()`. Without it, write `'()'(f)` directly.
+
+`make janus-test` runs the acceptance suite. See `docs/janus-design.md`.
+
+The other direction — calling Prolog from Python — is a CPython extension
+module built separately. It is the only part of the project that needs
+Python *headers* rather than a libpython to `dlopen`:
+
+	make janus-py
+
+That produces `janus_trealla.so`, which links `libtrealla.a`:
+
+	import janus_trealla as janus
+
+	janus.consult("facts.pl")
+
+	janus.query_once("X is 6*7")         # {'X': 42, 'truth': True}
+	janus.query_once("fail")             # {'truth': False}
+
+	for answer in janus.query("member(X, [a,b,c])"):
+	    print(answer["X"])               # a b c
+
+	# values go in as bindings, not as text spliced into the goal
+	janus.query_once("Y is X*2", {"X": 21})          # {'X': 21, 'Y': 42, ...}
+
+	# apply appends the output as the last argument
+	list(janus.apply("user", "between", 1, 6))       # [1, 2, 3, 4, 5, 6]
+
+	with janus.query("between(1, 1000000, X)") as q:
+	    first = next(iter(q))["X"]       # closing releases the query
+
+Answers are read through the `pl_term` API above, not scraped from what
+the engine prints, and the translation table runs in reverse: unbounded
+integers, floats, atoms as `str`, lists, `-/N` as tuples, `{k:v}` as
+dicts, `py_set/1` as sets, `@true`/`@false`/`@none`, and anything with no
+Python counterpart as its canonical text. A goal that will not parse
+raises `SyntaxError`, one that throws raises `RuntimeError`, and a goal
+that merely fails is `{'truth': False}`.
+
+`inputs` takes the same types in the other direction, including integers
+past CPython's 4300-digit limit on decimal conversion — those cross as
+hex, in both directions.
+
+`make janus-py-test` runs its acceptance suite.
+
+`make janus-conformance` runs a port of the shared XSB/SWI compatibility
+suite against that suite's own Python fixtures. It needs those fixtures,
+which are not shipped here — set `JANUS_XSB_TESTS` to the `xsb_tests`
+directory of SWI's swipy package, or it reports a skip.
+
+
+Compile to standalone
 =====================
 
 ```
@@ -1355,6 +2632,71 @@ Compile to standalone		##EXPERIMENTAL##
 	✗ ./tpl
 	Hello, world!
 ```
+
+Compile to freestanding
+=======================
+
+An example freestanding image for a Raspberry Pi 4:
+
+```
+	✗ cat ports/rpi4/blink.pl
+
+	% GPIO21 is physical pin 40 on the 40-pin header. Put a meter between pin 40
+	% and any ground pin (39 is next door) and it should swing between roughly
+	% 0 V and 3.3 V every two seconds. For an LED, wire it through a 330R-1k
+	% resistor; the pin's drive is a few milliamps, not a lamp driver.
+	%
+	% blink/0 is last-call recursive, so this runs forever without growing the
+	% stack. Nothing halts the board: pull the power when you are done.
+
+	:- initialization(main).
+
+	main :-
+		gpio_mode(21, output),
+		blink.
+
+	blink :-
+		gpio_write(21, 1),
+		delay_ms(2000),
+		gpio_write(21, 0),
+		delay_ms(2000),
+		blink.
+
+	✗ make rpi4-app main=ports/rpi4/blink.pl
+```
+
+
+GPIO
+====
+
+Hosted Linux builds can drive GPIO pins through the character device:
+
+```
+	✗ make LINUX_GPIO=1
+	✗ tpl -g "gpio_chip(N,L,C), write(L), nl, halt"
+	pinctrl-bcm2711
+```
+
+The predicates match the Raspberry Pi 4 freestanding port's, so the same Prolog
+runs bare metal or hosted. See the [GPIO notes](docs/gpio.md).
+
+
+Statistics
+==========
+
+`statistics/0` prints the query's counters. `statistics/2` takes a key:
+
+| Key | Value |
+|---|---|
+| `cputime` | CPU seconds used by the query, as a float |
+| `runtime` | `[Total, SinceLast]` CPU milliseconds |
+| `wall` | wall-clock time in milliseconds |
+| `gctime` | always `0.0` |
+| `frames`, `choices`, `trails`, `slots` | how many are in use now |
+| `heap` | the current position in the heap page |
+| `max_frames`, `max_choices`, `max_trails`, `max_slots` | the most in use at once so far |
+| `max_heap` | the most heap cells in use at once so far |
+| `profile` | writes per-predicate counts as CSV to stderr, see below |
 
 
 Profile

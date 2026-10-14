@@ -1,0 +1,13 @@
+quads: MALFORMED tests/issues/test1078.pl:12
+   ?- X=1.
+   not an answer: 1=X
+quads: MALFORMED tests/issues/test1078.pl:15
+   ?- Y=1.
+   not an answer: Y=2
+quads: MALFORMED tests/issues/test1078.pl:18
+   ?- Z=f(W),W=1.
+   not an answer: Z=f(W)
+quads: BAD_ID tests/issues/test1078.pl:21
+   ?- true.
+   identifier is not ground
+quads: 6 run, 2 passed, 4 failed.

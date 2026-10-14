@@ -35,17 +35,26 @@ static void show_goals(query *q, int num)
 
 int check_interrupt(query *q)
 {
-#ifndef __wasi__
-#ifndef _WIN32
+	thread *self = q->thread_ptr ? q->thread_ptr : q->pl->main_thread;
+
+	if (self->timedout) {
+		self->timedout = 0;
+
+		if (!throw_error(q, q->st.instr, q->st.cur_ctx, "time_limit_exceeded", "timed_out"))
+			q->retry = true;
+
+		return 2;   // timeout handled: break C-level loops, WAM loop continues
+	}
+
+#if !defined(__wasi__) && !defined(_WIN32)
 	if (g_tpl_interrupt == SIGALRM) {
 		g_tpl_interrupt = 0;
 
 		if (!throw_error(q, q->st.instr, q->st.cur_ctx, "time_limit_exceeded", "timed_out"))
 			q->retry = true;
 
-		return 0;
+		return 2;   // timeout handled: break C-level loops, WAM loop continues
 	}
-#endif
 #endif
 
 	if (!q || !q->top || !q->top->interactive) {
@@ -54,7 +63,7 @@ int check_interrupt(query *q)
 	}
 
 	g_tpl_interrupt = 0;
-	signal(SIGINT, &sigfn);
+	signal(SIGINT, &g_sigfn);
 
 	for (;;) {
 		printf("\nAction or (h)elp: ");
@@ -63,6 +72,16 @@ int check_interrupt(query *q)
 
 		fflush(stdout);
 		int ch = history_getch();
+
+		if (ch == EOF) {			// no input left: abort, don't re-prompt forever
+			printf("\n");
+			q->is_redo = true;
+			q->retry = QUERY_RETRY;
+			q->pl->did_dump_vars = false;
+			q->noretry = true;
+			break;
+		}
+
 #ifndef __wasi__
 		printf("%c\n", ch);
 #endif
@@ -97,9 +116,9 @@ int check_interrupt(query *q)
 			goto LOOP;
 		}
 
-		if (isdigit(ch)) {
+		if (iswdigit(ch)) {
 			q->fail_on_retry = true;
-			q->autofail_n = isdigit(ch) ? (unsigned)ch - '0' : INT_MAX;
+			q->autofail_n = iswdigit(ch) ? (unsigned)ch - '0' : INT_MAX;
 			break;
 		}
 
@@ -174,6 +193,15 @@ bool check_redo(query *q)
 		fflush(stdout);
 		int ch = history_getch();
 
+		if (ch == EOF) {			// no input left: stop enumerating, don't re-prompt forever
+			printf("  ... .\n");
+			q->is_redo = true;
+			q->retry = QUERY_RETRY;
+			q->pl->did_dump_vars = true;
+			q->noretry = true;
+			break;
+		}
+
 		if ((ch == 'h') || (ch == '?')) {
 			printf("Action:\n"
 				"\tENTER,.     abort        - abort current query\n"
@@ -194,14 +222,14 @@ bool check_redo(query *q)
 	printf(" ");
 #endif
 
-		if ((ch == 'a') || (ch == 'f') || isdigit(ch)) {
+		if ((ch == 'a') || (ch == 'f') || iswdigit(ch)) {
 			printf(" ");
 			fflush(stdout);
 			q->is_redo = true;
 			q->retry = QUERY_RETRY;
 			q->pl->did_dump_vars = false;
 			q->fail_on_retry = true;
-			q->autofail_n = isdigit(ch) ? (unsigned)ch - '0' : ch == 'f' ? 5-(q->retries%5) : INT_MAX;
+			q->autofail_n = iswdigit(ch) ? (unsigned)ch - '0' : ch == 'f' ? 5-(q->retries%5) : INT_MAX;
 			break;
 		}
 
@@ -229,9 +257,9 @@ bool check_redo(query *q)
 			break;
 		}
 
-		if (isdigit(ch)) {
+		if (iswdigit(ch)) {
 			q->fail_on_retry = true;
-			q->autofail_n = isdigit(ch) ? (unsigned)ch - '0' : INT_MAX;
+			q->autofail_n = iswdigit(ch) ? (unsigned)ch - '0' : INT_MAX;
 			break;
 		}
 
@@ -337,6 +365,18 @@ bool query_redo(query *q)
 	return start(q);
 }
 
+// Leave an answer half-written, after a print that threw.
+
+static void end_dump(query *q)
+{
+	fprintf(stdout, "\n");
+	fflush(stdout);
+	q->is_dump_vars = q->is_input = false;
+	q->pl->did_dump_vars = true;
+	clear_write_options(q);
+	clear_results();
+}
+
 void dump_vars(query *q, bool partial)
 {
 	if (q->in_attvar_print)
@@ -346,15 +386,16 @@ void dump_vars(query *q, bool partial)
 	const frame *f = GET_FRAME(0);
 	q->is_dump_vars = true;
 	q->tab_idx = 0;
+	q->num_cycle_vars = 0;
 	clear_write_options(q);
 
 	for (unsigned i = 0; i < p->num_vars; i++) {
 		int j;
 
-		if ((GET_POOL(q, p->vartab.off[i])[0] == '_')
-			&& isalpha(GET_POOL(q, p->vartab.off[i])[1])
-			&& ((j = varunformat(GET_POOL(q, p->vartab.off[i])+1)) != -1))
-			q->ignores[j] = true;
+		if ((GET_POOL(q, vartab_off(p, i))[0] == '_')
+			&& isalpha((unsigned char)GET_POOL(q, vartab_off(p, i))[1])
+			&& ((j = varunformat(GET_POOL(q, vartab_off(p, i))+1)) != -1))
+			ignore_name(q, j);
 	}
 
 	// Build the var-names list for dumping vars...
@@ -364,7 +405,7 @@ void dump_vars(query *q, bool partial)
 	for (unsigned i = 0; i < p->num_vars; i++) {
 		cell tmp[3];
 		make_instr(tmp, g_eq_s, NULL, 2, 2);
-		make_atom(tmp+1, p->vartab.off[i]);
+		make_atom(tmp+1, vartab_off(p, i));
 		make_var(tmp+2, g_anon_s, i);
 		append_list(q, tmp);
 	}
@@ -376,18 +417,18 @@ void dump_vars(query *q, bool partial)
 	bool want_space = false, any = false, anons = false;
 	q->variable_names = vlist;
 	q->variable_names_ctx = 0;
-	q->print_idx = 0;
+	q->print_idx = q->name_idx = 0;
 
 	for (unsigned i = 0; i < p->num_vars; i++) {
-		if (!strcmp(GET_POOL(q, p->vartab.off[i]), "__G_"))
+		if (!strcmp(GET_POOL(q, vartab_off(p, i)), "__G_"))
 			continue;
 
-		if (!strcmp(GET_POOL(q, p->vartab.off[i]), "_")) {
+		if (!strcmp(GET_POOL(q, vartab_off(p, i)), "_")) {
 			anons = true;
 			continue;
 		}
 
-		if (q->pl->quiet && GET_POOL(q, p->vartab.off[i])[0] == '_')
+		if (q->pl->quiet && GET_POOL(q, vartab_off(p, i))[0] == '_')
 			continue;
 
 		slot *e = get_slot(q, f, i);
@@ -402,8 +443,10 @@ void dump_vars(query *q, bool partial)
 			continue;
 
 		if (is_ref(c)) {
-			if (GET_POOL(q, p->vartab.off[c->var_num])[0] == '_')
+#if 0
+			if (GET_POOL(q, vartab_off(p, c->var_num))[0] == '_')
 				continue;
+#endif
 		}
 
 		if (any)
@@ -414,14 +457,14 @@ void dump_vars(query *q, bool partial)
 			fprintf(stdout, " ");
 
 		if (is_rational(c))
-			fprintf(stdout, "%s is ", GET_POOL(q, p->vartab.off[i]));
+			fprintf(stdout, "%s is ", GET_POOL(q, vartab_off(p, i)));
 		else
-			fprintf(stdout, "%s = ", GET_POOL(q, p->vartab.off[i]));
+			fprintf(stdout, "%s = ", GET_POOL(q, vartab_off(p, i)));
 
 		int j = check_duplicate_result(q, i, c, c_ctx);
 
 		if ((j >= 0) && ((unsigned)j != i)) {
-			fprintf(stdout, "%s", GET_POOL(q, p->vartab.off[j]));
+			fprintf(stdout, "%s", GET_POOL(q, vartab_off(p, j)));
 			any = true;
 			continue;
 		}
@@ -430,7 +473,7 @@ void dump_vars(query *q, bool partial)
 		want_space = false;
 
 		if (is_compound(c)) {
-			unsigned pri = match_op(q->st.m, C_STR(q, c), NULL, c->arity);
+			unsigned pri = match_op(q->st.m, C_STR(q, c), NULL, get_arity(c));
 
 			if (pri >= 700)
 				parens = true;
@@ -469,14 +512,63 @@ void dump_vars(query *q, bool partial)
 		q->parens = parens;
 		q->dump_var_num = i;
 		q->numbervars = true;
-		e->vgen = ++q->vgen;
+		q->dump_var_cell = c;
+		q->dump_var_cell_ctx = c_ctx;
+		if (++q->vgen == 0) q->vgen = 1;
+		set_vgen(q, e, q->vgen);
 
-		print_term(q, stdout, c, c_ctx, 1);
+		// An answer too big to print throws (issue #801): stop here
+		// rather than carry on with half a binding written.
+
+		if (!print_term(q, stdout, c, c_ctx, 1)) {
+			end_dump(q);
+			return;
+		}
 
 		if (parens) fputc(')', stdout);
 		if (q->last_thing == WAS_SYMBOL) want_space = true;
 		if (q->did_quote) want_space = false;
 		any = true;
+	}
+
+	// A cyclic answer whose cycle starts below the reported variable
+	// closed the loop on a name of its own (issue #1138); give each one
+	// its equation, so S = "zabcdef"||_S1 says which string _S1 is.
+	// Printing an equation can meet a further cycle entry, so walk by
+	// index rather than caching the count.
+
+	for (unsigned i = 0; i < q->num_cycle_vars; i++) {
+		const frame *cf = GET_FRAME(q->cycle_vars[i].ctx);
+		slot *ce = get_slot(q, cf, q->cycle_vars[i].var_num);
+		cell *cc = deref(q, &ce->c, ce->c.val_ctx);
+		pl_ctx cc_ctx = q->latest_ctx;
+
+		if (any)
+			fprintf(stdout, ", ");
+		else if (!q->is_redo || q->is_input)
+			fprintf(stdout, "   ");
+		else
+			fprintf(stdout, " ");
+
+		char nbuf[256];
+		fprintf(stdout, "%s = ", cycle_slot_name(q, i + 1, nbuf));
+		q->max_depth = q->pl->def_max_depth;
+		q->double_quotes = q->pl->def_double_quotes;
+		q->quoted = q->pl->def_quoted ? 1 : 0;
+		q->parens = false;
+		q->numbervars = true;
+		q->dump_var_cell = cc;
+		q->dump_var_cell_ctx = cc_ctx;
+		if (++q->vgen == 0) q->vgen = 1;
+		set_vgen(q, ce, q->vgen);
+
+		if (!print_term(q, stdout, cc, cc_ctx, 1)) {
+			end_dump(q);
+			return;
+		}
+
+		any = true;
+		want_space = false;
 	}
 
 	bool any_atts = /*any &&*/ p->num_vars && any_attributed(q);
@@ -493,7 +585,7 @@ void dump_vars(query *q, bool partial)
 	partial_clear_write_options(q);
 	q->variable_names = vlist;
 	q->variable_names_ctx = 0;
-	q->print_idx = 0;
+	q->print_idx = q->name_idx = 0;
 
 	if (any_atts) {
 		cell p1[2];

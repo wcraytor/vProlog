@@ -9,6 +9,10 @@
 #include <stdbool.h>
 #include <inttypes.h>
 
+#ifndef USE_FFI
+#define USE_FFI 0
+#endif
+
 #ifndef USE_OPENSSL
 #define USE_OPENSSL 0
 #endif
@@ -16,6 +20,8 @@
 #ifndef USE_THREADS
 #define USE_THREADS 0
 #endif
+
+#include "tpl_features.h"
 
 #if USE_THREADS
 #include <pthread.h>
@@ -34,24 +40,39 @@ typedef uint32_t pl_ctx;
 #if (__STDC_VERSION__ >= 201112L) && USE_THREADS
 #include <stdatomic.h>
 #define pl_atomic _Atomic
+
+// Make a new structure visible before the pointer that reveals it.
+// Writer-side only: the reader's address dependency orders its own
+// loads. skiplist.c has its own copy, not including this header.
+
+#define pl_publish_barrier() atomic_thread_fence(memory_order_release)
 #else
 #define pl_atomic volatile
+#define pl_publish_barrier() ((void)0)
 #endif
 
 typedef pl_atomic int64_t pl_refcnt;
 
 #include "list.h"
 #include "skiplist.h"
-#include "stringbuf.h"
 #include "threads.h"
 #include "trealla.h"
 #include "utf8.h"
+#include "stringbuf.h"
 
 #include "imath/imath.h"
 #include "imath/imrat.h"
 
 #if defined(_WIN32) || defined(__wasi__)
 char *realpath(const char *path, char resolved_path[PATH_MAX]);
+#endif
+
+// This MinGW target's errno.h has EAGAIN but not EWOULDBLOCK - on every
+// other platform here the two are either the same value or both defined,
+// so alias rather than special-case every errno==EAGAIN||EWOULDBLOCK check.
+#if defined(_WIN32) && !defined(EWOULDBLOCK)
+#include <errno.h>
+#define EWOULDBLOCK EAGAIN
 #endif
 
 // Sentinel Value
@@ -61,18 +82,26 @@ char *realpath(const char *path, char resolved_path[PATH_MAX]);
 
 #define MAX_SMALL_STRING ((sizeof(void*)*2)-1)
 #define MAX_VAR_POOL_SIZE 16000
-#define MAX_ARITY UINT8_MAX
+#define MAX_ARITY UINT32_MAX
+#define MAX_PROCEDURE_ARITY UINT8_MAX
 #define MAX_IF_DEPTH 256
 #define MAX_VARS 1024
 #define MAX_QUEUES 256
 #define MAX_MODULES 1024
 #define MAX_IGNORES (1024*8)
+#define MAX_CYCLE_VARS 64		// named cycle entries in one answer, see cycle_vars
 #define MAX_TABS 64000
-#define MAX_STREAMS 1024
 #define MAX_THREADS 2048
 #define MAX_ACTUAL_THREADS MAX_THREADS
+#define MAX_STREAM_BUFLEN 1024
 
-#define STREAM_BUFLEN 1024
+#ifndef MAX_STREAMS
+#if TPL_FREESTANDING
+#define MAX_STREAMS 16
+#else
+#define MAX_STREAMS 1024
+#endif
+#endif
 
 #define MAX_OF(a,b) (a) > (b) ? (a) : (b)
 #define MIN_OF(a,b) (a) < (b) ? (a) : (b)
@@ -91,25 +120,26 @@ char *realpath(const char *path, char resolved_path[PATH_MAX]);
 
 // Derived type...
 
-#define is_iso_atom(c) ((is_interned(c) || is_cstring(c)) && !(c)->arity)
-#define is_iso_list(c) (is_interned(c) && ((c)->arity == 2) && ((c)->val_off == g_dot_s))
+#define is_iso_atom(c) ((is_interned(c) || is_cstring(c)) && !get_arity(c))
+#define is_iso_list(c) (is_interned(c) && (get_arity(c) == 2) && ((c)->val_off == g_dot_s))
 #define is_smallint(c) (is_integer(c) && !((c)->flags & FLAG_INT_BIG))
 #define is_bigint(c) (is_integer(c) && ((c)->flags & FLAG_INT_BIG))
-#define is_boolean(c) ((is_interned(c) && !(c)->arity && (((c)->val_off == g_true_s) || ((c)->val_off == g_false_s))))
-#define is_atom(c) ((is_interned(c) && !(c)->arity) || is_cstring(c))
+#define is_boolean(c) ((is_interned(c) && !get_arity(c) && (((c)->val_off == g_true_s) || ((c)->val_off == g_false_s))))
+#define is_atom(c) ((is_interned(c) && !get_arity(c)) || is_cstring(c))
 #define is_string(c) (is_cstring(c) && ((c)->flags & FLAG_CSTR_STRING))
 #define is_codes(c) (is_string(c) && ((c)->flags & FLAG_CSTR_CODES))
+#define is_bytes(c) (is_string(c) && ((c)->flags & FLAG_CSTR_BYTES))
 #define is_managed(c) ((c)->flags & FLAG_MANAGED)
 #define is_cstr_blob(c) (is_cstring(c) && ((c)->flags & FLAG_CSTR_BLOB))
 #define is_slice(c) (is_cstr_blob(c) && ((c)->flags & FLAG_CSTR_SLICE))
 #define is_strbuf(c) (is_cstr_blob(c) && !((c)->flags & FLAG_CSTR_SLICE))
 #define is_list(c) (is_iso_list(c) || is_string(c))
-#define is_nil(c) (is_interned(c) && !(c)->arity && ((c)->val_off == g_nil_s))
+#define is_nil(c) (is_interned(c) && !get_arity(c) && ((c)->val_off == g_nil_s))
 #define is_anon(c) ((c)->flags & FLAG_VAR_ANON)
 #define is_builtin(c) (is_interned(c) && (c)->flags & FLAG_INTERNED_BUILTIN)
 #define is_evaluable(c) (is_interned(c) && ((c)->flags & FLAG_INTERNED_EVALUABLE))
 #define is_tail_call(c) ((c)->flags & FLAG_INTERNED_TAIL_CALL)
-#define is_recursive_call(c) ((c)->flags & FLAG_INTERNED_RECURSIVE_CALL)
+#define is_next_cut(c) ((c)->flags & FLAG_INTERNED_NEXT_CUT)
 #define is_temporary(c) ((c)->flags & FLAG_VAR_TEMPORARY)
 #define is_local(c) ((c)->flags & FLAG_VAR_LOCAL)
 #define is_void(c) ((c)->flags & FLAG_VAR_VOID)
@@ -118,7 +148,7 @@ char *realpath(const char *path, char resolved_path[PATH_MAX]);
 #define is_ref(c) (is_var(c) && ((c)->flags & FLAG_VAR_REF))
 #define is_op(c) ((c)->flags & 0xE000) ? true : false
 #define is_callable(c) (is_interned(c) || (is_cstring(c) && !is_string(c)))
-#define is_compound(c) (is_interned(c) && (c)->arity)
+#define is_compound(c) (is_interned(c) && get_arity(c))
 #define is_structure(c) (is_compound(c) || is_string(c))
 #define is_number(c) (is_integer(c) || is_float(c) || is_rational(c))
 #define is_atomic(c) (is_atom(c) || is_number(c))
@@ -141,6 +171,15 @@ char *realpath(const char *path, char resolved_path[PATH_MAX]);
 #define set_smallint(c,v) (c)->val_int = (v)
 #define get_smalluint(c) (c)->val_uint
 #define set_smalluint(c,v) (c)->val_uint = (v)
+#define get_voidptr(c) (c)->val_voidptr
+#define get_arity(c) (is_interned(c) ? (c)->arity : (uint32_t)(c)->small_arity)
+#define set_arity(c,v) do { \
+	if (is_interned(c)) { \
+		(c)->small_arity = 0; \
+		(c)->arity = (uint32_t)(v); \
+	} else \
+		(c)->small_arity = (uint8_t)(v); \
+} while (0)
 
 #define neg_bigint(c) (c)->val_bigint->ival.sign = MP_NEG
 #define neg_smallint(c) (c)->val_int = -llabs((c)->val_int)
@@ -242,14 +281,16 @@ enum {
 	FLAG_INT_HANDLE=1<<0,
 	FLAG_INT_STREAM=1<<1,
 	FLAG_INT_THREAD=1<<2,
-	FLAG_INT_MAP=1<<3,
+	FLAG_INT_ENGINE=1<<3,
 	FLAG_INT_ALIAS=1<<4,
 	FLAG_INT_BIG=1<<5,
+	FLAG_INT_TABLE=1<<6,
 
 	FLAG_CSTR_BLOB=1<<0,
 	FLAG_CSTR_SLICE=1<<1,
 	FLAG_CSTR_STRING=1<<2,				// string of chars
 	FLAG_CSTR_CODES=1<<3,				// string of codes
+	FLAG_CSTR_BYTES=1<<4,				// walk the bytes, don't decode UTF-8
 
 	FLAG_VAR_ANON=1<<0,
 	FLAG_VAR_REF=1<<1,
@@ -265,17 +306,17 @@ enum {
 	FLAG_BLOB_SREGEX=1<<0,
 
 	FLAG_INTERNED_TAIL_CALL=1<<0,
-	FLAG_INTERNED_RECURSIVE_CALL=1<<1,
 	FLAG_INTERNED_BUILTIN=1<<2,
 	FLAG_INTERNED_EVALUABLE=1<<3,
 	FLAG_INTERNED_GROUND=1<<4,
+	FLAG_INTERNED_NEXT_CUT=1<<5,
 
-	FLAG_LIVE=1<<11,					// used by bb_b_put/2
-	FLAG_MANAGED=1<<12,					// any ref-counted object
-	FLAG_END=1<<13						// DO NOT USE
+	FLAG_LIVE=1<<10,					// used by bb_b_put/2
+	FLAG_MANAGED=1<<11,					// any ref-counted object
+	FLAG_END=1<<12						// DO NOT USE
 };
 
-// The OP types are stored in the high 3 bits of the flag (13-15)
+// The OP types are stored in the high 4 bits of the flag (12-15)
 // and only used during parsing
 
 #define	OP_FX 1
@@ -304,9 +345,9 @@ enum {
 #define is_xfx(c) (GET_OP(c) == OP_XFX)
 #define is_xfy(c) (GET_OP(c) == OP_XFY)
 
-#define SET_OP(c,op) (CLR_OP(c), (c)->flags |= (((uint16_t)(op)) << 13))
-#define CLR_OP(c) ((c)->flags &= ~((uint16_t)(0xF) << 13))
-#define GET_OP(c) (((c)->flags >> 13) & 0xF)
+#define SET_OP(c,op) (CLR_OP(c), (c)->flags |= (((uint16_t)(op)) << 12))
+#define CLR_OP(c) ((c)->flags &= ~((uint16_t)(0xF) << 12))
+#define GET_OP(c) (((c)->flags >> 12) & 0xF)
 #define IS_OP(c) (GET_OP(c) != 0)
 
 typedef struct module_ module;
@@ -316,15 +357,35 @@ typedef struct rule_ rule;
 typedef struct cell_ cell;
 typedef struct clause_ clause;
 typedef struct trail_ trail;
+typedef struct trail_page_ trail_page;
+typedef struct choice_page_ choice_page;
+typedef struct slot_page_ slot_page;
+typedef struct frame_page_ frame_page;
 typedef struct frame_ frame;
 typedef struct parser_ parser;
 typedef struct page_ page;
 typedef struct stream_ stream;
+typedef struct capture_ capture;
 typedef struct slot_ slot;
 typedef struct choice_ choice;
 typedef struct run_state_ run_state;
 typedef struct prolog_flags_ prolog_flags;
+
+// A term handed to an embedder through src/trealla.h. Owned by the
+// query, invalidated by pl_redo/pl_done - see the header.
+
+struct pl_term_ {
+	struct query_ *q;
+	cell *c;
+	pl_ctx ctx;
+};
+typedef struct {
+	cell *queue;
+	pl_idx qp, qcnt, q_size;
+} qbuf;
+
 typedef struct builtins_ builtins;
+typedef struct scheduler_ scheduler;
 
 // Using a fixed-size cell allows having arrays of cells, which is
 // basically what a Term is. A compound is a variable length array of
@@ -337,7 +398,7 @@ struct cell_ {
 	// 1 * 8 = 8 bytes
 
 	uint8_t tag;
-	uint8_t arity;
+	uint8_t small_arity;				// used by strings/CSTR callables
 	uint16_t flags;
 
 	union {
@@ -349,6 +410,7 @@ struct cell_ {
 
 	union {
 
+		void *val_voidptr;
 		pl_uint val_uint;
 		pl_int val_int;
 		pl_flt val_float;
@@ -381,7 +443,10 @@ struct cell_ {
 				cell *val_attrs;		// used with TAG_EMPTY in slot
 			};
 
-			uint32_t var_num;			// used with TAG_VAR
+			union {
+				uint32_t var_num;		// used with TAG_VAR
+				uint32_t arity;			// used with TAG_INTERNED
+			};
 
 			union {
 				uint32_t val_off;		// used with TAG_INTERNED / TAG_VAR -FLAG_VAR_REF
@@ -404,11 +469,13 @@ struct clause_ {
 	cell *alt;							// alternate representation
 	pl_idx cidx, num_allocated_cells;
 	unsigned num_vars;
+	uint64_t arg_sig[3];				// summaries of three head arguments (see choose_sig_args); 0 matches anything
 	bool is_first_cut:1;
-	bool is_cut_only:1;
 	bool is_unique:1;
 	bool is_fact:1;
 	bool is_deleted:1;
+	bool is_purgeable:1;				// a fact whose head holds no compound: see purge_reclaimed()
+	bool is_indexed:1;					// linked into pr's current index: its key chains or overflows
 	cell cells[];						// 'num_allocated_cells'
 };
 
@@ -416,10 +483,11 @@ struct rule_ {
 	lnode hdr;							// must be first
 	predicate *owner;
 	rule *prev, *next;
+	rule *kprev[2], *knext[2];			// this clause's key chains in idx1 and idx2, in database order
 	const char *filename;
-	uuid u;
 	uint64_t db_id, matched, attempted, tcos;
 	uint64_t dbgen_created, dbgen_retracted;
+	uint64_t touch_qid, touch_at;		// the query that first bound into its cells (qid+1), and its push clock then
 	unsigned line_num_start, line_num_end;
 	clause cl;
 };
@@ -431,31 +499,54 @@ struct predicate_ {
 	predicate *alias;
 	rule *head, *tail;
 	module *m;
-	skiplist *idx1, *idx2;
+	skiplist *idx1, *idx2;				// one entry per distinct atomic key, holding its key chain (keyhead)
+	skiplist *ovf1, *ovf2;				// the other keys, one entry per clause, as idx1/idx2 were
+	skiplist *idx3;					// arg1 and idx2_arg together; built on demand, see find_key()
 	const char *filename;
 	cell *meta_args;
-	list dirty;
+	list dirty, delinked;				// retracted but still in the chain; out of the chain, not yet freed
 	cell key;
 	pl_refcnt refcnt, cnt, db_id;
-	unsigned max_vars;
+	unsigned max_vars, idx2_arg;
+	unsigned idx3_want;					// lookups that would have used a composite index
+	uint8_t sig_args[3];				// the head arguments clause signatures summarise, if sig_custom
+	uint64_t drain_gen;					// a drain in progress: readers that entered before this generation
+	int64_t drain_old;					// and how many of them are still inside
 	bool is_reload:1;
 	bool is_builtin:1;
 	bool is_public:1;
 	bool is_dynamic:1;
-	bool is_tabled:1;
+	bool is_thread_local:1;					// thread_local/1: each thread's clauses are in its own shadow
 	bool is_meta_predicate:1;
 	bool is_multifile:1;
 	bool is_discontiguous:1;
 	bool is_abolished:1;
+	bool is_revived:1;						// buried by destroy_module/1, then taken again: see match_in_view()
 	bool is_noindex:1;
+	bool needs_index:1;
+	bool no_idx3:1;						// a clause has a variable in a key argument
 	bool is_check_directive:1;
 	bool is_processed:1;
+	bool is_var_in_head:1;
 	bool is_var_in_first_arg:1;
+	bool is_open_first_arg:1;			// a first argument has a variable inside, as in f(_)
+	bool is_var_in_idx2_arg:1;
 	bool is_iso:1;
 	bool is_dirty:1;
+	bool is_incremental:1;
+	bool sig_chosen:1;					// choose_sig_args() has run, so sig_args no longer changes
+	bool sig_custom:1;
+	uint64_t last_modified;
 };
 
-#define BLAH false, false, {0}, {0}, 0, NULL, NULL, NULL, NULL, NULL, NULL
+// The tail of a builtins initialiser. Shorter without FFI, because the
+// argument-type arrays and libffi handles are not in the struct at all then.
+
+#if USE_FFI
+#define BLAH false, false, {0}, {0}, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+#else
+#define BLAH false, false, NULL, NULL, NULL, NULL
+#endif
 
 #define MAX_FFI_ARGS 64
 
@@ -468,21 +559,43 @@ struct builtins_ {
 	bool evaluable;
 	bool ffi;
 	bool via_directive;
+
+	// FFI argument metadata, and only that. At MAX_FFI_ARGS of 64 these two
+	// arrays are 576 bytes - 85% of the whole struct - carried by every
+	// builtin in every table whether or not the build has any FFI. Leaving
+	// them out where USE_FFI is off takes about 290KB off a freestanding
+	// image without removing a single predicate. Nothing outside
+	// src/bif_ffi.c reads them.
+
+#if USE_FFI
 	uint8_t types[MAX_FFI_ARGS];
 	const char *names[MAX_FFI_ARGS];
 	uint8_t ret_type;
 	void *ffi_ret_type;
 	const char *ret_name;
+#endif
+
 	module *m;
 	char *desc;
 	char *help2;
 	char *help_alt;
+
+#if USE_FFI
+	// Pre-compiled libffi call interface, built once at registration.
+	// void* so this header doesn't have to drag in ffi.h. NULL means
+	// the signature can't be pre-compiled (it returns a struct) and
+	// the cif is built per call as before.
+
+	void *cif;
+#endif
 };
 
 typedef struct {
 	const char *name;
 	unsigned specifier;
 	unsigned priority;
+	bool exported;						// in its module's export list, so seen by importers
+	bool changed;						// a standard operator op/3 has redefined, or removed, here
 } op_table;
 
 // Where *ctx* is the context of the var
@@ -494,12 +607,20 @@ struct trail_ {
 	uint32_t var_num;
 };
 
-// Where *c* is the (possibly) instantiated cell in the current frame
-// Where *vgen* & *vgen2* represent the visit generation to check for cyclic terms
+// An entry with this bit in var_num records a frame's slot layout, not a binding: its old actual_slots in the other bits, its old overflow run in attrs.
+#define TRAIL_FRAME_LAYOUT (1U << 31)
+#define is_frame_layout(tr) ((tr)->var_num & TRAIL_FRAME_LAYOUT)
+
+struct trail_page_ {
+	trail_page *prev, *next;
+	trail *entries;
+	pl_idx base, page_size;
+};
+
+// Where *c* is the (possibly) instantiated cell in the current frame (visit stamps are kept beside, see get_vgen)
 
 struct slot_ {
 	cell c;
-	uint32_t vgen, vgen2;
 };
 
 // Where *prev* is the previous frame
@@ -511,19 +632,26 @@ struct slot_ {
 
 struct frame_ {
 	cell *instr;
-	module *m;
 	uint64_t dbgen, chgen;
-	uint32_t hp_num, initial_slots, actual_slots, max_vars;
-	pl_idx base, op, hp;
+	slot *slots, *ovf;					// initial and create_vars() runs, the first page's start standing in for index 0
+	uint32_t mid;						// the module, by id as an instruction holds it: a pointer would not leave room for tp
+	uint32_t hp_num, initial_slots, actual_slots;
+	pl_idx hp;
+	pl_idx tp;							// the trail's top when this frame's call began: entries naming its slots lie above
 	pl_ctx prev;
 	bool no_recov:1;
+	bool heap_pinned:1;
 };
+
+#define FRAME_PAGE_SHIFT 7
+#define FRAME_PAGE_SIZE (1U << FRAME_PAGE_SHIFT)
 
 struct run_state_ {
 	predicate *pr;
+	uint64_t pr_dbgen;					// the generation pr was entered at, for leave_predicate()'s drains
 	cell *instr;
 	rule *dbe;
-	sliter *iter, *tmp_iter;
+	sliter *iter;
 	module *m;
 
 	union {
@@ -531,17 +659,27 @@ struct run_state_ {
 			cell *key;
 			pl_ctx key_ctx;
 			bool karg1_is_ground:1, karg2_is_ground:1, karg3_is_ground:1,
-			karg1_is_atomic:1, karg2_is_atomic:1, karg3_is_atomic:1;
+			karg1_is_atomic:1, karg2_is_atomic:1, karg3_is_atomic:1,
+			key_args_checked:1, iter_single:1,
+			kchain:1, kchain2:1;		// dbe walks a key chain (idx2's if kchain2), not pr->head
 		};
 		struct { uint64_t uv1, uv2; };
 		struct { int64_t v1, v2; };
 		struct { cell *c; pl_ctx c_ctx; };
+		sliter *tmp_iter;
 		int64_t cnt;
 	};
 
 	uint64_t cpu_time;
-	pl_idx fp, hp, cp, tp, sp, hp_num, qnum;
+	slot *sp;
+	slot_page *sp_page;
+	pl_idx fp, hp, cp, tp, hp_num, qnum;
 	pl_ctx cur_ctx;
+
+	// Which choicepoint owns *iter when it is a multi-hit prefetch.
+	// run_state is copied into every choice after find_key(), so several
+	// slots alias the same handle; only this one may free it.
+	pl_idx iter_owner;
 };
 
 typedef struct {
@@ -550,17 +688,28 @@ typedef struct {
 	union {
 		char *key;
 		cell *c;
+		rule *r;
+		void *addr;						// a mapping, with mmap_len below
 	};
 
+	size_t mmap_len;
+	void *tptr;
+	uint64_t gvar_id;
+
 	bool is_bboard:1;
+	bool is_gvar:1;							// key, with tptr and gvar_id below
 	bool is_cells:1;
+	bool is_rule:1;
+	bool is_mmap:1;
 } undo_item;
 
 struct choice_ {
 	run_state st;
-	list undo;
+	list *undo;							// allocated on first use, then kept with the slot (see choice_undo)
 	uint64_t gen, chgen, dbgen;
-	pl_idx base, op, initial_slots, actual_slots, skip;
+	uint64_t pushgen;					// the query's push clock when this was pushed, see reclaim_rule()
+	slot *slots, *ovf;
+	pl_idx initial_slots, actual_slots, skip;
 	bool catchme_retry:1;
 	bool catchme_exception:1;
 	bool barrier:1;
@@ -569,52 +718,141 @@ struct choice_ {
 	bool fail_on_retry:1;
 	bool succeed_on_retry:1;
 	bool reset:1;
+	bool owns_pr:1;						// pushed by a clause matcher, so it holds st.pr's reference
+};
+
+struct choice_page_ {
+	choice_page *prev, *next;
+	choice *entries;
+	pl_idx base, page_size;
+};
+
+// A frame's runs of slots each lie within one page, so a slot stays put as the stack grows.
+struct slot_page_ {
+	slot_page *prev, *next;
+	slot *slots, *end;
+	pl_idx used;						// live slots here, once sp is on a later page
+	pl_idx base;						// live slots on the pages before this one, while sp is here
 };
 
 enum { eof_action_eof_code, eof_action_error, eof_action_reset };
 
+// with_output_to/2 captures what a goal writes by making the stream
+// hold its output in memory. Captures nest, so each one records where
+// in that buffer it began: the text it captured is what was appended
+// past its mark, and taking it truncates the buffer back so that the
+// capture around it never sees it. The marks form a stack because
+// setup_call_cleanup/3 makes the pairing last-in-first-out.
+
+struct capture_ {
+	capture *prev;
+	size_t at;
+};
+
 struct stream_ {
 	union {
 		FILE *fp;
-		skiplist *keyval;
+		FILE *fp_in;
 		query *engine;
 		void *handle;
 	};
 
+	FILE *fp_out;
 	stringbuf sb_buf;
-	char *mode, *filename, *data, *src;
+	char *mode, *filename, *data, *src, *addr;
 	skiplist *alias;
 	void *sslptr;
 	parser *p;
+	capture *captures;					// innermost first, NULL when not capturing
 
+	// srcbuf is read by exactly one thing - the SSL path in network.c - so
+	// a build with no network carries a kilobyte per stream for code that
+	// is not in the image. The other arm is what engine streams use.
 	union {
-		char srcbuf[STREAM_BUFLEN];
+#if TPL_FEATURE_NETWORK
+		char srcbuf[MAX_STREAM_BUFLEN];
+#endif
 		struct {
-			cell *pattern, *cur_yield;
+			cell *pattern, *cur_yield, *cur_post;	// cur_post is engine_post/2's, kept apart from what engine_yield/1 hands back
 		};
 	};
 
-	size_t data_len, alloc_nbytes;
-	int ungetch, srclen, chan, idx;
+	char *wbuf;							// a task's parked write, see write_all()
+	const query *wbuf_owner;			// ... and whose it is
+	const query *data_owner;			// whose partial read str->data is
+	unsigned timeout_ms;
+	size_t data_len, alloc_nbytes, wbuf_len, wbuf_pos;
+	size_t str_pos;						// an open_string/2 stream's read offset into sb
+	int ungetch, srclen, chan, idx, port;
 	unsigned rows, cols;
 	uint8_t level, eof_action;
+	pl_atomic bool is_closing;			// set before a socket's shutdown, for an accept it wakes
+	bool is_active:1;
 	bool at_end_of_file:1;
 	bool bom:1;
 	bool repo:1;
 	bool binary:1;
 	bool did_getc:1;
+	FILE *tty_fp;						// what tty_val was measured on; a reopen re-checks
+	bool tty_val:1;
+	bool invalid_pending:1;				// a peeked ill-formed sequence, still unread
 	bool nodelay:1;
 	bool udp:1;
 	bool ssl:1;
 	bool first_time:1;
 	bool is_pipe:1;
+	bool is_popen:1;
 	bool is_socket:1;
-	bool is_map:1;
 	bool is_memory:1;
+	bool is_string:1;					// reads from sb, has no FILE
+	bool str_eof:1;
 	bool is_engine:1;
 	bool is_alias:1;
 };
 
+// An open_string/2 stream reads its text from sb and has no FILE, so
+// anything that might be handed one asks through these instead.
+
+static inline bool stream_eof(stream *str)
+{
+	return str->is_string ? str->str_eof : feof(str->fp_in);
+}
+
+static inline bool stream_error(stream *str)
+{
+	return str->is_string ? false : ferror(str->fp_in);
+}
+
+static inline void stream_clearerr(stream *str)
+{
+	if (str->is_string)
+		str->str_eof = false;
+	else
+		clearerr(str->fp_in);
+}
+
+static inline int stream_fileno(stream *str)
+{
+	return str->is_string ? -1 : fileno(str->fp_in);
+}
+
+static inline off_t stream_tell(stream *str)
+{
+	return str->is_string ? (off_t)str->str_pos : ftello(str->fp_out);
+}
+
+// Timeouts are a polled monotonic deadline kept per thread object, not
+// a signal - see has_expired_alarm(). This used to be the fallback for
+// hosts with no usable POSIX per-thread timer (Windows and WASI have no
+// such API; on OpenBSD and NetBSD timer_create() is there but a limit
+// armed through it never fires), and is now the only path.
+//
+// It is also the only design that survives a thread becoming a task: a
+// SIGALRM handler can only ask which *pthread* it is on, which under a
+// worker pool is the worker rather than the thread object that armed
+// the timer. The deadline is keyed to the object throughout.
+
+typedef struct alarm_entry_ alarm_entry;
 typedef struct thread_ thread;
 
 struct thread_ {
@@ -630,23 +868,74 @@ struct thread_ {
     pthread_mutex_t mutex;
 #endif
 	lock guard;
+	void *tabling_state;
+	alarm_entry *alarms;					// polled timers, see has_expired_alarm()
+	thread *live_next, *live_prev, *free_next;
+
+	// Tasks are scheduled per thread object, not per query and not per
+	// instance. Per query was phase 0's problem: a scheduler that died
+	// with whoever spawned into it. Per instance was phase 0's fix and
+	// went too far - two real threads each draining their own tasks
+	// then drove one set of queues with no lock, which crashed six runs
+	// in ten. A thread object is the thing that actually owns a run
+	// queue: it outlives any one query, and only ever has one thread in
+	// it.
+
+	// Atomic because sched_get() reads it without a lock on the fast
+	// path: a thread other than the owner reaches it through task_send/2.
+
+	scheduler *pl_atomic sched;
+
+	// seq -> query* for the tasks this thread owns, and the counter
+	// their ids are minted from. Per thread for the same reason the
+	// scheduler is: a task belongs to one thread and is created,
+	// destroyed and - almost always - addressed by that thread, so its
+	// registry lock is uncontended in the case that matters. One
+	// skiplist per prolog instance under prolog_lock() was the previous
+	// arrangement, and it serialised every task create, destroy and
+	// send in the process against every other; see the header of
+	// samples/skynet_mixed.pl for what that cost.
+	//
+	// tasks_guard, not t->guard: the thread guard is held across thread
+	// operations that can reach into a task, and a second lock with no
+	// overlap cannot join those orderings.
+
+	skiplist *tasks;
+	lock tasks_guard;
+	uint64_t next_task_seq;
+
+	// Tasks parked on this queue waiting for a message. A send walks
+	// these and promotes them, which is what makes a receive wake on
+	// delivery rather than on its next poll.
+
+	query *msg_waiters;
+
 	unsigned num_vars, at_exit_goal_num_vars, num_locks;
 	int chan, locked_by;
 	pl_atomic bool is_active;
+	bool is_joining;						// under guard: a join is waiting, so it can't be detached
+	pl_atomic bool cancel_requested;		// thread_cancel/1: a blocking wait gives up and the thread exits
+	pl_atomic bool alerted;					// thread_signal/2 or thread_cancel/1 sent: a blocking read retries after it
+	bool alertable;							// under guard: its OS thread runs, so pthread_kill() can reach it
+	skiplist *gvars;						// b_setval/nb_setval, this thread's own
+	uint64_t gvar_seq;
+	predicate **tl_shadows, **tl_origs;		// this thread's shadows of thread_local/1 predicates, and theirs
+	unsigned tl_shadows_n, tl_shadows_cap;
+	volatile int timedout;   // set by SIGALRM handler s_sigfn(); thread-lived
 	bool is_init:1;
 	bool is_finished:1;
 	bool is_detached:1;
 	bool is_exception:1;
+	bool is_failed:1;
 	bool is_queue_only:1;
 	bool is_mutex_only:1;
 };
 
 struct page_ {
 	page *next;
-	union {
-		cell *cells;
-	};
+	cell *cells;
 	pl_idx idx, page_size;
+	pl_idx base;						// cells on the pages below this one
 	unsigned num;
 };
 
@@ -666,6 +955,7 @@ struct prolog_flags_ {
 	bool debug:1;
 	bool json:1;
 	bool var_prefix:1;
+	bool empty_args:1;
 };
 
 typedef struct {
@@ -675,56 +965,172 @@ typedef struct {
 	bool is_anon;
 } var_item;
 
+// Ephemeral compound-pair memo for one unify() call (keyed by q->vgen).
+// Avoids re-walking shared DAG nodes (e.g. issue #855 blam/1).
+//
+// It GROWS. A fixed table stops memoizing once full, and the walk it
+// exists to prevent is exponential - so a capacity is not a slowdown
+// threshold, it is the bug returning at the next size up. Held at load
+// factor <= 1/2 (which is also what lets the linear probe terminate),
+// doubling, and allocated on first use so a query that never unifies a
+// compound pair pays nothing.
+#define UNIFY_SEEN_SIZE 256		// initial capacity, power of two
+
+typedef struct {
+	cell *c1, *c2;
+	pl_ctx ctx1, ctx2;
+	uint32_t gen;
+} unify_seen_pair;
+
+// A variable's visit stamp for the walk in progress, beside its slot rather than in it (see get_vgen).
+typedef struct {
+	const slot *e;
+	uint32_t gen, val;
+} vgen_entry;
+
+// A goal call_check() resolved at run time, valid while pl->pred_gen is unchanged.
+#define LOOKUP_CACHE_SIZE 32
+
+typedef struct {
+	module *m;
+	union { predicate *match; builtins *bif_ptr; };
+	unsigned gen, arity;
+	pl_idx val_off;
+	bool is_builtin;
+} lookup_entry;
+
 struct query_ {
 	lnode hdr;							// must be first
 	query *prev, *next, *parent;
 	module *current_m;
 	prolog *pl;
+	// `top` is the parser that read the query text, usually borrowed.
+	// `p` is a scratch parser for tokenizing text mid-query, built on
+	// first use by query_parser() and belonging to parser_m - see there
+	// for why it is not built up front.
 	parser *top, *p;
-	frame *frames;
-	slot *slots;
-	choice *choices;
-	trail *trails;
+	module *parser_m;
+	bool owns_top;						// destroy top with the query
+	struct pl_term_ **terms;			// arena for the embedding API
+	unsigned terms_used, terms_cap;
 	cell *tmp_heap, *last_arg, *variable_names, *ball, *cont, *suspect;
-	cell *queue[MAX_QUEUES], *tmpq[MAX_QUEUES];
+	char *engine_ball;					// an engine's uncaught ball as throw/1 printed it, for engine_next/2 to rethrow
+	void *oom_reserve;					// emergency headroom for constructing a memory error
+	cell *clone_root;					// the term copy_term/2 is copying, for cycles back to it
+	bool cycle_dropped;					// a clone hit a cycle it could not represent and truncated it
+	skiplist *clone_defs;				// close_cycles only: original slot -> tmp offset where its value starts
+	bool close_cycles;					// opt-in (copy_term/2, copy_term_nat/2 only): bind back-edges to
+										// nested cyclic slots instead of leaving them dangling - see clone_defs
+	qbuf *queues;
+	unsigned queues_alloc;
 	page *heap_pages;
-	slot *save_e;
-	query *tasks;
+	trail_page *trail_pages, *trail_current;
+	trail *trail_next;
+	choice_page *choice_pages, *choice_current;
+	choice *choice_next;
+	slot_page *slot_pages;
+	frame **frame_pages;
+	query *tasks;						// tasks we spawned, our registry of them
+	unsigned num_subtasks;				// ... and how many live below us, any depth
+	query *sched_next;					// link in the ready FIFO or the io list
+	unsigned heap_idx;					// our slot in the timer heap
+	int wait_fd;						// descriptor we parked on, if waiting_io
+	uint64_t msg_deadline;				// absolute ms for a receive we parked in
+	query *wait_next;					// link in a queue's msg_waiters
+	thread *waiting_on;					// ... and which queue that is
+	short wait_events;					// ... and what we are waiting for
+	uint8_t sched_where;				// which of the three we are queued on
+
 	skiplist *vars;
 	thread *thread_ptr;
 	var_item *tabs;
 	size_t tabs_size;
 	list dirty, undo;
+	uint32_t dirty_cnt;					// rules on dirty awaiting purge_reclaimed()
+	uint32_t purge_at;					// the count at which to try again; rises so a pass that
+										// frees nothing cannot make every later goal rescan
 	cell accum;
 	mpz_t tmp_ival;
 	mpq_t tmp_irat;
 	run_state st;
 	stringbuf sb_buf;
-	bool ignores[MAX_IGNORES];
+
+	// Name numbers already spoken for by variables the user wrote as _A,
+	// _B1 and so on, so a generated name never collides with a source
+	// one - see get_slot_name(). Was a flat bool[MAX_IGNORES]: 8KB per
+	// query, and an 8KB memset every time the write options were
+	// cleared, for a set that is usually a few dozen entries. Grown on
+	// demand through ignore_name(), and freed with the query.
+
+	bool *ignores;
+	unsigned ignores_alloc;
+
+	// Cycle-entry variables met while dumping an answer (issue #1138).
+	// A cyclic term whose cycle starts below the reported variable needs
+	// a name of its own for the loop to close on: S = "zabcdef"||_S1 with
+	// _S1 = "abcdef"||_S1, not S = "zabcdef"||S, which says something
+	// else. Shared so two answers over one cycle name it once.
+
+	struct { uint32_t var_num; pl_ctx ctx; } cycle_vars[MAX_CYCLE_VARS];
+	unsigned num_cycle_vars;
+
+	const cell *dump_var_cell;
+	pl_ctx dump_var_cell_ctx;
+
 	uint64_t total_goals, total_backtracks, total_retries, total_matches, total_inferences;
+	uint64_t inference_limit;				// call_with_inference_limit/3's, against total_goals; 0 for none
+	uint64_t stack_limit;					// thread_create/3's stack_limit(Bytes); 0 for none
+	bool stack_over;						// set when growth went past stack_limit, for the engine to throw
+	bool goal_trap;							// either of the two above armed: one test per goal while neither is
 	uint64_t total_tcos, total_recovs, total_matched, total_no_recovs;
+	pl_idx hw_frames, hw_choices, hw_trails, hw_slots, hw_heap;	// highwater marks, for statistics
 	uint64_t step, qid, tmo_msecs, chgen, cycle_error;
+	uint64_t push_clock;				// ticks with every choicepoint pushed
+	uint64_t task_id;
+	thread *task_owner;					// the thread it registered on
 	uint64_t get_started, yield_at;
-	uint64_t cpu_time, time_cpu_last_started, future;
+	uint64_t cpu_time;					// time/1 baseline, kept out of st so it survives backtracking
+	uint64_t time_cpu_last_started, future;
 	unsigned max_depth, max_eval_depth, print_idx, tab_idx, dump_var_num;
+	unsigned name_idx;		// next free generated-name number, see get_slot_name()
+	pl_idx *tab1, *tab2;
+	unsigned tabs_alloc;
 	unsigned varno, tab0_varno, cur_engine, cur_chan, my_chan;
-	unsigned s_cnt, retries, popp, rand_seed;
+
+	// A task's own mailbox: list of task_msg nodes (bif_tasks.c),
+	// scanned in place by task_recv/1 so a skipped message keeps its
+	// position rather than rotating to the back. Guarded by the
+	// owning thread's scheduler->guard, since task_send/2 can enqueue into
+	// this from any thread. cur_task_qid is the sender of the last
+	// message task_recv/1 matched - stored for a reply-to, not yet exposed
+	// to Prolog. Separate from cur_chan (a thread chan, unsigned):
+	// qid is process-wide and uint64_t, would truncate if shared.
+
+	list mailbox;
+	uint64_t cur_task_qid;
+	pl_atomic bool cancel_requested;
+	unsigned retries, rand_seed;
 	int autofail_n;
 	pl_ctx latest_ctx, variable_names_ctx, dump_var_ctx, ball_ctx, cont_ctx;
+	pl_ctx clone_root_ctx;				// context of clone_root, which alone does not identify a term
 	pl_idx tmphp;
-	pl_idx frames_size, slots_size, trails_size, choices_size;
-	pl_idx before_hook_tp, qcnt[MAX_QUEUES];
+	pl_idx frame_pages_size;
+	pl_idx before_hook_tp;
 	pl_idx heap_size, tmph_size;
 	pl_idx undo_lo_tp, undo_hi_tp;
-	pl_idx q_size[MAX_QUEUES], tmpq_size[MAX_QUEUES], qp[MAX_QUEUES];
 	prolog_flags flags;
 	enum q_retry retry;
-	int is_cyclic1, is_cyclic2;
 	uint32_t vgen;
+	unify_seen_pair *unify_seen;
+	vgen_entry *vgens;
+	unsigned vgens_size, vgens_used;
+	uint32_t vgens_gen;
+	unsigned unify_seen_size, unify_seen_used, unify_seen_pairs;
 	int8_t halt_code;
 	int8_t quoted;
 	enum { WAS_OTHER, WAS_SPACE, WAS_COMMA, WAS_SYMBOL } last_thing;
 	bool oom:1;
+	bool in_throw:1;
 	bool done:1;
 	bool noskip:1;
 	bool parens:1;
@@ -734,11 +1140,16 @@ struct query_ {
 	bool noretry:1;
 	bool is_redo:1;
 	bool run_hook:1;
+	bool attrs_used:1;
+	bool residue_used:1;					// '$mark_start'/1 has run: trail entries may be read back by frame index
+	bool sto_watch:1;					// '$sto_begin'/0 is listening for a binding that closes a cycle
+	bool sto_seen:1;					// and one did: the query is subject to occurs check
 	bool do_dump_vars:1;
 	bool is_dump_vars:1;
 	bool portray_vars:1;
 	bool status:1;
 	bool no_recov:1;
+	bool no_tco:1;						// the last unification refers into the current frame: a tail call may not reuse it
 	bool has_vars:1;
 	bool error:1;
 	bool did_throw:1;
@@ -747,8 +1158,10 @@ struct query_ {
 	bool eval:1;
 	bool yield_after:1;
 	bool yielded:1;
+	bool engine_done:1;					// an engine whose goal has no more answers
 	bool is_task:1;
 	bool is_thread:1;
+	bool is_registered:1;			// lazily added to its thread's registry - see bif_task_self_1
 	bool json:1;
 	bool nl:1;
 	bool fullstop:1;
@@ -764,29 +1177,38 @@ struct query_ {
 	bool did_quote:1;
 	bool is_input:1;
 	bool is_engine:1;
-	bool ops_dirty:1;
 	bool noderef:1;
 	bool double_quotes:1;
 	bool end_wait:1;
+	bool waiting_io:1;
 	bool did_unhandled_exception:1;
-	bool access_private:1;
-	bool in_retract:1;
+	bool unify_too_deep:1;				// recursion hit MAX_UNIFY_DEPTH; unify() turns it into an error
+	lookup_entry lookup_cache[LOOKUP_CACHE_SIZE];
 };
+
+// What the parser records about one variable it has seen. These were six
+// parallel arrays fixed at MAX_VARS, beside a MAX_VAR_POOL_SIZE name pool -
+// 37508 bytes in every parser, for clauses that nearly always have a handful
+// of variables. One of the six, vars[], was never read anywhere.
+//
+// Both the entries and the pool grow on demand now, still capped at MAX_VARS
+// and MAX_VAR_POOL_SIZE so the same errors fire at the same limits.
+
+typedef struct {
+	unsigned used, depth, in_body, in_head;
+	pl_idx off;
+} var_entry;
 
 struct parser_ {
 	struct {
-		char pool[MAX_VAR_POOL_SIZE];
-		unsigned used[MAX_VARS];
-		unsigned depth[MAX_VARS];
-		unsigned in_body[MAX_VARS];
-		unsigned in_head[MAX_VARS];
-		pl_idx off[MAX_VARS];
-		uint8_t vars[MAX_VARS];
-		unsigned num_vars;
+		char *pool;
+		var_entry *v;
+		unsigned pool_size, alloc, num_vars;
 	} vartab;
 
 	prolog *pl;
 	FILE *fp;
+	stream *strm;						// an open_string/2 stream, which has no fp
 	module *m;
 	clause *cl;
 	cell v;
@@ -794,6 +1216,7 @@ struct parser_ {
 	prolog_flags flags;
 	query *q;
 	char *save_line, *srcptr, *error_desc;
+	const char *error_type;				// NULL means syntax_error
 	size_t token_size, n_line, pos_start;
 	unsigned line_num, line_num_start;
 	unsigned depth, read_term_slots, num_vars;
@@ -815,6 +1238,8 @@ struct parser_ {
 	bool is_command:1;
 	bool is_comment:1;
 	bool is_consulting:1;
+	bool expand_dcg:1;			// re-parse of term_expansion/2 output: translate a --> result
+	bool saw_initialization:1;		// this load recorded a goal of its own
 	bool is_symbol:1;
 	bool is_string:1;
 	bool is_quoted:1;
@@ -822,6 +1247,7 @@ struct parser_ {
 	bool is_op:1;
 	bool skip:1;
 	bool last_close:1;
+	bool last_empty_arglist:1;		// the arg list just closed was f()
 	bool last_neg:1;
 	bool no_fp:1;
 	bool reuse:1;
@@ -829,7 +1255,14 @@ struct parser_ {
 	bool in_body:1;
 	bool is_number_chars:1;
 	bool double_bar:1;
+	bool pending_bar:1;			// single '|' seen after a closing quote, deferred to the next token (issue #1134)
+	bool is_socket:1;			// fp is a blocking-mode socket; see tpl_wait_fd_readable()
 };
+
+static inline pl_idx vartab_off(const parser *p, unsigned i)
+{
+	return (i < p->vartab.alloc) ? p->vartab.v[i].off : 0;
+}
 
 typedef struct loaded_file_ loaded_file;
 
@@ -843,24 +1276,35 @@ typedef struct pi_ {
 
 struct module_ {
 	lnode hdr;							// must be first
-	module *used[MAX_MODULES];
+	module **used;
+	unsigned used_alloc;
 	module *orig;
+	module *dead_next;					// on pl->dead_modules once destroy_module/1 has emptied it
 	prolog *pl;
+	lock guard;							// serializes this module's own predicate mutation; see prolog_lock_mod()
 	pi *gex_head, *gex_tail;			// goal expansion ??? (see pi_ above, why not use list?)
 	parser *p;
 	FILE *fp;
 	const char *filename, *name, *actual_filename;
 	skiplist *index, *ops, *defops, *keyval;
+	skiplist *props;					// which name/arity have $predicate_property clauses
 	loaded_file *loaded_files;
-	lock guard;
 	list predicates;
+	list buried;						// predicates abolished by destroy_module/1, see module_bury_predicates()
 	prolog_flags flags;
 	unsigned id, idx_used, arity;
 	int if_depth;
 	bool ifs_blocked[MAX_IF_DEPTH];
 	bool ifs_done[MAX_IF_DEPTH];
+	cell *quad_query;					// pending '?- Query' awaiting its answer description
+	cell *quad_name;					// its identifier, for 'Name ?- Query', else NULL
+	unsigned quad_num_vars;				// number of vars in quad_query
+	unsigned quad_line_num;				// line the pending quad query started on
+	bool in_quad:1;						// consuming answer-description terms after '?- Query'
+	bool quad_recorded:1;				// at least one answer description seen for quad_query
 	bool user_ops:1;
 	bool prebuilt:1;
+	bool from_file:1;					// made by a module/2 directive
 	bool make_public:1;
 	bool loaded_properties:1;
 	bool loading:1;
@@ -871,27 +1315,39 @@ struct module_ {
 	bool run_init:1;
 };
 
+#define OP_NAMES_BITS 8192
+#define OP_NAMES_BYTES (OP_NAMES_BITS / 8)
+
 struct prolog_ {
 	stream streams[MAX_STREAMS];
-	thread threads[MAX_THREADS];
-	module *modmap[MAX_MODULES];
-	struct { pl_idx tab1[MAX_TABS], tab2[MAX_TABS]; };
+	skiplist *threads;
+	thread *live_head, *live_tail, *free_head, *free_tail, *main_thread;
+	unsigned next_thread_id;
+	module **modmap;
+	unsigned modmap_alloc;
 	list modules;
 	module *system_m, *user_m, *m, *dcgs;
+	module *dead_modules;				// emptied by destroy_module/1, for module_create() to take again
 	parser *p;
 	skiplist *biftab, *help, *fortab, *alias;
-	FILE *logfp;
+	skiplist *flagtab;					// flag/3 values, keyed by flag_key()
+	uint8_t op_names[OP_NAMES_BYTES];	// see note_op_name()
 	lock guard;
 	uint64_t s_last, s_cnt, seed, thr_cnt;
 	pl_refcnt q_cnt, dbgen;
+	pl_atomic bool is_multithreaded;
 	unsigned next_mod_id, def_max_depth, my_chan;
+	unsigned tbl_max_answer_size, tbl_max_subgoal_size, tbl_max_answers_for_subgoal;
 	unsigned current_input, current_output, current_error;
+	pl_atomic int goal_expansions;		// every thread bumps it; plain ++/-- wrapped below zero
+	pl_atomic unsigned pred_gen;		// bumped when a module gains or loses a predicate
 	int8_t halt_code, opt, limit;
 	pl_refcnt rnd_first_time;
 	bool def_quoted:1;
 	bool def_double_quotes:1;
 	bool is_redo:1;
 	bool is_query:1;
+	bool no_dump_vars:1;				// set_dump_vars(pl, 0)
 	bool halt:1;
 	bool status:1;
 	bool error:1;
@@ -903,16 +1359,32 @@ struct prolog_ {
 	bool trace:1;
 	bool in_goal_expansion:1;
 	bool global_bb:1;
+	bool tabling:1;			// tabling flag: enabled by default
+	void *tbl_shared;
+	bool tbl_any_specs;
+
 };
+
+// A module by id, or NULL for one that was never registered - which is what
+// indexing the old fixed array gave, since it was zeroed.
+
+static inline module *module_by_id(const prolog *pl, unsigned id)
+{
+	return (id < pl->modmap_alloc) ? pl->modmap[id] : NULL;
+}
 
 extern pl_idx g_empty_s, g_pair_s, g_dot_s, g_cut_s, g_nil_s, g_true_s, g_fail_s;
 extern pl_idx g_anon_s, g_neck_s, g_eof_s, g_lt_s, g_false_s, g_once_s;
 extern pl_idx g_gt_s, g_eq_s, g_sys_elapsed_s, g_sys_queue_s, g_braces_s;
 extern pl_idx g_sys_stream_property_s, g_unify_s, g_on_s, g_off_s, g_sys_var_s;
 extern pl_idx g_call_s, g_braces_s, g_plus_s, g_minus_s, g_post_unify_hook_s;
+extern pl_idx g_quad_s, g_sys_quad_s;
 extern bool do_erase(module *m, const char *str);
+extern void tabling_destroy(prolog *pl);
+extern void tabling_destroy_thread(thread *t);
+extern void tbl_note_predicate_dep(query *q, predicate *pr);
 
-extern unsigned g_cpu_count;
+extern unsigned g_max_os_threads;
 
 #define share_cell(c) if (is_managed(c)) share_cell_(c)
 
@@ -1010,20 +1482,21 @@ inline static pl_idx dup_cells_by_ref(cell *dst, const cell *src, pl_ctx src_ctx
 	return num_cells;
 }
 
-#define LIST_HANDLER(l) cell l##_h_tmp, l##_t_tmp
-#define LIST_HEAD(l) list_head(l, &l##_h_tmp)
-#define LIST_TAIL(l) list_tail(l, &l##_t_tmp)
+#define PROLOG_LIST_HANDLER(l) cell l##_h_tmp, l##_t_tmp
+#define PROLOG_LIST_HEAD(l) list_head(l, &l##_h_tmp)
+#define PROLOG_LIST_TAIL(l) list_tail(l, &l##_t_tmp)
 
 cell *list_head(cell *l, cell *tmp);
 cell *list_tail(cell *l, cell *tmp);
 
-enum clause_type { DO_CLAUSE, DO_RETRACT, DO_RETRACTALL };
+enum clause_type { DO_CLAUSE, DO_CLAUSE_STATIC, DO_RETRACT, DO_RETRACTALL };
 
 char *formatted(const char *src, int srclen, bool dq, bool json);
 char *slicedup(const char *s, size_t n);
 int slicecmp(const char *s1, size_t len1, const char *s2, size_t len2);
 uint64_t wall_time_in_usec(void);
 uint64_t cpu_time_in_usec(void);
+uint64_t monotonic_time_in_usec(void);
 char *relative_to(const char *basefile, const char *relfile);
 size_t sprint_int(char *dst, size_t size, pl_int n, int base);
 int format_integer(char *dst, cell *c, int grouping, int sep, int decimals, int radix);
@@ -1037,8 +1510,15 @@ inline static int fake_strcmp(const void *ptr1, const void *ptr2, const void *pa
 	return strcmp(ptr1, ptr2);
 }
 
+void index_unlink_rule(predicate *pr, rule *r);
+
+// A clause leaves its key chains when it leaves the main chain (declared here, not module.h, for this).
+
 inline static void predicate_delink(predicate *pr, rule *r)
 {
+	if (r->cl.is_indexed)
+		index_unlink_rule(pr, r);
+
 	if (r->prev) r->prev->next = r->next;
 	if (r->next) r->next->prev = r->prev;
 	if (pr->head == r) pr->head = r->next;

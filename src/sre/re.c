@@ -35,6 +35,8 @@
 #include <stdio.h>
 #include <ctype.h>
 
+#include "../allocator.h"
+
 /* Definitions: */
 
 #define MAX_REGEXP_OBJECTS      30    /* Max number of regex symbols in expression. */
@@ -74,11 +76,16 @@ static int ismetachar(char c);
 /* Public functions: */
 int re_match(const char* pattern, const char* text, int* matchlength)
 {
+  /* re_compile() returns 0 on an invalid pattern and does NOT write
+     *buf on those paths, so buf must start NULL. Without this, an
+     invalid pattern - e.g. an unterminated char class from
+     sre_match/4 - reached TPL_free() with an indeterminate stack value:
+     "attempting free on address which was not TPL_malloc()-ed". */
   regex_t *tmp;
-  unsigned char *buf;
+  unsigned char *buf = NULL;
   int ok = re_matchp(tmp = re_compile(pattern, &buf), text, matchlength);
-  free (buf);
-  free(tmp);
+  TPL_free(buf);
+  TPL_free(tmp);
   return ok;
 }
 
@@ -120,7 +127,7 @@ re_t re_compile(const char* pattern, unsigned char** buf)
      MAX_CHAR_CLASS_LEN determines the size of buffer for chars in all char-classes in the expression. */
   regex_t re_compiled[MAX_REGEXP_OBJECTS];
   static unsigned char tmp_ccl_buf[MAX_CHAR_CLASS_LEN];
-  unsigned char *ccl_buf = malloc(sizeof(tmp_ccl_buf));
+  unsigned char *ccl_buf = TPL_malloc(sizeof(tmp_ccl_buf));
   int ccl_bufidx = 1;
 
   char c;     /* current char in pattern   */
@@ -191,7 +198,8 @@ re_t re_compile(const char* pattern, unsigned char** buf)
           i += 1; /* Increment i to avoid including '^' in the char-buffer */
           if (pattern[i+1] == 0) /* incomplete pattern, missing non-zero char after '^' */
           {
-			free(ccl_buf);
+			TPL_free(ccl_buf);
+            *buf = NULL;
             return 0;
           }
         }
@@ -209,12 +217,14 @@ re_t re_compile(const char* pattern, unsigned char** buf)
             if (ccl_bufidx >= MAX_CHAR_CLASS_LEN - 1)
             {
               //fputs("exceeded internal buffer!\n", stderr);
-			  free(ccl_buf);
+			  TPL_free(ccl_buf);
+              *buf = NULL;
               return 0;
             }
             if (pattern[i+1] == 0) /* incomplete pattern, missing non-zero char after '\\' */
             {
-			  free(ccl_buf);
+			  TPL_free(ccl_buf);
+              *buf = NULL;
               return 0;
             }
             ccl_buf[ccl_bufidx++] = pattern[i++];
@@ -222,7 +232,8 @@ re_t re_compile(const char* pattern, unsigned char** buf)
           else if (ccl_bufidx >= MAX_CHAR_CLASS_LEN)
           {
               //fputs("exceeded internal buffer!\n", stderr);
-			  free(ccl_buf);
+			  TPL_free(ccl_buf);
+              *buf = NULL;
               return 0;
           }
           ccl_buf[ccl_bufidx++] = pattern[i];
@@ -231,7 +242,8 @@ re_t re_compile(const char* pattern, unsigned char** buf)
         {
             /* Catches cases such as [00000000000000000000000000000000000000][ */
             //fputs("exceeded internal buffer!\n", stderr);
-			free(ccl_buf);
+			TPL_free(ccl_buf);
+            *buf = NULL;
             return 0;
         }
         /* Null-terminate string end */
@@ -249,7 +261,8 @@ re_t re_compile(const char* pattern, unsigned char** buf)
     /* no buffer-out-of-bounds access on invalid patterns - see https://github.com/kokke/tiny-regex-c/commit/1a279e04014b70b0695fba559a7c05d55e6ee90b */
     if (pattern[i] == 0)
     {
-	  free(ccl_buf);
+	  TPL_free(ccl_buf);
+      *buf = NULL;
       return 0;
     }
 
@@ -259,7 +272,7 @@ re_t re_compile(const char* pattern, unsigned char** buf)
   /* 'UNUSED' is a sentinel used to indicate end-of-pattern */
   re_compiled[j].type = UNUSED;
 
-  regex_t *tmp = malloc(sizeof(re_compiled));
+  regex_t *tmp = TPL_malloc(sizeof(re_compiled));
   memcpy(tmp, re_compiled, sizeof(re_compiled));
   *buf = ccl_buf;
   return (re_t) tmp;

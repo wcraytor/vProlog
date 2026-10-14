@@ -4,13 +4,10 @@ extern "C" {
 #include "trealla.h"
 }
 
-// Symbols that tpl.c's main() normally provides; required when embedding the
-// library without the REPL driver (see test/embed_tests.c).
+// The engine defines g_envp (src/bif_os.c); a front end points it at the
+// process environment (see test/embed_tests.c).
 extern "C" char **environ;
-extern "C" {
-  char **g_envp = NULL;
-  void sigfn(int s) { (void)s; }
-}
+extern "C" char **g_envp;
 
 using namespace Rcpp;
 

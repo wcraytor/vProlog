@@ -1,5 +1,5 @@
 :- module(lists, [
-		member/2,
+		member/2, memberchk/2,
 		select/3, selectchk/3,
 		append/2, append/3,
 		subtract/3, union/3, intersection/3, is_set/1,
@@ -13,6 +13,14 @@
 		maplist/2, maplist/3, maplist/4, maplist/5, maplist/6, maplist/7, maplist/8,
 		tasklist/2, tasklist/3, tasklist/4, tasklist/5, tasklist/6, tasklist/7, tasklist/8
 	]).
+
+memberchk(E, List) :-
+	'$memberchk'(E, List, Tail),
+	(   nonvar(Tail) ->  true
+	;   Tail = [_|_], memberchk(E, Tail)
+	).
+
+:- help(memberchk(?term,?term), [iso(false), desc('Is element a member of the list.')]).
 
 reverse(Xs, Ys) :-
 	(	nonvar(Xs) -> reverse_(Xs, Ys, [], Xs)
@@ -256,19 +264,19 @@ list_min_([H|T], Min0, Min) :-
 :- help(list_min(+list,?integer), [iso(false), desc('Lowest value in list.')]).
 
 list_to_set(Ls0, Ls) :-
-		maplist(with_var, Ls0, LVs0),
-		keysort(LVs0, LVs),
-		same_elements(LVs),
-		pick_firsts(LVs0, Ls).
+	maplist(with_var, Ls0, LVs0),
+	keysort(LVs0, LVs),
+	same_elements(LVs),
+	pick_firsts(LVs0, Ls).
 
 pick_firsts([], []).
 pick_firsts([E-V|EVs], Fs0) :-
-		(   V == visited ->
-			Fs0 = Fs
-		;   V = visited,
-			Fs0 = [E|Fs]
-		),
-		pick_firsts(EVs, Fs).
+	(   V == visited ->
+		Fs0 = Fs
+	;   V = visited,
+		Fs0 = [E|Fs]
+	),
+	pick_firsts(EVs, Fs).
 
 with_var(E, E-_).
 
@@ -277,10 +285,10 @@ same_elements([EV|EVs]) :-
 		foldl(unify_same, EVs, EV, _).
 
 unify_same(E-V, Prev-Var, E-V) :-
-		(   Prev == E ->
-			Var = V
-		;   true
-		).
+	(   Prev == E ->
+		Var = V
+	;   true
+	).
 
 is_set(Set) :-
 	'$skip_list'(Len, Set, Tail),
@@ -297,11 +305,11 @@ transpose_(_, Fs, Lists0, Lists) :-
 
 lists_transpose_([], []).
 lists_transpose_([L|Ls], Ts) :-
-        maplist(same_length(L), Ls),
-        foldl(transpose_, L, Ts, [L|Ls], _).
+	maplist(same_length(L), Ls),
+	foldl(transpose_, L, Ts, [L|Ls], _).
 
 transpose(Ls, Ts) :-
-        lists_transpose_(Ls, Ts).
+	lists_transpose_(Ls, Ts).
 
 :- help(transpose(?list,?list), [iso(false), desc('Transpose list of lists.')]).
 
@@ -388,8 +396,6 @@ perm_(List, [First|Perm]) :-
 
 :- help(permutation(?list,?list), [iso(false)]).
 
-:- use_module(library(gensym)).
-
 maplist(G, L) :-
 	maplist_(L, G).
 
@@ -465,57 +471,57 @@ maplist_([E1|T1], [E2|T2], [E3|T3], [E4|T4], [E5|T5], [E6|T6], [E7|T7], G) :-
 tasklist(G, L) :-
 	tasklist_(L, G).
 
-tasklist_([], _) :- wait.
+tasklist_([], _) :- task_wait.
 tasklist_([E|T], G) :-
-	call_task(G, E),
+	task_call(G, E),
 	tasklist_(T, G).
 
 tasklist(G, L1, L2) :-
 	tasklist_(L1, L2, G).
 
-tasklist_([], [], _) :- wait.
+tasklist_([], [], _) :- task_wait.
 tasklist_([E1|T1], [E2|T2], G) :-
-	call_task(G, E1, E2),
+	task_call(G, E1, E2),
 	tasklist_(T1, T2, G).
 
 tasklist(G, L1, L2, L3) :-
 	tasklist_(L1, L2, L3, G).
 
-tasklist_([], [], [], _) :- wait.
+tasklist_([], [], [], _) :- task_wait.
 tasklist_([E1|T1], [E2|T2], [E3|T3], G) :-
-	call_task(G, E1, E2, E3),
+	task_call(G, E1, E2, E3),
 	tasklist_(T1, T2, T3, G).
 
 tasklist(G, L1, L2, L3, L4) :-
 	tasklist_(L1, L2, L3, L4, G).
 
-tasklist_([], [], [], [], _) :- wait.
+tasklist_([], [], [], [], _) :- task_wait.
 tasklist_([E1|T1], [E2|T2], [E3|T3], [E4|T4], G) :-
-	call_task(G, E1, E2, E3, E4),
+	task_call(G, E1, E2, E3, E4),
 	tasklist_(T1, T2, T3, T4, G).
 
 tasklist(G, L1, L2, L3, L4, L5) :-
 	tasklist_(L1, L2, L3, L4, L5, G).
 
-tasklist_([], [], [], [], [], _) :- wait.
+tasklist_([], [], [], [], [], _) :- task_wait.
 tasklist_([E1|T1], [E2|T2], [E3|T3], [E4|T4], [E5|T5], G) :-
-	call_task(G, E1, E2, E3, E4, E5),
+	task_call(G, E1, E2, E3, E4, E5),
 	tasklist_(T1, T2, T3, T4, T5, G).
 
 tasklist(G, L1, L2, L3, L4, L5, L6) :-
 	tasklist_(L1, L2, L3, L4, L5, L6, G).
 
-tasklist_([], [], [], [], [], [], _) :- wait.
+tasklist_([], [], [], [], [], [], _) :- task_wait.
 tasklist_([E1|T1], [E2|T2], [E3|T3], [E4|T4], [E5|T5], [E6|T6], G) :-
-	call_task(G, E1, E2, E3, E4, E5, E6),
+	task_call(G, E1, E2, E3, E4, E5, E6),
 	tasklist_(T1, T2, T3, T4, T5, T6, G).
 
 tasklist(G, L1, L2, L3, L4, L5, L6, L7) :-
 	tasklist_(L1, L2, L3, L4, L5, L6, L7, G).
 
-tasklist_([], [], [], [], [], [], [], _) :- wait.
+tasklist_([], [], [], [], [], [], [], _) :- task_wait.
 tasklist_([E1|T1], [E2|T2], [E3|T3], [E4|T4], [E5|T5], [E6|T6], [E7|T7], G) :-
-	call_task(G, E1, E2, E3, E4, E5, E6, E7),
+	task_call(G, E1, E2, E3, E4, E5, E6, E7),
 	tasklist_(T1, T2, T3, T4, T5, T6, T7, G).
 
 :- meta_predicate(tasklist(1, ?)).

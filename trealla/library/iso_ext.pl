@@ -45,12 +45,6 @@ setup_call_cleanup(S, G, C) :-
 		(catch(ignore(C), _, true), throw(Err))
 	).
 
-:- meta_predicate(forall(0,0)).
-:- help(forall(:callable,:callable), [iso(false)]).
-
-forall(Cond, Action) :-
-	\+ (Cond, \+ Action).
-
 :- help(succ(?integer,+integer), [iso(false)]).
 :- help(succ(+integer,-integer), [iso(false)]).
 
@@ -67,18 +61,10 @@ succ(I, S) :-
 
 :- help(cfor(+evaluable,+evaluable,-var), [iso(false),desc('C-style for loop')]).
 
-cfor(I0,J0,K) :-
+cfor(I0, J0, K) :-
 	I is I0,
 	J is J0,
 	between(I, J, K).
-
-:- help(variant(+term,+term), [iso(false)]).
-
-variant(X,Y) :-
-	\+ \+ ( copy_term(X,XC),
-		subsumes_term(XC,Y),
-		subsumes_term(Y,XC)
-	).
 
 :- meta_predicate(call_det(0,?)).
 :- help(call_det(:callable,?boolean), [iso(false)]).
@@ -88,6 +74,13 @@ call_det(G, Det) :-
 	call(G),
 	'$get_level'(L2),
 	(L1 = L2 -> Det = true; Det = false).
+
+goal_expansion(call_det(G, Det), Goal) :-
+	nonvar(G),
+	!,
+	Goal = ('$get_level'(L1), call(G), '$get_level'(L2), (L1 = L2 -> Det = true; Det = false)),
+	true.
+goal_expansion(call_det(G, V), call_det(G, V)).
 
 :- meta_predicate(findall(?,0,-,?)).
 :- help(findall(+term,:callable,-list,+list), [iso(false)]).
@@ -99,82 +92,261 @@ findall(T, G, B, Tail) :-
 	append(B0, Tail, B), !.
 
 :- meta_predicate(call_with_time_limit(+,0)).
-:- help(call_with_time_limit(+float,:callable), [iso(false)]).
+:- help(call_with_time_limit(+number,:callable), [iso(false)]).
 
 call_with_time_limit(Time, Goal) :-
-	Time0 is truncate(Time * 1000),
-	'$alarm'(Time0),
-	(	catch(once(Goal), E, ('$alarm'(0), throw(E))) ->
-		'$alarm'(0)
-	;	('$alarm'(0), fail)
+	% 1000.0 not 1000: truncate/1 wants a float, so an INTEGER number of
+	% seconds used to raise type_error(float, _) instead of applying a
+	% limit. A sub-millisecond limit rounds down to 0, which is '$alarm's
+	% cancel opcode rather than a duration, so floor it at 1ms. Negative
+	% stays negative and '$alarm'/2 still raises domain_error.
+	TimeMs0 is truncate(Time * 1000.0),
+	(	TimeMs0 =:= 0 ->
+		TimeMs = 1
+	;	TimeMs = TimeMs0
+	),
+	'$alarm'(TimeMs, Timer),
+	(	catch(once(Goal), E, ('$alarm'(0, Timer), throw(E))) ->
+		'$alarm'(0, Timer)
+	;	('$alarm'(0, Timer), fail)
 	).
 
 :- meta_predicate(time_out(0,+,-)).
 :- help(time_out(:callable,+integer,?atom), [iso(false)]).
 
-time_out(Goal, Time, Result) :-
-	'$alarm'(Time),
-	(	catch(once(Goal), E, ('$alarm'(0), throw(E))) ->
-		('$alarm'(0), Result = success)
-	;	('$alarm'(0), fail)
+time_out(Goal, TimeMs0, Result) :-
+	% 0ms is '$alarm's cancel opcode, not a duration - floor it so an
+	% explicit zero times out at once instead of erroring, matching
+	% call_with_time_limit/2.
+	(	TimeMs0 =:= 0 ->
+		TimeMs = 1
+	;	TimeMs = TimeMs0
+	),
+	'$alarm'(TimeMs, Timer),
+	(	catch(once(Goal), E, ('$alarm'(0, Timer), throw(E))) ->
+		('$alarm'(0, Timer), Result = success)
+	;	('$alarm'(0, Timer), fail)
 	).
 
-:- help(not(:callable), [iso(false),deprecated(true)]).
-:- meta_predicate(not(0)).
+:- help(variant(+term,+term), [iso(false)]).
 
-not(X) :- X, !, fail.
-not(_).
+variant(X, Y) :-
+	\+ \+ ( copy_term(X,XC),
+		subsumes_term(XC,Y),
+		subsumes_term(Y,XC)
+	).
 
-:- help(term_variables(+term,-list,?tail), [iso(false)]).
+:- op(1105, xfy, '|').
 
-term_variables(P1, P2, P3) :-
-	term_variables(P1, P4),
-	append(P4, P3, P2).
+:- meta_predicate(phrase(2, ?)).
+:- meta_predicate(phrase(2, ?, ?)).
+:- meta_predicate(phrase(3, ?, ?, ?)).
+:- meta_predicate(phrase(4, ?, ?, ?, ?)).
 
-length(Xs0, N) :-
-   '$skip_max_list'(M, N, Xs0,Xs),
-   !,
-   (  Xs == [] -> N = M
-   ;  nonvar(Xs) -> var(N), Xs = [_|_], resource_error(finite_memory,length/2)
-   ;  nonvar(N) -> R is N-M, length_rundown(Xs, R)
-   ;  N == Xs -> failingvarskip(Xs), resource_error(finite_memory,length/2)
-   ;  length_addendum(Xs, N, M)
-   ).
-length(_, N) :-
-   integer(N), !,
-   domain_error(not_less_than_zero, N, length/2).
-length(_, N) :-
-   type_error(integer, N, length/2).
+%% phrase(+Body, ?Ls).
 
-length_rundown(Xs, 0) :- !, Xs = [].
-length_rundown(Vs, N) :-
-    '$unattributed_var'(Vs), % unconstrained
-    !,
-    '$det_length_rundown'(Vs, N).
-length_rundown([_|Xs], N) :- % force unification
-    N1 is N-1,
-    length(Xs, N1). % maybe some new info on Xs
+phrase(GRBody, S0) :-
+    phrase(GRBody, S0, []).
 
-failingvarskip(Xs) :-
-    '$unattributed_var'(Xs), % unconstrained
-    !.
-failingvarskip([_|Xs0]) :- % force unification
-    '$skip_max_list'(_, _, Xs0,Xs),
-    (  nonvar(Xs) -> Xs = [_|_]
-	 ;  failingvarskip(Xs)
+%% phrase(+Body, ?Ls, ?Ls0).
+%
+% True iff Body describes part of the list Ls and the rest of Ls is Ls0.
+%
+% Example:
+%
+% ```
+% ?- phrase(seq(X), "aaa", Y).
+%    X = [], Y = "aaa"
+% ;  X = "a", Y = "aa"
+% ;  X = "aa", Y = "a"
+% ;  X = "aaa", Y = [].
+% ```
+
+% '$dcg_body'/4 FAILS for anything that is not a 7.14 construct, which is
+% what lets the last branch handle an ordinary non-terminal by appending
+% the two arguments - so phrase(1, L) still reaches call/3 and reports
+% type_error(callable, 1) from there. It throws only where ISO requires,
+% including type_error(callable, T) for a non-callable in non-terminal
+% position, which is the #1102 fix.
+
+phrase(GRBody, S0, S) :-
+    strip_module(GRBody, M, B),
+    (   var(GRBody) ->
+        instantiation_error(phrase/3)
+    ;   '$dcg_body'(B, S0, S, Goal) ->
+        call(M:Goal)
+    ;   extend(B, [S0,S], Goal) ->
+        call(M:Goal)
+    ;   call(M:B, S0, S)
     ).
 
-length_addendum([], N, N).
-length_addendum([_|Xs], N, M) :-
-    M1 is M + 1,
-    length_addendum(Xs, N, M1).
+phrase(GRBody, Arg, S0, S) :-
+    strip_module(GRBody, M, B),
+    (   var(GRBody) ->
+        instantiation_error(phrase/4)
+    ;   extend(B, [Arg], B2),
+        '$dcg_body'(B2, S0, S, Goal) ->
+        call(M:Goal)
+    ;   extend(B, [Arg,S0,S], Goal) ->
+        call(M:Goal)
+    ;   call(M:B, Arg, S0, S)
+    ).
 
-:- help(length(?term,?integer), [iso(false), desc('Number of elements in list.')]).
+phrase(GRBody, Arg1, Arg2, S0, S) :-
+    strip_module(GRBody, M, B),
+    (   var(GRBody) ->
+        instantiation_error(phrase/5)
+    ;   extend(B, [Arg1,Arg2], B2),
+        '$dcg_body'(B2, S0, S, Goal) ->
+        call(M:Goal)
+    ;   extend(B, [Arg1,Arg2,S0,S], Goal) ->
+        call(M:Goal)
+    ;   call(M:B, Arg1, Arg2, S0, S)
+    ).
 
-memberchk(E, List) :-
-	'$memberchk'(E, List, Tail),
-	(   nonvar(Tail) ->  true
-	;   Tail = [_|_], memberchk(E, Tail)
+% As the reference does it: append the extra arguments to the body term
+% first, then translate the result.
+
+extend(B, Extra, B2) :-
+    callable(B),
+    B =.. L0,
+    append(L0, Extra, L),
+    B2 =.. L.
+
+%% seq(Seq)//
+%
+% Describes a sequence.
+%
+% The walk is seq_//1, whose first clause is deliberately NOT a DCG rule:
+% it is a hand-written seq_/3 guarding var(Xs), Cs0 == [], which is what
+% terminates generation. Carried over from the reference verbatim.
+
+% A whole compact string is its own answer; walking to it costs a frame per
+% character.
+
+seq(Xs, Cs0,Cs) :-
+	(	string(Cs0), var(Xs), Cs == []
+	->	Xs = Cs0
+	;	seq_(Xs, Cs0, Cs)
 	).
 
-:- help(memberchk(?term,?term), [iso(false), desc('Is element a member of the list.')]).
+seq_(Xs, Cs0,Cs) :-
+   var(Xs),
+   Cs0 == [],
+   !,
+   Xs = [],
+   Cs0 = Cs.
+seq_([]) --> [].
+seq_([E|Es]) --> [E], seq_(Es).
+
+%% seqq(SeqOfSeqs)//
+%
+% Describes a sequence of sequences.
+
+seqq([]) --> [].
+seqq([Es|Ess]) --> seq(Es), seqq(Ess).
+
+%% ...//
+%
+% Describes an arbitrary number of elements. The hand-written .../2
+% clause below terminates generation, as with seq//1.
+%
+% Written as TWO rules rather than the reference's `[] | [_], ...`.
+% Same solutions in the same order, but an in-body disjunction under deep
+% recursion is quadratic in this engine, where two clauses are linear:
+% skipping to a marker in an 80k-character string took 19s as a
+% disjunction and is linear without it. Measured with the disjunction
+% reproduced in plain Prolog, so this is not a DCG effect - see the note
+% in docs/native-dcg-design.md §11.
+
+...(Cs0,Cs) :-
+   Cs0 == [],
+   !,
+   Cs0 = Cs.
+... --> [].
+... --> [_], ... .
+
+% Inline phrase/3 at consult time, as the reference did. This MUST NOT
+% throw: a compile-time expansion may not raise an error at a different
+% moment than the runtime would, so a body whose translation would throw
+% is declined here and left to fail at runtime instead, where it belongs
+% (see section 5.3 of docs/native-dcg-design.md). Declining is just
+% failing the hook, which leaves the ordinary phrase/3 call in place.
+
+goal_expansion(phrase(GRBody, S0, S), Goal) :-
+    nonvar(GRBody),
+    strip_module(GRBody, M, B),
+    nonvar(B),
+    catch(dcg_inline(B, S0, S, G), _, fail),
+    (   GRBody = (_:_) ->
+        Goal = M:G
+    ;   Goal = G
+    ).
+
+% Translate a construct, or append the two arguments to an ordinary
+% non-terminal. Deliberately NOT wrapped in its own catch: a body whose
+% translation throws must propagate out to the catch above, which
+% declines the expansion and leaves the runtime phrase/3 call in place.
+%
+% Falling back to extend/3 on a throw would be silently wrong - the body
+% is a construct, so appending arguments to it builds nonsense like
+% ','(A,B,S0,S). That is what issue #832's own test caught.
+
+dcg_inline(B, S0, S, G) :-
+    (   '$dcg_body'(B, S0, S, G0) ->
+        G = G0
+    ;   extend(B, [S0,S], G)
+    ).
+
+goal_expansion(phrase(GRBody, S0), phrase(GRBody, S0, [])).
+
+% (-->)/2 behaves as if it didn't exist. We export (and define) it
+% only so that clauses for (-->)/2 cannot be asserted when
+% library(dcgs) is loaded.
+
+(_-->_) :- throw(error(existence_error(procedure,(-->)/2),(-->)/2)).
+
+% expand_term/2 is the expansion driver, not just a grammar-rule
+% translator: the term_expansion/2 hook first, then translation of
+% whatever came back, then identity. Only the middle step used to be
+% here, so it failed on every term that was not a grammar rule and
+% never consulted the hook at all.
+
+expand_term(T, X) :-
+	user:term_expansion(T, T0),
+	!,
+	expand_term_dcg(T0, X).
+expand_term(T, X) :-
+	expand_term_dcg(T, X).
+
+% expand_goal/2: user:goal_expansion/2 until it no longer applies, through
+% the control constructs. The depth bound stops an expansion that loops.
+
+:- help(expand_goal(+callable,-callable), [iso(false)]).
+
+expand_goal(G, X) :-
+	'$expand_goal'(G, X, 0).
+
+'$expand_goal'(G, X, _) :- var(G), !, X = G.
+'$expand_goal'((A,B), (X,Y), D) :- !, '$expand_goal'(A, X, D), '$expand_goal'(B, Y, D).
+'$expand_goal'((A;B), (X;Y), D) :- !, '$expand_goal'(A, X, D), '$expand_goal'(B, Y, D).
+'$expand_goal'((A->B), (X->Y), D) :- !, '$expand_goal'(A, X, D), '$expand_goal'(B, Y, D).
+'$expand_goal'((A*->B), (X*->Y), D) :- !, '$expand_goal'(A, X, D), '$expand_goal'(B, Y, D).
+'$expand_goal'(\+A, \+X, D) :- !, '$expand_goal'(A, X, D).
+'$expand_goal'(G, X, D) :-
+	D < 100,
+	predicate_property(user:goal_expansion(_, _), defined),
+	user:goal_expansion(G, G1),
+	G1 \== G,
+	!,
+	D1 is D + 1,
+	'$expand_goal'(G1, X, D1).
+'$expand_goal'(G, G, _).
+
+% A list result has each element translated, as when consulting.
+
+expand_term_dcg(T, X) :- var(T), !, X = T.
+expand_term_dcg((H --> B), X) :- !, '$dcg_rule'((H --> B), X).
+expand_term_dcg([T|Ts], [X|Xs]) :- !, expand_term_dcg(T, X), expand_term_dcg(Ts, Xs).
+expand_term_dcg(T, T).
+

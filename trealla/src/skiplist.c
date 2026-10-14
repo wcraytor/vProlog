@@ -7,6 +7,31 @@
 #include <stdbool.h>
 #include <time.h>
 
+#if (__STDC_VERSION__ >= 201112L) && USE_THREADS
+#include <stdatomic.h>
+#define sl_atomic _Atomic
+
+// Publishing a new node into a list another thread may be descending.
+// Its key and val have to be visible before the forward pointer that
+// reveals it, which on a weak memory model is not otherwise guaranteed:
+// the store linking the node in can land before the stores that filled
+// it, and a reader then compares against an uninitialised key.
+//
+// Only the writer needs a fence. A reader reaches key and val *through*
+// the forward pointer it loaded, and that address dependency orders the
+// loads on every architecture Trealla targets.
+//
+// This does not make the list lock-free. Concurrent sl_rem() still has
+// to be excluded by the caller - the database does that with
+// prolog_lock(). It closes the narrower window where insertion alone
+// races with a descent, which nothing excluded.
+
+#define sl_publish_barrier() atomic_thread_fence(memory_order_release)
+#else
+#define sl_atomic volatile
+#define sl_publish_barrier() ((void)0)
+#endif
+
 #include "skiplist.h"
 #include "threads.h"
 
@@ -18,11 +43,15 @@ struct slnode_ {
 	slnode_t *forward[];
 };
 
+// Traversal state: one per lookup, never shared between them.
+typedef struct { bool wild_card, is_find; } slctx;
+
 struct sliter_ {
 	sliter *next;
 	skiplist *l;
 	slnode_t *p;
 	void *key;
+	slctx ctx;
 };
 
 struct skiplist_ {
@@ -36,7 +65,7 @@ struct skiplist_ {
 	lock guard;
 	int level;
 	unsigned seed;
-	bool is_tmp_list, wild_card, is_find, is_destroyed;
+	bool is_tmp_list, is_destroyed;
 };
 
 #define MAX_LEVELS 16
@@ -44,7 +73,7 @@ struct skiplist_ {
 
 inline static slnode_t *new_node_of_level(unsigned x)
 {
-	return malloc(sizeof(slnode_t) + ((x+1) * sizeof(slnode_t*)));
+	return TPL_malloc(sizeof(slnode_t) + ((x+1) * sizeof(slnode_t*)));
 }
 
 static int default_cmpkey(const void *p1, const void *p2, __attribute__((unused)) const void *p, void *l)
@@ -54,9 +83,11 @@ static int default_cmpkey(const void *p1, const void *p2, __attribute__((unused)
 	return i1 < i2 ? -1 : i1 > i2 ? 1 : 0;
 }
 
+static int g_sl_random = -1;
+
 skiplist *sl_create(int (*cmpkey)(const void*, const void*, const void*, void *), void(*delkey)(void*, void*, const void*), const void *p)
 {
-	skiplist *l = (skiplist*)calloc(1, sizeof(struct skiplist_));
+	skiplist *l = (skiplist*)TPL_calloc(1, sizeof(struct skiplist_));
 	if (!l) return NULL;
 
 	init_lock(&l->guard);
@@ -66,10 +97,45 @@ skiplist *sl_create(int (*cmpkey)(const void*, const void*, const void*, void *)
 		return NULL;
 	}
 
-	l->seed = (unsigned)(size_t)(l + clock());
+	// Deterministic by default. The old seed mixed in the skiplist's own
+	// heap address and clock(), so every list in every run got a different
+	// level distribution - and any bug that depends on the shape of the
+	// structure then shows up as flakiness rather than as a reproducible
+	// failure. That is how a broken sl_rem() and a non-antisymmetric index
+	// comparator both stayed hidden for so long: they only bit on the runs
+	// where the dice fell a particular way.
+	//
+	// Seeded off a process-local counter instead, so the Nth skiplist
+	// created always gets the same sequence. Set TPL_SKIPLIST_RANDOM to
+	// bring the entropy back for soak and fuzz runs, where exploring many
+	// different shapes is the whole point.
+
+	static sl_atomic unsigned g_seq;
+	unsigned n = ++g_seq;
+
+	if (g_sl_random < 0)
+		g_sl_random = getenv("TPL_SKIPLIST_RANDOM") ? 1 : 0;
+
+	if (g_sl_random)
+		n ^= (unsigned)((size_t)l + (size_t)clock());
+
+	// Knuth multiplicative, then a mixing round so early lists do not
+	// start from near-identical states.
+
+	l->seed = n * 2654435761u;
+	l->seed ^= l->seed >> 15;
+
+	if (!l->seed)
+		l->seed = 1;
 	l->level = 1;
 
-	for (int i = 0; i < MAX_LEVELS; i++)
+	// new_node_of_level(x) allocates x+1 forward slots, so the header
+	// has MAX_LEVELS+1 of them. Initialising only MAX_LEVELS left the
+	// top slot holding whatever the allocator last put there, and
+	// sl_del/sl_rem read exactly that slot once l->level reaches the
+	// MAX_LEVELS cap.
+
+	for (int i = 0; i <= MAX_LEVELS; i++)
 		l->header->forward[i] = NULL;
 
 	l->header->key = NULL;
@@ -113,23 +179,41 @@ void sl_destroy(skiplist *l)
 	TPL_free(l);
 }
 
-void sl_set_wild_card(skiplist *l) { if (l) l->wild_card = true; }
-bool sl_is_find(skiplist *l) { return l ? l->is_find : true; }
+void sl_set_wild_card(void *ctx) { if (ctx) ((slctx*)ctx)->wild_card = true; }
+bool sl_is_find(void *ctx) { return ctx ? ((slctx*)ctx)->is_find : true; }
 size_t sl_count(const skiplist *l) { return l ? l->count : 0; }
 void sl_set_tmp(skiplist *l) { l->is_tmp_list = true; }
 
-#ifdef _WIN32
-#define rand_r(p1) rand()
-#endif
+// xorshift32 on the list's own seed. Replaces log(frand())/log(0.5),
+// which needed a guard for rand_r() returning 0 (log(0.0) is -inf, and
+// the conversion to int gave INT_MIN, which asked new_node_of_level()
+// for a nonsense size and silently dropped the insert).
+//
+// It also removes a platform split: on Windows rand_r was #defined to
+// rand(), discarding the per-list seed for shared global state, which is
+// neither reproducible nor safe to call from several threads at once.
+// This is the same generator everywhere.
 
-#define frand(seedp) (((double)rand_r(seedp)) / RAND_MAX)
+static inline unsigned sl_rand(unsigned *seedp)
+{
+	unsigned x = *seedp;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	return *seedp = x;
+}
+
+// Geometric with P=0.5, straight off the low bits - no floating point,
+// and no zero case to special-case.
 
 static int random_level(unsigned *seedp)
 {
-	const double P = 0.5;
-	double r = frand(seedp);
-	int lvl = (int)(log(r) / log(1.0 - P));
-	return lvl < MAX_LEVEL ? lvl : MAX_LEVEL;
+	int lvl = 0;
+
+	while ((sl_rand(seedp) & 1u) && (lvl < MAX_LEVEL))
+		lvl++;
+
+	return lvl;
 }
 
 bool sl_get(skiplist *l, const void *key, const void **val)
@@ -138,16 +222,17 @@ bool sl_get(skiplist *l, const void *key, const void **val)
 		return false;
 
 	slnode_t *p = l->header, *q = NULL;
+	slctx ctx = {false, true};
 
 	for (int k = l->level - 1; k >= 0; k--) {
-		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, l) < 0))
+		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, &ctx) < 0))
 			p = q;
 	}
 
 	if (!(q = p->forward[0]))
 		return false;
 
-	if (l->cmpkey(q->key, key, l->p, l) != 0)
+	if (l->cmpkey(q->key, key, l->p, &ctx) != 0)
 		return false;
 
 	if (val)
@@ -162,10 +247,11 @@ bool sl_set(skiplist *l, const void *key, const void *val)
 		return false;
 
 	slnode_t *update[MAX_LEVELS+1], *p = l->header, *q = NULL;
+	slctx ctx = {false, true};
 	int k;
 
 	for (k = l->level - 1; k >= 0; k--) {
-		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, l) < 0))
+		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, &ctx) < 0))
 			p = q;
 
 		update[k] = p;
@@ -183,6 +269,10 @@ bool sl_set(skiplist *l, const void *key, const void *val)
 	if (!q) return false;
 	q->key = (void *)key;
 	q->val = (void*)val;
+
+	// Before any forward pointer reveals q.
+
+	sl_publish_barrier();
 
 	for (; k >= 0; k--) {
 		p = update[k];
@@ -200,10 +290,11 @@ bool sl_app(skiplist *l, const void *key, const void *val)
 		return false;
 
 	slnode_t *update[MAX_LEVELS+1], *p = l->header, *q = NULL;
+	slctx ctx = {false, true};
 	int k;
 
 	for (k = l->level - 1; k >= 0; k--) {
-		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, l) <= 0))
+		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, &ctx) <= 0))
 			p = q;
 
 		update[k] = p;
@@ -222,6 +313,10 @@ bool sl_app(skiplist *l, const void *key, const void *val)
 	q->key = (void *)key;
 	q->val = (void*)val;
 
+	// Before any forward pointer reveals q.
+
+	sl_publish_barrier();
+
 	for (; k >= 0; k--) {
 		p = update[k];
 		q->forward[k] = p->forward[k];
@@ -232,55 +327,100 @@ bool sl_app(skiplist *l, const void *key, const void *val)
 	return true;
 }
 
+// Give the entry holding val under key a new key and value in place, the new key comparing equal
+// to the old. A reader finds the entry throughout, and either key or value it sees is usable.
+
+bool sl_replace(skiplist *l, const void *key, const void *val, const void *newkey, const void *newval)
+{
+	if (!l || l->is_destroyed)
+		return false;
+
+	slnode_t *p = l->header, *q = NULL;
+	slctx ctx = {false, true};
+
+	for (int k = l->level - 1; k >= 0; k--) {
+		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, &ctx) < 0))
+			p = q;
+	}
+
+	for (q = p->forward[0]; q && !l->cmpkey(q->key, key, l->p, &ctx); q = q->forward[0]) {
+		if (q->val != val)
+			continue;
+
+		sl_publish_barrier();
+		q->val = (void*)newval;
+		q->key = (void*)newkey;
+		return true;
+	}
+
+	return false;
+}
+
 bool sl_rem(skiplist *l, const void *key, const void *val)
 {
 	if (!l || l->is_destroyed || !key)
 		return false;
 
 	slnode_t *update[MAX_LEVELS+1], *p = l->header, *q = NULL;
+	slctx ctx = {false, true};
 	int k;
 
-	for (k = l->level; k >= 0; k--) {
-		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, l) <= 0)) {
-			if (l->cmpkey(q->key, key, l->p, l) == 0) {
-				if (q->val == val)
-					break;
-			}
+	// Descend on a STRICT less-than so update[] lands on the last node
+	// ahead of the run of equal keys, at every level.
+	//
+	// The old loop advanced while cmp <= 0 and broke only on
+	// q->val == val. At a level where the target node is absent - most
+	// levels, since heights are random - that walked p past the whole
+	// equal-key run and so past the target's position. The descent then
+	// finished beyond the node it wanted and either unlinked a
+	// neighbour or reported failure. With duplicate keys it failed on
+	// 394 of 400 removals, and first-argument indexing is nothing but
+	// duplicate keys: every clause sharing a principal functor lands on
+	// the same key. Index entries therefore outlived the clauses whose
+	// cells they borrow for a key.
 
+	for (k = l->level - 1; k >= 0; k--) {
+		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, &ctx) < 0))
 			p = q;
-		}
 
 		update[k] = p;
 	}
 
-	if (!(q = p->forward[0]))
-		return false;
+	// Walk the equal-key run at level 0 for the exact pair, carrying
+	// update[] forward as nodes tall enough to matter go by. Level 0
+	// included - leaving update[0] behind strands the node in the
+	// bottom chain after it has been freed.
 
-	if (l->cmpkey(q->key, key, l->p, l) != 0)
+	slnode_t *t = update[0]->forward[0];
+
+	while (t && (l->cmpkey(t->key, key, l->p, &ctx) == 0) && (t->val != val)) {
+		for (k = 0; k < l->level; k++) {
+			if (update[k]->forward[k] == t)
+				update[k] = t;
+		}
+
+		t = t->forward[0];
+	}
+
+	if (!t || (l->cmpkey(t->key, key, l->p, &ctx) != 0) || (t->val != val))
 		return false;
 
 	if (l->delkey)
-		l->delkey(q->key, q->val, l->p);
+		l->delkey(t->key, t->val, l->p);
 
-	int m = l->level - 1;
-
-	for (k = 0; k <= m; k++) {
-		p = update[k];
-
-		if (!p || (p->forward[k] != q))
-			break;
-
-		p->forward[k] = q->forward[k];
+	for (k = 0; k < l->level; k++) {
+		if (update[k]->forward[k] == t)
+			update[k]->forward[k] = t->forward[k];
 	}
 
-	m = l->level - 1;
+	int m = l->level - 1;
 
 	while (!l->header->forward[m] && (m > 0))
 		m--;
 
 	l->level = m + 1;
 	l->count--;
-	TPL_free(q);
+	TPL_free(t);
 	return true;
 }
 
@@ -290,10 +430,11 @@ bool sl_del(skiplist *l, const void *key)
 		return false;
 
 	slnode_t *update[MAX_LEVELS+1], *p = l->header, *q = NULL;
+	slctx ctx = {false, true};
 	int k;
 
-	for (k = l->level; k >= 0; k--) {
-		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, l) < 0))
+	for (k = l->level - 1; k >= 0; k--) {
+		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, &ctx) < 0))
 			p = q;
 
 		update[k] = p;
@@ -302,7 +443,7 @@ bool sl_del(skiplist *l, const void *key)
 	if (!(q = p->forward[0]))
 		return false;
 
-	if (l->cmpkey(q->key, key, l->p, l) != 0)
+	if (l->cmpkey(q->key, key, l->p, &ctx) != 0)
 		return false;
 
 	if (l->delkey)
@@ -336,7 +477,6 @@ sliter *sl_first(skiplist *l)
 		return NULL;
 
 	sliter *iter;
-	l->wild_card = false;
 
 	if (l->is_tmp_list)
 		iter = &l->tmp_iter;
@@ -344,7 +484,7 @@ sliter *sl_first(skiplist *l)
 		acquire_lock(&l->guard);
 
 		if (!l->iters) {
-			iter = malloc(sizeof(sliter));
+			iter = TPL_malloc(sizeof(sliter));
 			if (!iter) { release_lock(&l->guard); return NULL; }
 		} else {
 			iter = l->iters;
@@ -405,16 +545,15 @@ sliter *sl_find_key(skiplist *l, const void *key)
 		return NULL;
 
 	slnode_t *p = l->header, *q = NULL;
-	l->wild_card = false;
-	l->is_find = true;
+	slctx ctx = {false, true};
 
 	for (int k = l->level - 1; k >= 0; k--) {
-		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, l) < 0))
+		while ((q = p->forward[k]) && (l->cmpkey(q->key, key, l->p, &ctx) < 0))
 			p = q;
 	}
 
 	if (!p || !(q = p->forward[0]))
-		return false;
+		return NULL;
 
 	sliter *iter;
 
@@ -424,7 +563,7 @@ sliter *sl_find_key(skiplist *l, const void *key)
 		acquire_lock(&l->guard);
 
 		if (!l->iters) {
-			iter = malloc(sizeof(sliter));
+			iter = TPL_malloc(sizeof(sliter));
 			if (!iter) { release_lock(&l->guard); return NULL; }
 		} else {
 			iter = l->iters;
@@ -445,15 +584,15 @@ bool sl_next_key(sliter *iter, void **val)
 	if (!iter)
 		return false;
 
-	iter->l->is_find = false;
+	iter->ctx.is_find = false;
 
 	if (!iter->p)
 		return false;
 
-	iter->l->wild_card = false;
-	int ok = iter->l->cmpkey(iter->p->key, iter->key, iter->l->p, iter->l);
+	iter->ctx.wild_card = false;
+	int ok = iter->l->cmpkey(iter->p->key, iter->key, iter->l->p, &iter->ctx);
 
-	if (!iter->l->wild_card && (ok != 0))
+	if (!iter->ctx.wild_card && (ok != 0))
 		return false;
 
 	if (val)

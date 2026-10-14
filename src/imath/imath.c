@@ -32,6 +32,8 @@
 #include <errno.h>
 #include <string.h>
 
+#include "../allocator.h"
+
 const mp_result MP_OK = 0;      /* no error, all is well  */
 const mp_result MP_FALSE = 0;   /* boolean false          */
 const mp_result MP_TRUE = -1;   /* boolean true           */
@@ -379,7 +381,7 @@ mp_result mp_int_init(mp_int z) {
 }
 
 mp_int mp_int_alloc(void) {
-  mp_int out = malloc(sizeof(mpz_t));
+  mp_int out = TPL_malloc(sizeof(mpz_t));
   if(out == NULL) errno = ENOMEM;
 
   if (out != NULL) mp_int_init(out);
@@ -474,7 +476,7 @@ void mp_int_free(mp_int z) {
   assert(z != NULL);
 
   mp_int_clear(z);
-  free(z); /* note: NOT s_free() */
+  TPL_free(z); /* note: NOT s_free() */
 }
 
 mp_result mp_int_copy(mp_int a, mp_int c) {
@@ -1406,14 +1408,19 @@ mp_result mp_int_to_int(mp_int z, mp_small *out) {
 
   mp_usmall uz = MP_USED(z);
   mp_digit *dz = MP_DIGITS(z) + uz - 1;
-  mp_small uv = 0;
+  mp_usmall uv = 0;
   while (uz > 0) {
     uv <<= MP_DIGIT_BIT / 2;
     uv = (uv << (MP_DIGIT_BIT / 2)) | *dz--;
     --uz;
   }
 
-  if (out) *out = (mp_small)((sz == MP_NEG) ? -uv : uv);
+  if (out) {
+    if (sz == MP_NEG && uv == (mp_usmall)MP_SMALL_MAX + 1)
+      *out = MP_SMALL_MIN;
+    else
+      *out = (sz == MP_NEG) ? -(mp_small)uv : (mp_small)uv;
+  }
 
   return MP_OK;
 }
@@ -1442,6 +1449,124 @@ mp_result mp_int_to_uint(mp_int z, mp_usmall *out) {
   return MP_OK;
 }
 
+/* -- Fast divide-and-conquer radix conversion for large values -------------
+   The classic loop extracts one radix digit per full-length division,
+   costing O(n_digits * n_words).  Instead we recursively split the value
+   by powers radix^(k*2^i), where radix^k is the largest power of the
+   radix fitting in a single mp_digit.  Leaves fit in an mp_word and are
+   converted with native integer arithmetic. */
+
+#define MP_TO_STR_MAX_LEVELS 64
+
+static mp_digit s_maxradixpow(mp_size radix, int *k_out) {
+  mp_digit p = 1;
+  int k = 0;
+  while (p <= MP_DIGIT_MAX / radix) {
+    p *= (mp_digit)radix;
+    ++k;
+  }
+  *k_out = k;
+  return p;
+}
+
+/* Emit v in the given radix, zero-padded to at least `pad` chars. */
+static void s_emit_word(mp_word v, mp_size radix, int pad, char **strp) {
+  char tmp[2 * MP_DIGIT_BIT + 2];
+  int n = 0;
+  char *s = *strp;
+
+  do {
+    tmp[n++] = s_val2ch((int)(v % radix), 1);
+    v /= radix;
+  } while (v != 0);
+  while (n < pad) tmp[n++] = s_val2ch(0, 1);
+  while (n > 0) *s++ = tmp[--n];
+  *strp = s;
+}
+
+/* Requires 0 <= x < pow[level]^2, where pow[i] = radix^(k*2^i) and
+   dig[i] = k*2^i.  Writes the digits of x, zero-padded to `pad`. */
+static mp_result s_to_str_rec(mp_int x, mp_size radix, mpz_t *pow,
+                              const int *dig, int level, int pad,
+                              char **strp) {
+  if (CMPZ(x) == 0) { /* all zeros; skip pointless division */
+    char *s = *strp;
+    while (pad-- > 0) *s++ = s_val2ch(0, 1);
+    *strp = s;
+    return MP_OK;
+  }
+
+  if (level == 0) { /* x < radix^2k, fits in an mp_word */
+    mp_word v = MP_DIGITS(x)[0];
+    if (MP_USED(x) > 1) v |= (mp_word)MP_DIGITS(x)[1] << MP_DIGIT_BIT;
+    s_emit_word(v, radix, pad, strp);
+    return MP_OK;
+  } else {
+    mpz_t q, r;
+    mp_result res;
+    int lowdig = dig[level];
+
+    if ((res = mp_int_init(&q)) != MP_OK) return res;
+    if ((res = mp_int_init(&r)) != MP_OK) {
+      mp_int_clear(&q);
+      return res;
+    }
+    res = mp_int_div(x, &pow[level], &q, &r);
+    if (res == MP_OK) {
+      if (pad == 0 && CMPZ(&q) == 0) {
+        /* Still in the leading-digit region: stay minimal width. */
+        res = s_to_str_rec(&r, radix, pow, dig, level - 1, 0, strp);
+      } else {
+        res = s_to_str_rec(&q, radix, pow, dig, level - 1,
+                           (pad > lowdig) ? pad - lowdig : 0, strp);
+        if (res == MP_OK)
+          res = s_to_str_rec(&r, radix, pow, dig, level - 1, lowdig, strp);
+      }
+    }
+    mp_int_clear(&q);
+    mp_int_clear(&r);
+    return res;
+  }
+}
+
+/* Requires z > 0 and a buffer large enough for all digits of z. */
+static mp_result s_to_str_fast(mp_int z, mp_size radix, char **strp) {
+  mpz_t pow[MP_TO_STR_MAX_LEVELS];
+  int dig[MP_TO_STR_MAX_LEVELS];
+  int k, top, count, i;
+  mp_result res;
+  mp_digit p0 = s_maxradixpow(radix, &k);
+
+  if ((res = mp_int_init(&pow[0])) != MP_OK) return res;
+  count = 1;
+  if ((res = mp_int_set_uvalue(&pow[0], (mp_usmall)p0)) != MP_OK)
+    goto CLEANUP;
+  dig[0] = k;
+
+  /* Square up until pow[top]^2 > z; pow[top+1] doubles as the tester. */
+  for (;;) {
+    if (count == MP_TO_STR_MAX_LEVELS) {
+      res = MP_RANGE;
+      goto CLEANUP;
+    }
+    if ((res = mp_int_init(&pow[count])) != MP_OK) goto CLEANUP;
+    ++count;
+    if ((res = mp_int_sqr(&pow[count - 2], &pow[count - 1])) != MP_OK)
+      goto CLEANUP;
+    dig[count - 1] = dig[count - 2] * 2;
+    if (mp_int_compare_unsigned(z, &pow[count - 1]) < 0) {
+      top = count - 2;
+      break;
+    }
+  }
+
+  res = s_to_str_rec(z, radix, pow, dig, top, 0, strp);
+
+CLEANUP:
+  for (i = 0; i < count; i++) mp_int_clear(&pow[i]);
+  return res;
+}
+
 mp_result mp_int_to_string(mp_int z, mp_size radix, char *str, int limit) {
   assert(z != NULL && str != NULL && limit >= 2);
   assert(radix >= MP_MIN_RADIX && radix <= MP_MAX_RADIX);
@@ -1461,6 +1586,17 @@ mp_result mp_int_to_string(mp_int z, mp_size radix, char *str, int limit) {
       --limit;
     }
     h = str;
+
+    /* Large value whose buffer is known to be big enough: use the
+       divide-and-conquer conversion instead of digit-at-a-time. */
+    if (MP_USED(&tmp) > 4 && s_outlen(z, radix) < limit) {
+      if ((res = mp_int_abs(&tmp, &tmp)) == MP_OK)
+        res = s_to_str_fast(&tmp, radix, &str);
+      mp_int_clear(&tmp);
+      if (res != MP_OK) return res;
+      *str = '\0';
+      return MP_OK;
+    }
 
     /* Generate digits in reverse order until finished or limit reached */
     for (/* */; limit > 0; --limit) {
@@ -1504,6 +1640,85 @@ mp_result mp_int_string_len(mp_int z, mp_size radix) {
 }
 
 /* Read zero-terminated string into z */
+/* -- Fast divide-and-conquer string reading for large values ---------------
+   The classic loop does one full-length multiply-by-radix per character,
+   costing O(n_chars * n_words).  Instead, parse k-char chunks (radix^k
+   being the largest radix power fitting in one mp_digit) into an array of
+   small values, then combine adjacent pairs bottom-up with full bignum
+   multiplications by radix^(k*2^i).  With Karatsuba multiplication the
+   total cost is roughly one full-size multiply. */
+
+static mp_result s_read_fast(mp_int z, mp_size radix, const char *str,
+                             int nd) {
+  int k, j, m, first;
+  mp_digit p0 = s_maxradixpow(radix, &k);
+  mp_result res = MP_OK;
+  mpz_t P;
+
+  m = (nd + k - 1) / k;
+  first = nd - (m - 1) * k; /* leftmost chunk may be short */
+
+  mpz_t *v = TPL_malloc((size_t)m * sizeof(mpz_t));
+  if (v == NULL) return MP_MEMORY;
+
+  for (j = 0; j < m; j++) {
+    int cnt = (j == 0) ? first : k;
+    mp_word acc = 0;
+    while (cnt-- > 0) acc = acc * radix + (mp_word)s_ch2val(*str++, radix);
+    if ((res = mp_int_init_uvalue(&v[j], (mp_usmall)acc)) != MP_OK) {
+      while (--j >= 0) mp_int_clear(&v[j]);
+      TPL_free(v);
+      return res;
+    }
+  }
+
+  if ((res = mp_int_init_uvalue(&P, (mp_usmall)p0)) != MP_OK) {
+    /* P is untouched when init fails - mp_int_init_copy() returns
+       before writing z - so it must not reach mp_int_clear() below. */
+    for (j = 0; j < m; j++) mp_int_clear(&v[j]);
+    TPL_free(v);
+    return res;
+  }
+
+  /* Combine pairs from the right; an odd leftmost element passes through. */
+  while (m > 1) {
+    int ofs = m % 2;
+
+    for (j = 0; j < m / 2; j++) {
+      int hi = ofs + 2 * j, lo = hi + 1;
+
+      if ((res = mp_int_mul(&v[hi], &P, &v[hi])) != MP_OK) goto CLEANUP;
+      if ((res = mp_int_add(&v[hi], &v[lo], &v[hi])) != MP_OK) goto CLEANUP;
+      mp_int_clear(&v[lo]);
+      if (ofs + j != hi) { /* shallow move, fixing up the self-pointer */
+        v[ofs + j] = v[hi];
+        if (v[hi].digits == &v[hi].single)
+          v[ofs + j].digits = &v[ofs + j].single;
+
+        /* The move duplicated the digits pointer. On the success path
+           m shrinks past v[hi] so only one copy is ever cleared, but a
+           mid-loop failure jumps to CLEANUP with the old m and frees
+           both - a double free reachable whenever mp_int_mul() or
+           mp_int_add() hits OOM (issue #801). Hand ownership over. */
+        v[hi].digits = &v[hi].single;
+        v[hi].used = 1;
+        v[hi].single = 0;
+      }
+    }
+    m = ofs + m / 2;
+    if (m > 1 && (res = mp_int_sqr(&P, &P)) != MP_OK) goto CLEANUP;
+  }
+
+  res = mp_int_copy(&v[0], z);
+
+CLEANUP:
+  /* On success or failure, v[0..m-1] are the still-live elements. */
+  for (j = 0; j < m; j++) mp_int_clear(&v[j]);
+  TPL_free(v);
+  mp_int_clear(&P);
+  return res;
+}
+
 mp_result mp_int_read_string(mp_int z, mp_size radix, const char *str) {
   return mp_int_read_cstring(z, radix, str, NULL);
 }
@@ -1539,10 +1754,22 @@ mp_result mp_int_read_cstring(mp_int z, mp_size radix, const char *str,
   z->used = 1;
   z->digits[0] = 0;
 
-  while (*str != '\0' && ((ch = s_ch2val(*str, radix)) >= 0)) {
-    s_dmul(z, (mp_digit)radix);
-    s_dadd(z, (mp_digit)ch);
-    ++str;
+  /* Count the run of valid digit characters. */
+  int nd = 0;
+  while (str[nd] != '\0' && s_ch2val(str[nd], radix) >= 0) ++nd;
+
+  if (nd > 64) { /* Large value: use divide-and-conquer conversion. */
+    mp_sign sign = z->sign;
+    mp_result res = s_read_fast(z, radix, str, nd);
+    if (res != MP_OK) return res;
+    z->sign = sign;
+    str += nd;
+  } else {
+    while (*str != '\0' && ((ch = s_ch2val(*str, radix)) >= 0)) {
+      s_dmul(z, (mp_digit)radix);
+      s_dadd(z, (mp_digit)ch);
+      ++str;
+    }
   }
 
   CLAMP(z);
@@ -1692,7 +1919,7 @@ static const mp_digit fill = (mp_digit)0xdeadbeefabad1dea;
 #endif
 
 static mp_digit *s_alloc(mp_size num) {
-  mp_digit *out = malloc(num * sizeof(mp_digit));
+  mp_digit *out = TPL_malloc(num * sizeof(mp_digit));
   //assert(out != NULL);
   if (out == NULL) { errno = ENOMEM; return out; }
 
@@ -1710,8 +1937,9 @@ static mp_digit *s_realloc(mp_digit *old, mp_size osize, mp_size nsize) {
 
   for (mp_size ix = 0; ix < nsize; ++ix) new[ix] = fill;
   memcpy(new, old, osize * sizeof(mp_digit));
+  s_free(old); /* TPL_realloc() frees the old buffer; this path must too */
 #else
-  mp_digit *new = realloc(old, nsize * sizeof(mp_digit));
+  mp_digit *new = TPL_realloc(old, nsize * sizeof(mp_digit));
   //assert(new != NULL);
   if (new == NULL) errno = ENOMEM;
 #endif
@@ -1719,7 +1947,7 @@ static mp_digit *s_realloc(mp_digit *old, mp_size osize, mp_size nsize) {
   return new;
 }
 
-static void s_free(void *ptr) { free(ptr); }
+static void s_free(void *ptr) { TPL_free(ptr); }
 
 static bool s_pad(mp_int z, mp_size min) {
   if (MP_ALLOC(z) < min) {
@@ -1740,9 +1968,8 @@ static bool s_pad(mp_int z, mp_size min) {
   return true;
 }
 
-/* Note: This will not work correctly when value == MP_SMALL_MIN */
 static void s_fake(mp_int z, mp_small value, mp_digit vbuf[]) {
-  mp_usmall uv = (mp_usmall)(value < 0) ? -value : value;
+  mp_usmall uv = value < 0 ? -(mp_usmall)value : (mp_usmall)value;
   s_ufake(z, uv, vbuf);
   if (value < 0) z->sign = MP_NEG;
 }
@@ -2504,6 +2731,205 @@ static mp_result s_embar(mp_int a, mp_int b, mp_int m, mp_int mu, mp_int c) {
   outputs: u / v stored in u
            u % v stored in v
  */
+/* -- Recursive divide-and-conquer division ----------------------------------
+   Schoolbook division costs O(m*n) digit operations.  For large operands
+   we instead use the recursive algorithm (cf. Burnikel & Ziegler, and
+   Brent & Zimmermann, "Modern Computer Arithmetic", alg. 1.8): divide by
+   the high half of the divisor, correct, and recurse.  The work then
+   collapses into large multiplications, which use recursive (Karatsuba)
+   multiplication, giving a subquadratic division overall. */
+
+#define RECDIV_THRESHOLD 24 /* digits; below this, use schoolbook */
+
+/* out = z / RADIX^words (word-aligned right shift) */
+static mp_result s_wshr(mp_int out, mp_int z, mp_size words) {
+  mp_result res = mp_int_copy(z, out);
+  if (res == MP_OK) s_qdiv(out, words * MP_DIGIT_BIT);
+  return res;
+}
+
+/* out = z mod RADIX^words */
+static mp_result s_wmod(mp_int out, mp_int z, mp_size words) {
+  mp_result res = mp_int_copy(z, out);
+  if (res == MP_OK) s_qmod(out, words * MP_DIGIT_BIT);
+  return res;
+}
+
+/* out = hi * RADIX^words + lo; hi, lo >= 0, out distinct from hi, lo */
+static mp_result s_wjoin(mp_int out, mp_int hi, mp_size words, mp_int lo) {
+  mp_result res = mp_int_copy(hi, out);
+  if (res != MP_OK) return res;
+  if (!s_qmul(out, words * MP_DIGIT_BIT)) return MP_MEMORY;
+  return mp_int_add(out, lo, out);
+}
+
+/* Balanced recursive division core.  Requires A >= 0, B > 0 with the high
+   bit of its top digit set, and used(A) <= 2*used(B).  Computes Q and R
+   with A = Q*B + R, 0 <= R < B.  Q, R must be distinct from A and B. */
+static mp_result s_rdivrem(mp_int A, mp_int B, mp_int Q, mp_int R) {
+  mp_result res;
+
+  if (s_ucmp(A, B) < 0) { /* trivial case: Q = 0, R = A */
+    if ((res = mp_int_copy(A, R)) == MP_OK) mp_int_zero(Q);
+    return res;
+  }
+
+  mp_size n = MP_USED(B);
+  mp_size m = MP_USED(A) - n; /* used(A) >= n since A >= B */
+
+  if (m <= RECDIV_THRESHOLD || n <= RECDIV_THRESHOLD) {
+    /* Base case: schoolbook division is O(m*n), cheap when m is small. */
+    mpz_t u, v;
+    if ((res = mp_int_init_copy(&u, A)) != MP_OK) return res;
+    if ((res = mp_int_init_copy(&v, B)) != MP_OK) {
+      mp_int_clear(&u);
+      return res;
+    }
+    res = s_udiv_knuth(&u, &v);
+    if (res == MP_OK) res = mp_int_copy(&u, Q);
+    if (res == MP_OK) res = mp_int_copy(&v, R);
+    mp_int_clear(&u);
+    mp_int_clear(&v);
+    return res;
+  }
+
+  mpz_t t[10];
+  mp_int AC = &t[0], B1 = &t[1], B0 = &t[2], Q1 = &t[3], R1 = &t[4],
+         Q0 = &t[5], R0 = &t[6], TA = &t[7], T0 = &t[8], T1 = &t[9];
+  int i, qbit = 0;
+  mp_size k = m / 2;
+
+  for (i = 0; i < 10; i++) {
+    if ((res = mp_int_init(&t[i])) != MP_OK) {
+      while (--i >= 0) mp_int_clear(&t[i]);
+      return res;
+    }
+  }
+
+  /* If A >= B*R^m the quotient needs m+1 digits; since B is normalized,
+     A < 2*B*R^m, so a single subtraction reduces it and the extra
+     quotient bit is added back at the end. */
+  if ((res = mp_int_copy(A, AC)) != MP_OK) goto CLEANUP;
+  if ((res = mp_int_copy(B, T0)) != MP_OK) goto CLEANUP;
+  if (!s_qmul(T0, m * MP_DIGIT_BIT)) {
+    res = MP_MEMORY;
+    goto CLEANUP;
+  }
+  if (s_ucmp(AC, T0) >= 0) {
+    if ((res = mp_int_sub(AC, T0, AC)) != MP_OK) goto CLEANUP;
+    qbit = 1;
+  }
+
+  /* Split the divisor: B = B1*R^k + B0. B1 keeps the normalized top. */
+  if ((res = s_wshr(B1, B, k)) != MP_OK) goto CLEANUP;
+  if ((res = s_wmod(B0, B, k)) != MP_OK) goto CLEANUP;
+
+  /* First half: divide the top of A by B1, then correct. */
+  if ((res = s_wshr(T0, AC, 2 * k)) != MP_OK) goto CLEANUP;
+  if ((res = s_rdivrem(T0, B1, Q1, R1)) != MP_OK) goto CLEANUP;
+
+  /* TA = R1*R^2k + (AC mod R^2k) - Q1*B0*R^k */
+  if ((res = s_wmod(T1, AC, 2 * k)) != MP_OK) goto CLEANUP;
+  if ((res = s_wjoin(TA, R1, 2 * k, T1)) != MP_OK) goto CLEANUP;
+  if ((res = mp_int_mul(Q1, B0, T0)) != MP_OK) goto CLEANUP;
+  if (!s_qmul(T0, k * MP_DIGIT_BIT)) {
+    res = MP_MEMORY;
+    goto CLEANUP;
+  }
+  if ((res = mp_int_sub(TA, T0, TA)) != MP_OK) goto CLEANUP;
+
+  if (CMPZ(TA) < 0) { /* T1 = B*R^k, used by the correction loop */
+    if ((res = mp_int_copy(B, T1)) != MP_OK) goto CLEANUP;
+    if (!s_qmul(T1, k * MP_DIGIT_BIT)) {
+      res = MP_MEMORY;
+      goto CLEANUP;
+    }
+    do { /* at most twice, since B is normalized */
+      if ((res = mp_int_sub_value(Q1, 1, Q1)) != MP_OK) goto CLEANUP;
+      if ((res = mp_int_add(TA, T1, TA)) != MP_OK) goto CLEANUP;
+    } while (CMPZ(TA) < 0);
+  }
+
+  /* Second half: same again on the reduced remainder TA. */
+  if ((res = s_wshr(T0, TA, k)) != MP_OK) goto CLEANUP;
+  if ((res = s_rdivrem(T0, B1, Q0, R0)) != MP_OK) goto CLEANUP;
+
+  /* T0 = R0*R^k + (TA mod R^k) - Q0*B0 */
+  if ((res = s_wmod(T1, TA, k)) != MP_OK) goto CLEANUP;
+  if ((res = s_wjoin(T0, R0, k, T1)) != MP_OK) goto CLEANUP;
+  if ((res = mp_int_mul(Q0, B0, T1)) != MP_OK) goto CLEANUP;
+  if ((res = mp_int_sub(T0, T1, T0)) != MP_OK) goto CLEANUP;
+
+  while (CMPZ(T0) < 0) { /* at most twice */
+    if ((res = mp_int_sub_value(Q0, 1, Q0)) != MP_OK) goto CLEANUP;
+    if ((res = mp_int_add(T0, B, T0)) != MP_OK) goto CLEANUP;
+  }
+
+  /* Q = Q1*R^k + Q0 (+ R^m), R = T0 */
+  if ((res = s_wjoin(Q, Q1, k, Q0)) != MP_OK) goto CLEANUP;
+  if (qbit) {
+    if ((res = mp_int_set_value(T1, 1)) != MP_OK) goto CLEANUP;
+    if (!s_qmul(T1, m * MP_DIGIT_BIT)) {
+      res = MP_MEMORY;
+      goto CLEANUP;
+    }
+    if ((res = mp_int_add(Q, T1, Q)) != MP_OK) goto CLEANUP;
+  }
+  res = mp_int_copy(T0, R);
+
+CLEANUP:
+  for (i = 0; i < 10; i++) mp_int_clear(&t[i]);
+  return res;
+}
+
+/* Unsigned magnitude division for large operands.  Same contract as
+   s_udiv_knuth: assumes |u| > |v|, overwrites u with the quotient and v
+   with the remainder.  Wide dividends are consumed in 2n-digit chunks so
+   the balanced core always sees used(A) <= 2*used(B). */
+static mp_result s_udiv_recursive(mp_int u, mp_int v) {
+  mp_result res;
+  int norm = s_norm(u, v);
+  mp_size n = MP_USED(v);
+  mpz_t t[5];
+  mp_int Q = &t[0], RR = &t[1], HI = &t[2], LO = &t[3], Q1 = &t[4];
+  int i;
+
+  for (i = 0; i < 5; i++) {
+    if ((res = mp_int_init(&t[i])) != MP_OK) {
+      while (--i >= 0) mp_int_clear(&t[i]);
+      return res;
+    }
+  }
+
+  if ((res = mp_int_copy(u, RR)) != MP_OK) goto CLEANUP;
+  mp_int_zero(Q);
+
+  while (MP_USED(RR) > 2 * n) {
+    mp_size s = MP_USED(RR) - 2 * n;
+
+    if ((res = s_wshr(HI, RR, s)) != MP_OK) goto CLEANUP;
+    if ((res = s_wmod(LO, RR, s)) != MP_OK) goto CLEANUP;
+    if ((res = s_rdivrem(HI, v, Q1, u)) != MP_OK) goto CLEANUP;
+    if (!s_qmul(Q1, s * MP_DIGIT_BIT)) {
+      res = MP_MEMORY;
+      goto CLEANUP;
+    }
+    if ((res = mp_int_add(Q, Q1, Q)) != MP_OK) goto CLEANUP;
+    if ((res = s_wjoin(RR, u, s, LO)) != MP_OK) goto CLEANUP;
+  }
+
+  if ((res = s_rdivrem(RR, v, Q1, u)) != MP_OK) goto CLEANUP;
+  if ((res = mp_int_add(Q, Q1, Q)) != MP_OK) goto CLEANUP;
+
+  if (norm && MP_OK == res) s_qdiv(u, (mp_size)norm); /* denormalize R */
+  if ((res = mp_int_copy(u, v)) != MP_OK) goto CLEANUP;
+  res = mp_int_copy(Q, u);
+
+CLEANUP:
+  for (i = 0; i < 5; i++) mp_int_clear(&t[i]);
+  return res;
+}
+
 static mp_result s_udiv_knuth(mp_int u, mp_int v) {
   /* Force signs to positive */
   u->sign = MP_ZPOS;
@@ -2516,6 +2942,13 @@ static mp_result s_udiv_knuth(mp_int u, mp_int v) {
     rem = s_ddiv(u, d);
     mp_int_set_value(v, rem);
     return MP_OK;
+  }
+
+  /* Use divide-and-conquer division for large operands; it needs both a
+     large divisor and a large quotient to be worthwhile. */
+  if (MP_USED(v) > RECDIV_THRESHOLD &&
+      MP_USED(u) > MP_USED(v) + RECDIV_THRESHOLD) {
+    return s_udiv_recursive(u, v);
   }
 
   /* Algorithm D
@@ -3045,4 +3478,3 @@ mp_result mp_int_set_double(mp_int a, double b)
 
 	return MP_OK;
 }
-

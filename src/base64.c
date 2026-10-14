@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "allocator.h"
 #include "base64.h"
 
 static size_t encode_base64(char *ostr, uint8_t *inbuf, int *inbuf_size, int *line_len, int breaks, int cr)
@@ -36,7 +37,7 @@ static size_t encode_base64(char *ostr, uint8_t *inbuf, int *inbuf_size, int *li
 	return len;
 }
 
-size_t b64_encode(const char *s, size_t nbytes, char **pdst, int breaks, int cr)
+size_t tpl_b64_encode(const char *s, size_t nbytes, char **pdst, int breaks, int cr)
 {
 	if (!pdst)
 		return 0;
@@ -44,7 +45,7 @@ size_t b64_encode(const char *s, size_t nbytes, char **pdst, int breaks, int cr)
 	size_t max_len = 0, bytes_left = 0;
 
 	if (!*pdst) {
-		*pdst = malloc(max_len=bytes_left=64);
+		*pdst = TPL_malloc(max_len=bytes_left=64);
 		if (!*pdst) return 0;
 	}
 
@@ -65,7 +66,7 @@ size_t b64_encode(const char *s, size_t nbytes, char **pdst, int breaks, int cr)
 			max_len *= 2;
 			size_t nbytes = dst - *pdst;
 			bytes_left = max_len - nbytes;
-			*pdst = realloc(*pdst, max_len);
+			*pdst = TPL_realloc(*pdst, max_len);
 			if (!*pdst) return 0;
 			dst = *pdst + nbytes;
 		}
@@ -127,7 +128,7 @@ static int conv_to_number(uint8_t inbyte)
 	return -1;
 }
 
-size_t b64_decode(const char *s, size_t nbytes, char **pdst)
+size_t tpl_b64_decode(const char *s, size_t nbytes, char **pdst)
 {
 	if (!pdst)
 		return 0;
@@ -135,7 +136,7 @@ size_t b64_decode(const char *s, size_t nbytes, char **pdst)
 	size_t max_len = 0, bytes_left = 0;
 
 	if (!*pdst) {
-		*pdst = malloc(max_len=bytes_left=64);
+		*pdst = TPL_malloc(max_len=bytes_left=64);
 		if (!*pdst) return 0;
 	}
 
@@ -159,7 +160,7 @@ size_t b64_decode(const char *s, size_t nbytes, char **pdst)
 			max_len *= 2;
 			size_t nbytes = dst - *pdst;
 			bytes_left = max_len - nbytes;
-			*pdst = realloc(*pdst, max_len);
+			*pdst = TPL_realloc(*pdst, max_len);
 			if (!*pdst) return 0;
 			dst = *pdst + nbytes;
 		}
